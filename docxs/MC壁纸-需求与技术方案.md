@@ -500,6 +500,64 @@ Slint 的软件渲染器用 `fontdue` 把 fontdb 查到的那个字面**整份**
   再点击 / 截图(单纯 `SetCursorPos` + `mouse_event` 会点到压在面板上面的窗口上,页面状态就会
   「莫名其妙」没变)。
 
+### 11.7 「构建怎么这么大?」:10.4 GB 的来历与一次特性裁剪(2026-10-14 同日)
+
+起因:第一次推仓库时 `.gitignore` 排掉 `/app/target/`,顺带看到本机这个目录有 **10.4 GB**。
+数字本身没错,但它**不是成品**,而是 cargo 的编译中间产物 —— 删掉随时能重建(本机约 80 秒)。
+
+**实测拆解**(`target/` = 10,428 MB / 15,614 文件):
+
+| 目录 | 体积 | 文件数 | 说明 |
+| --- | --- | --- | --- |
+| `target/debug` | 6,719 MB | 9,439 | 含 21 个 exe;另有 882 MB `incremental/`、525 MB `build/` |
+| `target/release` | 3,709 MB | 6,173 | |
+
+按扩展名:`rlib` 5,043 MB / 1,036 个、`rmeta` 2,299 MB / 1,256 个、`pdb` 1,640 MB / 354 个、
+`.o` 约 500 MB、`.exe` 合计 317 MB。单个最大的几个文件是
+`debug/deps/mcwp_wallpaper.pdb` 121.7 MB、`libwgpu_core-*.rlib` 113.8 MB(4 份)、
+`libnaga-*.rlib` 87 MB(2 份)、`release/deps/libwindows-*.rlib` 77.5 MB。
+
+三条主因,按贡献排序:
+
+1. **依赖的中间产物远大于成品**:每个 crate 都留一份 `.rlib` + `.rmeta`(+ debug 的 `.o` / `.pdb`),
+   而 `rlib` 是「未做最终链接优化的对象归档」,比 strip 过的 exe 大一个量级。真正的成品
+   `mcwp-wallpaper.exe` 只有十几 MB。
+2. **同一 crate 存在大量 feature 哈希不同的重复副本**:`libwindows` 20 份、`libmcwp_platform` 16 份、
+   `libmcwp_ui` 13 份、`libsyn` 13 份。根因是逐包构建(`-p`)/ 不同 feature 组合各留一份缓存,
+   统一 `cargo build --workspace` 能收敛(本轮已全部改用 `--workspace`)。
+3. **debug / release / dev-tools 三套产物并存**。其中 `target/debug/build/mcwp-ui-*/` 两个目录
+   各 148 MB —— 那是 **Slint 编译器自己**的产物(`libi_slint_compiler` 57.7 MB)。
+
+顺带纠正一个直觉:本项目**自己写的代码**只有 57 个文件 / 0.79 MB,10 GB 里没有一行是我们写的
+业务代码,全是依赖树。另外 `libi_slint_compiler` 57.7 MB、`libimage` 21.7 MB、`libravif` 19.4 MB
+都是**构建期**依赖(`slint-macros → i-slint-compiler → image` 这条 proc-macro 链),
+只占缓存,**不进成品、不影响运行时**。
+
+**这轮实际做的裁剪:关掉 wgpu 用不到的后端**(`app/Cargo.toml` 的 `[workspace.dependencies]`)。
+依据是项目在 `crates/mcwp-render/src/lib.rs` 里把后端写死成 `wgpu::Backends::DX12`,
+着色器是 WGSL;而 wgpu 默认还开着 `vulkan / gles / metal / webgpu`,其中 vulkan 会把
+`ash`(Vulkan 绑定,单是 release rlib 就 68.5 MB)整条拖进依赖树,webgpu 还会给 naga
+加一个用不到的 WGSL 输出后端。
+
+```toml
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "dx12", "wgsl", "parking_lot"] }
+```
+
+实测(在临时目录从零构建,避免污染正式 target):
+
+| 指标 | 裁剪前 | 裁剪后 |
+| --- | --- | --- |
+| 成品 `mcwp-wallpaper.exe` | 13.3 MB | **11.52 MB** |
+| 从零构建后的整个 `target/` | 10,428 MB | **1,566 MB**(3,748 文件) |
+| 从零构建耗时 | — | 80 秒 |
+| 依赖树里的 `ash` / `glow` / `web_sys` / `wasm_bindgen` | 有 | **全部归零** |
+
+裁剪后重新冒烟: `--attach auto --fps 60` 跑通,`backend: Dx12`、挂载成功、**58.8 fps**;
+桌面拖动回归(3 个用例)、面板点击 / 截图、托盘挂载均无回归。
+
+**结论**:10.4 GB 是正常的编译缓存量级,不是「软件很大」;产品真实体积是 **~11.5 MB 单 exe**。
+注意 `app/Cargo.toml` 只改了 feature 集,**没动任何代码逻辑**。
+
 ## 十二、决策记录与剩余待定项
 
 ### 12.1 已确认(项目基线)
@@ -524,6 +582,7 @@ Slint 的软件渲染器用 `fontdue` 把 fontdb 查到的那个字面**整份**
 | 16 | 单实例 | **命名互斥体**:已在运行时把控制面板叫到前台,本次不启动 | 防连点挂出两个宿主抢 WorkerW;跨进程找窗口即可,不引入 IPC |
 | 17 | 托盘 | **Win32 原生 `Shell_NotifyIconW`**,与宿主**同线程**,不引入额外线程 / 消息循环 | 菜单:打开面板 / 换预设 / 暂停渲染 / 开机自启 / 退出;图标由 `.ico` 里的 PNG 码流直接建 HICON,不加图像依赖;自启写 HKCU 的 `Run` 项;详见 11.6 |
 | 18 | 面板信息架构 | **三段页签** `壁纸 / 库 / 设置`(iOS 分段控件);`page` 是纯界面状态,不进 Rust | 库 / 设置本轮只做占位页;切页必须用 `if` 而不是 `visible`(见 11.6) |
+| 19 | wgpu 特性 | **`default-features = false` + `std/dx12/wgsl/parking_lot`** | 后端写死 DX12、着色器是 WGSL,默认的 vulkan / gles / metal / webgpu 全用不到;裁掉后成品 13.3 → 11.5 MB、`ash` 等依赖退出依赖树;构建统一用 `--workspace` 以收敛重复副本;见 11.7 |
 
 ### 12.2 仍需拍板(不阻塞 M0)
 

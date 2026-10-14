@@ -1,5 +1,8 @@
-# Rust 构建产物:本机 target/ 有 10 GB 量级,绝对不能进仓库。
+# Rust 构建产物:裁剪 wgpu 后本机 target/ 仍有 1.5 GB 量级,绝对不能进仓库。
 /app/target/
+
+# 体积/依赖对比用的临时构建目录(见 docxs 11.7),一次性产物。
+/.measure-*/
 
 # tools/subset-panel-font.py 下载 Noto Sans SC 原始 woff2 用的缓存。
 /.fontcache/

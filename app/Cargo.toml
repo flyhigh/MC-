@@ -22,7 +22,11 @@ serde_json = "1"
 thiserror = "2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-wgpu = "30.0.1"
+# 只要 DX12 + WGSL:后端在 `mcwp-render` 里是写死的 `Backends::DX12`,着色器是 WGSL。
+# wgpu 默认还开着 vulkan / gles / metal / webgpu —— vulkan 那条会把 `ash`(Vulkan 绑定,
+# release rlib 就 68 MB)整个拖进依赖树,webgpu 还会给 naga 加一个用不到的 WGSL 输出后端。
+# 关掉之后依赖树和成品都明显变小,编译也快。
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "dx12", "wgsl", "parking_lot"] }
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
