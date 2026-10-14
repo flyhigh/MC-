@@ -13,7 +13,13 @@
 // 软件渲染器的能力边界(踩过才知道):
 //   * 支持:线性/径向渐变、圆角、alpha 混合、旋转、颜色插值动画
 //   * 不支持:backdrop-blur、盒阴影(draw_box_shadow 是 TODO)、裁剪路径、渐变描边
-//     → 阴影用「径向渐变暗斑」伪造,描边一律实色,每层各自带圆角
+//     → 阴影用「径向渐变暗斑」伪造,描边一律实色
+//   * **圆角只对实色背景生效**。software_renderer.rs 的 `process_rectangle_impl` 里,
+//     渐变是单独一条分支:它把整个矩形直接刷下去(不看 radius),随后那次
+//     `process_rounded_rectangle` 拿到的 inner_color 是透明的,等于什么也没画。
+//     表现就是「发丝线描边是圆的、填充是直角」—— 分段控件的滑片会变成一块直角砖。
+//     → 凡是要圆角的地方一律用实色;渐变只留给圆角不重要的地方(窗口底色、环境光斑)。
+//       液态玻璃的厚度感改用发丝高光 + 半透明层表达。
 //
 // 与 Rust 的唯一接口还是下面这些 property / callback,面板自己不持有任何持久状态。
 
@@ -132,8 +138,9 @@ component GlassSlider inherits VerticalLayout {
     track := Rectangle {
         height: 30px;
         border-radius: 15px;
-        // 凹槽:上暗下亮的反向渐变 + 内缘暗线,读起来像被"挖"进玻璃里
-        background: @linear-gradient(180deg, #00000038 0%, #FFFFFF12 100%);
+        // 凹槽:实色压暗 + 内缘暗线,读起来像被"挖"进玻璃里。
+        // 原来这里用「上暗下亮」的反向渐变 —— 但渐变画不出圆角,整条凹槽会变成直角。
+        background: #0000003D;
         border-width: 1px;
         border-color: Glass.hairline-dim;
 
@@ -144,7 +151,8 @@ component GlassSlider inherits VerticalLayout {
             width: max(0px, min(parent.width - 2px, knob.x + knob.width / 2 - 1px));
             height: parent.height - 2px;
             border-radius: (parent.height - 2px) / 2;
-            background: @linear-gradient(180deg, accent.brighter(0.18) 0%, accent 100%);
+            // 实色,理由同 track:渐变会让这一截连两头都是直的
+            background: accent.brighter(0.10);
             opacity: 0.92;
         }
 
@@ -154,25 +162,22 @@ component GlassSlider inherits VerticalLayout {
             y: (parent.height - self.height) / 2;
             x: clamp((parent.width - self.width) * (root.value - root.minimum) / (root.maximum - root.minimum), 0px, parent.width - self.width);
             border-radius: self.width / 2;
-            background: @linear-gradient(180deg, #FFFFFF 0%, #E9EEF7 100%);
+            // 实色,理由同 track(渐变会让旋钮从圆变成方块)
+            background: #FFFFFF;
             border-width: 1px;
             border-color: #FFFFFFE6;
             animate x { duration: 120ms; easing: ease-out; }
-
-            // 镜面高光:上半部分一笔白色弧,模拟玻璃球的光源
-            Rectangle {
-                x: 3px;
-                y: 2px;
-                width: parent.width - 6px;
-                height: (parent.height - 6px) / 2;
-                border-radius: self.height / 2;
-                background: @linear-gradient(180deg, #FFFFFFDD 0%, #FFFFFF00 100%);
-            }
+            // 原先这里还有一层「上半部白色弧」当玻璃球镜面:它在白色旋钮上本来就是白压白、
+            // 看不见,又因为是渐变而只会画出一个直角浅色块,所以删掉。
         }
 
         touch := TouchArea {
             pointer-event(e) => {
-                if (e.kind == PointerEventKind.down || e.kind == PointerEventKind.move) {
+                // `move` 事件是"悬停也会来"的:不加 `touch.pressed` 这道闸,鼠标只是从滑杆上
+                // 划过就会改值 —— 面板上五个滑杆会被一次挥动全部带动,拖动窗口时尤其明显。
+                // down 事件本身即按下,不用再判 pressed。
+                if (e.kind == PointerEventKind.down
+                    || (e.kind == PointerEventKind.move && touch.pressed)) {
                     root.value = root.minimum + clamp((touch.mouse-x - knob.width / 2) / (track.width - knob.width), 0, 1) * (root.maximum - root.minimum);
                 }
             }
@@ -256,8 +261,9 @@ component SegTabs inherits Rectangle {
 
     height: 36px;
     border-radius: self.height / 2;
-    // 和滑杆的凹槽同一套语言:上暗下亮 + 内缘发丝线
-    background: @linear-gradient(180deg, #00000038 0%, #FFFFFF10 100%);
+    // 和滑杆的凹槽同一套语言:实色压暗 + 内缘发丝线。
+    // 原先是渐变 —— 所以这条凹槽的填充一直是直角,只有那圈发丝线是圆的。
+    background: #0000003D;
     border-width: 1px;
     border-color: Glass.hairline-dim;
 
@@ -268,9 +274,20 @@ component SegTabs inherits Rectangle {
         x: 4px + self.width * root.current;
         y: 4px;
         border-radius: self.height / 2;
-        background: @linear-gradient(180deg, accent.brighter(0.16) 0%, accent 100%);
+        // 实色:圆角才生效(渐变会被画成一块直角砖)。染色玻璃的厚度感交给下面那条发丝高光。
+        background: accent;
         opacity: 0.92;
         animate x { duration: 180ms; easing: ease-out; }
+
+        Rectangle {
+            x: parent.width * 0.14;
+            y: 1px;
+            width: parent.width * 0.72;
+            height: 1px;
+            border-radius: 0.5px;
+            background: Glass.specular;
+            opacity: 0.65;
+        }
     }
 
     HorizontalLayout {

@@ -558,6 +558,36 @@ wgpu = { version = "30.0.1", default-features = false, features = ["std", "dx12"
 **结论**:10.4 GB 是正常的编译缓存量级,不是「软件很大」;产品真实体积是 **~11.5 MB 单 exe**。
 注意 `app/Cargo.toml` 只改了 feature 集,**没动任何代码逻辑**。
 
+### 11.8 圆角不生效的根因 + 滑杆「悬停即改值」(2026-10-14 同日)
+
+**现象**:分段控件的选中滑片是一个**直角矩形的蓝块**,滑杆的旋钮是**方块**、填充条两头也是直的;
+但同一块面板上,「当前壁纸」卡片和预设卡片的圆角却是好的。
+
+**根因:软件渲染器只给实色背景画圆角。** `i-slint-core/software_renderer.rs` 的
+`process_rectangle_impl` 里,渐变是**单独一条分支**:`Brush::LinearGradient` / `RadialGradient` /
+`ConicGradient` 都直接 `processor.process_linear_gradient(act_rect, ..)` 把**整个矩形**刷下去
+(`act_rect` 只是个矩形,没有任何 radius 参与),然后返回一个**透明**的 `Color::default()`。
+函数末尾那段 `if !radius.is_zero() { process_rounded_rectangle(.. inner_color: color ..) }`
+拿到的 inner_color 因此是透明的 —— 该画的圆角什么也没画。
+
+这解释了为什么「有的圆角是好的、有的不是」:实色背景走的是下面
+`process_simple_rectangle` + `process_rounded_rectangle` 那条路,圆角正常;只有描边
+(`border-color`)是圆的,因为描边一直由 `process_rounded_rectangle` 画 ——
+于是表现为「发丝线是圆的、填充是直角」。
+
+**修法**:凡是要圆角的地方一律改用**实色**;渐变只留给圆角不重要的地方(窗口底色、
+环境光斑 —— 前者被 DWM 裁、后者的四角本来就是透明的)。液态玻璃的厚度感改由
+**发丝高光 + 半透明层**表达。改动点:`SegTabs` 的凹槽与滑片、`GlassSlider` 的凹槽 /
+填充 / 旋钮;旋钮里那层「上半部白色弧」镜面被删掉(它在白色旋钮上本来就是白压白看不出来,
+又因为是渐变只会画出一个直角浅色块)。文件头的能力边界注释也一并更正。
+
+**顺带抓到的一个真 bug**:滑杆的 `pointer-event` 原本是
+`if (e.kind == down || e.kind == move)`。Slint 的 `move` **悬停也会派发**,所以鼠标只是
+**从滑杆上划过**(不按键)就会改值 —— 面板上五个滑杆会被一次挥动全部带动。
+修法:`down` 保持无条件(它本身就是按下),`move` 加上 `touch.pressed` 这道闸。
+实测:悬停横扫「雨量」滑杆,五个值纹丝不动(65/35/25/57/45 → 不变);
+按住拖动仍然正常(能从 65% 拖到 100%)。
+
 ## 十二、决策记录与剩余待定项
 
 ### 12.1 已确认(项目基线)
