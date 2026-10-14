@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "id": "",
+  "title": "专注网格",
+  "source": "builtin",
+  "keywords": [
+    "专注网格"
+  ],
+  "mood": {
+    "calm": 0.6,
+    "focus": 0.9,
+    "energy": 0.25
+  },
+  "palette": [
+    "#070B12",
+    "#12202E",
+    "#2E6F8E",
+    "#7FD4E8",
+    "#DFF6FF"
+  ],
+  "scene": {
+    "preset": "focus_grid",
+    "params": {
+      "contrast": 0.55,
+      "grid": 0.4,
+      "scan": 0.3
+    }
+  },
+  "motion": {
+    "intensity": 0.25,
+    "speed": 0.35
+  },
+  "lighting": {
+    "mode": "auto_ambient",
+    "key_light": 0.5,
+    "follow_desktop_brightness": true
+  },
+  "elements": [],
+  "overlay": {
+    "clock": false,
+    "quote": null
+  },
+  "seed": 20261014
+}

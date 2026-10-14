@@ -1,0 +1,16 @@
+[package]
+name = "mcwp-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+mcwp-spec = { path = "../mcwp-spec" }
+pollster.workspace = true
+raw-window-handle = "0.6.2"
+tracing.workspace = true
+wgpu.workspace = true
+windows.workspace = true
+

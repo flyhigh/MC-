@@ -1,0 +1,15 @@
+[package]
+name = "mcwp-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+windows.workspace = true
+
+[features]
+# 排查脚手架:窗口层级 dump、GDI 自检、离屏回读、普通窗口模式。产品构建默认关闭。
+dev-tools = []
+

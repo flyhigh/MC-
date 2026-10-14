@@ -1,0 +1,751 @@
+// MC 壁纸 · 控制面板(iOS 26 液态玻璃风格)
+//
+// 视觉依据:Apple HIG「Materials / Liquid Glass」+ WWDC25 §219《Meet Liquid Glass》。
+// 落到这个面板上的三条原则:
+//
+//   1. 玻璃是「功能层」,浮在内容层之上。所以窗口里先铺一层环境底(ambient),玻璃面板盖在
+//      上面;玻璃内部不再叠玻璃,只用薄填充 / 白色高光 / 发丝线(HIG:不要 glass on glass)。
+//   2. 玻璃要能"折射"。软件渲染器没有真·背景模糊,替代做法是:环境底由我们自己画(天然就是
+//      柔和的),再用半透明 + 顶部高光 + 底部内缘暗线去模拟 lensing。
+//   3. 玻璃铺满整个窗口:窗口那圈圆角由 DWM 画(约 8px),我们画的每一层都跟它对齐 ——
+//      自己画大了,窗口里会露出一小块背景色拼成的"墙角"。卡片再用更小的圆角嵌在里面。
+//
+// 软件渲染器的能力边界(踩过才知道):
+//   * 支持:线性/径向渐变、圆角、alpha 混合、旋转、颜色插值动画
+//   * 不支持:backdrop-blur、盒阴影(draw_box_shadow 是 TODO)、裁剪路径、渐变描边
+//     → 阴影用「径向渐变暗斑」伪造,描边一律实色,每层各自带圆角
+//
+// 与 Rust 的唯一接口还是下面这些 property / callback,面板自己不持有任何持久状态。
+
+// 把子集字体编进 exe。Slint 认 `import "xxx.ttf"` 这种写法:build.rs 的 EmbedFiles 会把
+// 字体数据塞进二进制,生成的初始化代码再调 register_font_from_memory() 注册族名。
+// 名字必须和下面的 default-font-family 对上,否则回落到系统字体(CJK 会整片画不出来)。
+// 字体是子集化的:改了面板文案要重跑 tools/subset-panel-font.py。
+import "../fonts/panel-cjk-regular.ttf";
+import "../fonts/panel-cjk-bold.ttf";
+
+// 设计令牌。深色玻璃 + iOS 系统色。
+global Glass {
+    out property <color> label: #FFFFFFFF;
+    out property <color> label-2: #EBEBF59E;
+    out property <color> label-3: #EBEBF55C;
+    out property <color> hairline: #FFFFFF24;
+    out property <color> hairline-dim: #FFFFFF14;
+    out property <color> specular: #FFFFFF8A;
+    out property <color> fill: #FFFFFF14;
+    out property <color> fill-strong: #FFFFFF1F;
+    out property <color> fill-hover: #FFFFFF2E;
+    out property <color> rim-dark: #0000007A;
+
+    // 窗口那一圈圆角由 DWM 画(DWMWCP_ROUND,约 8px),我们画的每一层都跟它对齐 ——
+    // 自己画大一点,窗口里就会露出一小块背景色拼成的"墙角"。
+    out property <length> r-window: 8px;
+    out property <length> r-card: 12px;
+}
+
+export struct PresetItem {
+    id: string,
+    title: string,
+    summary: string,
+    label-a: string,
+    label-b: string,
+    label-c: string,
+    value-a: float,
+    value-b: float,
+    value-c: float,
+    motion: float,
+}
+
+// 玻璃上的「胶囊」按钮。主操作是 tinted(染色玻璃),次操作是普通玻璃。
+component Pill inherits Rectangle {
+    in property <string> text: "";
+    in property <bool> primary: false;
+    in property <color> accent: #0A84FF;
+
+    callback clicked();
+
+    height: 34px;
+    width: 104px;
+    border-radius: self.height / 2;
+    border-width: 1px;
+    border-color: primary ? accent.with-alpha(0.55) : Glass.hairline;
+    background: primary
+        ? (touch.has-hover ? accent.brighter(0.12) : accent)
+        : (touch.pressed ? Glass.fill-strong : (touch.has-hover ? Glass.fill-hover : Glass.fill));
+    animate background { duration: 140ms; easing: ease-out; }
+
+    // 顶部高光:一条横向渐变的细线,让胶囊有玻璃厚度
+    Rectangle {
+        x: parent.width * 0.12;
+        y: 0.5px;
+        width: parent.width * 0.76;
+        height: 1px;
+        border-radius: 0.5px;
+        background: @linear-gradient(90deg, #FFFFFF00 0%, Glass.specular 50%, #FFFFFF00 100%);
+        opacity: primary ? 0.5 : 0.8;
+    }
+
+    t := Text {
+        text: root.text;
+        color: Glass.label;
+        font-size: 13px;
+        font-weight: root.primary ? 600 : 400;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        width: 100%;
+        height: 100%;
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// iOS 风格滑杆:粗胶囊轨道 + 白色圆钮。
+component GlassSlider inherits VerticalLayout {
+    in property <string> label: "";
+    in property <float> minimum: 0;
+    in property <float> maximum: 1;
+    in property <color> accent: #0A84FF;
+    in-out property <float> value: 0.5;
+
+    spacing: 7px;
+    height: 52px;
+
+    HorizontalLayout {
+        height: 15px;
+        Text {
+            text: root.label;
+            color: Glass.label-2;
+            font-size: 12px;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: "\{round((root.value - root.minimum) / (root.maximum - root.minimum) * 100)}%";
+            color: Glass.label-3;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+    }
+
+    track := Rectangle {
+        height: 30px;
+        border-radius: 15px;
+        // 凹槽:上暗下亮的反向渐变 + 内缘暗线,读起来像被"挖"进玻璃里
+        background: @linear-gradient(180deg, #00000038 0%, #FFFFFF12 100%);
+        border-width: 1px;
+        border-color: Glass.hairline-dim;
+
+        // 已填充部分:染色玻璃
+        Rectangle {
+            x: 1px;
+            y: 1px;
+            width: max(0px, min(parent.width - 2px, knob.x + knob.width / 2 - 1px));
+            height: parent.height - 2px;
+            border-radius: (parent.height - 2px) / 2;
+            background: @linear-gradient(180deg, accent.brighter(0.18) 0%, accent 100%);
+            opacity: 0.92;
+        }
+
+        knob := Rectangle {
+            width: 24px;
+            height: 24px;
+            y: (parent.height - self.height) / 2;
+            x: clamp((parent.width - self.width) * (root.value - root.minimum) / (root.maximum - root.minimum), 0px, parent.width - self.width);
+            border-radius: self.width / 2;
+            background: @linear-gradient(180deg, #FFFFFF 0%, #E9EEF7 100%);
+            border-width: 1px;
+            border-color: #FFFFFFE6;
+            animate x { duration: 120ms; easing: ease-out; }
+
+            // 镜面高光:上半部分一笔白色弧,模拟玻璃球的光源
+            Rectangle {
+                x: 3px;
+                y: 2px;
+                width: parent.width - 6px;
+                height: (parent.height - 6px) / 2;
+                border-radius: self.height / 2;
+                background: @linear-gradient(180deg, #FFFFFFDD 0%, #FFFFFF00 100%);
+            }
+        }
+
+        touch := TouchArea {
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down || e.kind == PointerEventKind.move) {
+                    root.value = root.minimum + clamp((touch.mouse-x - knob.width / 2) / (track.width - knob.width), 0, 1) * (root.maximum - root.minimum);
+                }
+            }
+            clicked => {
+                root.value = root.minimum + clamp((touch.mouse-x - knob.width / 2) / (track.width - knob.width), 0, 1) * (root.maximum - root.minimum);
+            }
+        }
+    }
+}
+
+// 预设卡片。选中的用染色玻璃表示,未选中的是薄填充。
+component PresetRow inherits Rectangle {
+    in property <bool> selected: false;
+    in property <string> heading: "";
+    in property <string> sub: "";
+    in property <color> accent: #0A84FF;
+
+    callback picked();
+
+    height: 58px;
+    border-radius: Glass.r-card;
+    border-width: 1px;
+    border-color: selected ? accent.with-alpha(0.5) : Glass.hairline-dim;
+    background: selected
+        ? accent.with-alpha(touch.has-hover ? 0.2 : 0.16)
+        : (touch.has-hover ? Glass.fill-hover : Glass.fill);
+    animate background { duration: 160ms; easing: ease-out; }
+    animate border-color { duration: 160ms; easing: ease-out; }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 10px;
+        alignment: center;
+
+        // 选中指示器:一颗小圆点(渐变),未选中时几乎不可见
+        Rectangle {
+            width: 7px;
+            height: 7px;
+            border-radius: 3.5px;
+            background: selected ? accent : Glass.label-3;
+            opacity: selected ? 1 : 0.35;
+            animate opacity { duration: 160ms; }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            horizontal-stretch: 1;
+
+            Text {
+                text: root.heading;
+                color: selected ? Glass.label : Glass.label-2;
+                font-size: 14px;
+                font-weight: selected ? 600 : 400;
+                animate color { duration: 160ms; }
+            }
+            Text {
+                text: root.sub;
+                color: Glass.label-3;
+                font-size: 11px;
+                wrap: word-wrap;
+                max-height: 14px;
+                overflow: elide;
+            }
+        }
+    }
+
+    touch := TouchArea {
+        clicked => { root.picked(); }
+    }
+}
+
+// 分段控件(页签)。iOS 的 segmented control:胶囊凹槽 + 一块会滑动的染色玻璃。
+component SegTabs inherits Rectangle {
+    in property <[string]> items;
+    in property <int> current: 0;
+    in property <color> accent: #0A84FF;
+
+    callback picked(int);
+
+    height: 36px;
+    border-radius: self.height / 2;
+    // 和滑杆的凹槽同一套语言:上暗下亮 + 内缘发丝线
+    background: @linear-gradient(180deg, #00000038 0%, #FFFFFF10 100%);
+    border-width: 1px;
+    border-color: Glass.hairline-dim;
+
+    // 选中项的滑片:等宽,跟着 current 平移;切换时动画滑过去
+    Rectangle {
+        width: (parent.width - 8px) / max(1, root.items.length);
+        height: parent.height - 8px;
+        x: 4px + self.width * root.current;
+        y: 4px;
+        border-radius: self.height / 2;
+        background: @linear-gradient(180deg, accent.brighter(0.16) 0%, accent 100%);
+        opacity: 0.92;
+        animate x { duration: 180ms; easing: ease-out; }
+    }
+
+    HorizontalLayout {
+        padding: 4px;
+        for item[i] in root.items : Rectangle {
+            horizontal-stretch: 1;
+
+            Text {
+                text: item;
+                color: i == root.current ? Glass.label : Glass.label-2;
+                font-size: 13px;
+                font-weight: i == root.current ? 600 : 400;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: 100%;
+                height: 100%;
+                animate color { duration: 180ms; }
+            }
+
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.picked(i); }
+            }
+        }
+    }
+}
+
+export component Panel inherits Window {
+    in property <[PresetItem]> presets;
+    in-out property <int> current-preset: 0;
+    // 页签。0 = 壁纸(下面的「当前壁纸」+「预设/参数」两块就是它的内容),
+    // 1 = 库,2 = 设置。纯界面状态,不进 Rust。
+    in-out property <int> page: 0;
+    in property <string> wallpaper-title: "—";
+    in property <string> wallpaper-hint: "";
+    in property <string> fingerprint: "";
+    in-out property <string> preset-summary: "";
+
+    // 环境底色板由 Rust 按当前壁纸调色板算出来,玻璃因此会"透"出当前壁纸的色。
+    in property <color> ambient-a: #1B2A4A;
+    in property <color> ambient-b: #4F7CFF;
+    in property <color> ambient-c: #0B1020;
+    in property <color> glass-tint: #10141F;
+    in property <color> accent: #0A84FF;
+
+    in-out property <string> label-a: "";
+    in-out property <string> label-b: "";
+    in-out property <string> label-c: "";
+    in-out property <float> param-a: 0.5;
+    in-out property <float> param-b: 0.5;
+    in-out property <float> param-c: 0.5;
+    in-out property <float> brightness: 1.0;
+    in-out property <float> motion: 0.5;
+    in property <string> status: "";
+    // 左键是否正按在标题栏上。只用来判断"这次抬起要不要收尾",
+    // 真正的拖动由 Rust 侧驱动(见下面三个 drag-* 回调的说明)。
+    private property <bool> drag-active: false;
+
+    callback select-preset(int);
+    callback values-changed();
+    callback save-requested();
+    callback reset-requested();
+    callback close-requested();
+    // 无边框窗口没有系统标题栏,拖动得自己接。分三个动作,而不是一条"是否按住"的布尔:
+    // TouchArea 的 `pressed` 只在指针位于自己那条窄带里才为真,拖快一点指针就出界,
+    // 它会立刻 pressed=false 并补发一个 cancel —— 拖动等于半路脱手,窗口停住不再跟手。
+    // 所以这里只认左键 down / up,并要求 Rust 侧不要依赖"按住"状态。
+    callback drag-start();
+    callback drag-move();
+    callback drag-end();
+
+    title: "MC 壁纸 · 控制面板";
+    // 任务栏 / Alt-Tab 的窗口图标。`@image-url` 走的还是 build.rs 的 EmbedFiles,所以图标
+    // 也是编进 exe 的;exe 文件本身的那枚图标另说(那要 rc.exe 写资源,本轮没做)。
+    // 图标由 tools/make-icon.py 画,改配色重跑那个脚本即可。
+    icon: @image-url("../assets/mcwp-icon-256.png");
+    width: 940px;
+    height: 648px;
+    no-frame: true;
+    background: ambient-c;
+    default-font-family: "MCWP Sans";
+    default-font-size: 14px;
+
+    changed param-a => { root.values-changed(); }
+    changed param-b => { root.values-changed(); }
+    changed param-c => { root.values-changed(); }
+    changed brightness => { root.values-changed(); }
+    changed motion => { root.values-changed(); }
+
+    // ——————————————————————————————
+    // 内容层:环境底。代替真实的背景模糊 —— 我们自己画一层柔和的多色渐变,
+    // 玻璃半透明地盖在上面,看起来就像它在折射背后的东西。
+    // ——————————————————————————————
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: Glass.r-window;
+        background: @linear-gradient(155deg, ambient-a 0%, ambient-c 52%, ambient-b.with-alpha(0.75) 100%);
+    }
+
+    // 两团彩色光斑,让底色不平;方形的径向渐变 = 圆形光晕
+    Rectangle {
+        x: -120px;
+        y: -160px;
+        width: 620px;
+        height: 620px;
+        border-radius: 310px;
+        background: @radial-gradient(circle, ambient-b 0%, #00000000 68%);
+        opacity: 0.5;
+    }
+    Rectangle {
+        x: 520px;
+        y: 300px;
+        width: 560px;
+        height: 560px;
+        border-radius: 280px;
+        background: @radial-gradient(circle, accent 0%, #00000000 66%);
+        opacity: 0.28;
+    }
+
+    // ——————————————————————————————
+    // 功能层:一整块玻璃,铺满窗口(圆角和窗口对齐)。内部只用薄填充(不再叠玻璃)。
+    // ——————————————————————————————
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: Glass.r-window;
+        border-width: 1px;
+        border-color: Glass.hairline;
+
+        // 1) 染色底:跟随当前壁纸色调,压暗保证白字可读
+        Rectangle {
+            border-radius: parent.border-radius;
+            background: @linear-gradient(180deg, glass-tint.with-alpha(0.42) 0%, glass-tint.darker(0.35).with-alpha(0.58) 100%);
+        }
+        // 2) 白色薄纱:上厚下薄,模拟光从上方来(提亮靠它,不靠把染色调浅)
+        Rectangle {
+            border-radius: parent.border-radius;
+            background: @linear-gradient(180deg, #FFFFFF1F 0%, #FFFFFF0D 38%, #FFFFFF05 100%);
+        }
+        // 3) 顶部镜面高光:一条横向渐变的细线
+        Rectangle {
+            x: 14px;
+            y: 0.5px;
+            width: parent.width - 28px;
+            height: 1px;
+            background: @linear-gradient(90deg, #FFFFFF00 0%, Glass.specular 45%, #FFFFFF00 100%);
+        }
+        // 4) 底部内缘暗线:lensing 的"玻璃厚度",让玻璃和下面的内容分层
+        Rectangle {
+            x: 14px;
+            y: parent.height - 1.5px;
+            width: parent.width - 28px;
+            height: 1px;
+            background: @linear-gradient(90deg, #00000000 0%, Glass.rim-dark 50%, #00000000 100%);
+        }
+        // 5) 左右内缘反光:玻璃边缘把光"折"进来的一道亮边,上亮下无 ——
+        //    真·lensing 要 backdrop-blur 才做得到,这里只借这道边暗示折射
+        Rectangle {
+            x: 0.5px;
+            y: 14px;
+            width: 1px;
+            height: parent.height * 0.42;
+            background: @linear-gradient(180deg, Glass.specular 0%, #FFFFFF00 100%);
+            opacity: 0.55;
+        }
+        Rectangle {
+            x: parent.width - 1.5px;
+            y: 14px;
+            width: 1px;
+            height: parent.height * 0.42;
+            background: @linear-gradient(180deg, Glass.specular 0%, #FFFFFF00 100%);
+            opacity: 0.55;
+        }
+    }
+
+    // ——————————————————————————————
+    // 玻璃上的内容。四周 18px 内边距,离窗口边留出一圈玻璃本色当"边框"
+    // ——————————————————————————————
+    VerticalLayout {
+        width: 100%;
+        height: 100%;
+        padding: 18px;
+        spacing: 12px;
+
+        // —— 标题栏(也是拖拽区)—— 
+        Rectangle {
+            height: 30px;
+
+            drag := TouchArea {
+                pointer-event(e) => {
+                    if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                        root.drag-active = true;
+                        root.drag-start();
+                    } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
+                        if (root.drag-active) {
+                            root.drag-active = false;
+                            root.drag-end();
+                        }
+                    } else if (e.kind == PointerEventKind.move && root.drag-active) {
+                        // 只在还按着的时候转发:窗口没跟着动(手动拖动)时才需要这条。
+                        root.drag-move();
+                    }
+                    // Cancel 故意不处理:它就是"指针离开了标题栏"的信号,收了就脱手。
+                }
+            }
+
+            HorizontalLayout {
+                width: 100%;
+                spacing: 8px;
+
+                Rectangle {
+                    width: 6px;
+                    height: 6px;
+                    border-radius: 3px;
+                    background: accent;
+                    opacity: 0.9;
+                }
+                Text {
+                    text: "MC 壁纸";
+                    color: Glass.label-2;
+                    font-size: 12px;
+                    font-weight: 600;
+                    letter-spacing: 0.6px;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: "·";
+                    color: Glass.label-3;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: "液态玻璃预览";
+                    color: Glass.label-3;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+            }
+
+            // 关闭按钮:玻璃圆钮 + 两道旋转 45° 的细线(不依赖字体里有没有叉号字形)
+            Rectangle {
+                width: 26px;
+                height: 26px;
+                x: parent.width - self.width;
+                y: (parent.height - self.height) / 2;
+                border-radius: self.width / 2;
+                border-width: 1px;
+                border-color: close-touch.has-hover ? Glass.hairline : Glass.hairline-dim;
+                background: close-touch.has-hover ? Glass.fill-hover : Glass.fill;
+                animate background { duration: 140ms; }
+                animate border-color { duration: 140ms; }
+
+                Rectangle {
+                    width: 100%;
+                    height: 100%;
+                    Text {
+                        text: "×";
+                        color: Glass.label-2;
+                        font-size: 17px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                close-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.close-requested(); }
+                }
+            }
+        }
+
+        // —— 页签 ——
+        // 切页用 if 而不是 visible:Slint 把 visible=false 降级成一个 Clip 包裹元素,
+        // 元素照样占布局空间(试过,页面会缩在底部)。if 才是"根本没构造"。
+        SegTabs {
+            items: ["壁纸", "库", "设置"];
+            current: root.page;
+            accent: root.accent;
+            picked(index) => { root.page = index; }
+        }
+
+        // —— 当前壁纸(薄填充,不是玻璃)—— 
+        if root.page == 0 : Rectangle {
+            height: 66px;
+            border-radius: Glass.r-card;
+            background: Glass.fill;
+
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                spacing: 18px;
+                alignment: center;
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    Text { text: "当前壁纸"; color: Glass.label-3; font-size: 11px; }
+                    Text {
+                        text: root.wallpaper-title;
+                        color: Glass.label;
+                        font-size: 17px;
+                        font-weight: 600;
+                    }
+                }
+
+                Rectangle { width: 1px; height: 30px; background: Glass.hairline-dim; }
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    Text { text: "关键词"; color: Glass.label-3; font-size: 11px; }
+                    Text { text: root.wallpaper-hint; color: Glass.label-2; font-size: 13px; }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    Text { text: "指纹"; color: Glass.label-3; font-size: 11px; }
+                    Text { text: root.fingerprint; color: Glass.label-2; font-size: 13px; }
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+            }
+        }
+
+        // —— 主体:左预设 / 右参数 —— 
+        if root.page == 0 : HorizontalLayout {
+            spacing: 14px;
+            vertical-stretch: 1;
+
+            VerticalLayout {
+                width: 336px;
+                spacing: 8px;
+
+                Text {
+                    text: "场景预设";
+                    color: Glass.label-3;
+                    font-size: 11px;
+                    font-weight: 600;
+                    letter-spacing: 0.5px;
+                }
+
+                for preset[i] in root.presets : PresetRow {
+                    selected: i == root.current-preset;
+                    heading: preset.title;
+                    sub: preset.summary;
+                    accent: root.accent;
+
+                    picked => {
+                        root.current-preset = i;
+                        root.label-a = preset.label-a;
+                        root.label-b = preset.label-b;
+                        root.label-c = preset.label-c;
+                        root.param-a = preset.value-a;
+                        root.param-b = preset.value-b;
+                        root.param-c = preset.value-c;
+                        root.motion = preset.motion;
+                        root.preset-summary = preset.summary;
+                        root.select-preset(i);
+                    }
+                }
+
+                Rectangle { vertical-stretch: 1; }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+                border-radius: Glass.r-card;
+                background: Glass.fill;
+
+                VerticalLayout {
+                    padding: 14px;
+                    spacing: 2px;
+
+                    Text {
+                        text: "场景参数";
+                        color: Glass.label-3;
+                        font-size: 11px;
+                        font-weight: 600;
+                        letter-spacing: 0.5px;
+                    }
+
+                    GlassSlider { label: root.label-a; minimum: 0; maximum: 1; accent: root.accent; value <=> root.param-a; }
+                    GlassSlider { label: root.label-b; minimum: 0; maximum: 1; accent: root.accent; value <=> root.param-b; }
+                    GlassSlider { label: root.label-c; minimum: 0; maximum: 1; accent: root.accent; value <=> root.param-c; }
+
+                    Rectangle { height: 1px; background: Glass.hairline-dim; }
+
+                    GlassSlider { label: "桌面亮度"; minimum: 0.2; maximum: 1.6; accent: root.accent; value <=> root.brightness; }
+                    GlassSlider { label: "动势"; minimum: 0; maximum: 1; accent: root.accent; value <=> root.motion; }
+                }
+            }
+        }
+
+        // —— 页签 2:壁纸库(占位,先定信息架构)—— 
+        if root.page == 1 : Rectangle {
+            vertical-stretch: 1;
+            border-radius: Glass.r-card;
+            background: Glass.fill;
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 6px;
+
+                Text {
+                    text: "壁纸库";
+                    color: Glass.label;
+                    font-size: 22px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: "缩略图网格 / 搜索 / 一键切换 · 待接入";
+                    color: Glass.label-3;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+
+        // —— 页签 3:设置(占位)—— 
+        if root.page == 2 : Rectangle {
+            vertical-stretch: 1;
+            border-radius: Glass.r-card;
+            background: Glass.fill;
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 6px;
+
+                Text {
+                    text: "设置";
+                    color: Glass.label;
+                    font-size: 22px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: "开机自启 / 托盘开关 / 省电策略 · 待接入";
+                    color: Glass.label-3;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+
+        // —— 底部 —— 
+        HorizontalLayout {
+            height: 34px;
+            spacing: 10px;
+            alignment: center;
+
+            if root.page == 0 : Pill { text: "存为壁纸"; primary: true; accent: root.accent; clicked => { root.save-requested(); } }
+            if root.page == 0 : Pill { text: "恢复默认"; accent: root.accent; clicked => { root.reset-requested(); } }
+
+            Text {
+                text: root.status;
+                color: Glass.label-2;
+                font-size: 12px;
+                vertical-alignment: center;
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            if root.page == 0 : Text {
+                text: root.preset-summary;
+                color: Glass.label-3;
+                font-size: 11px;
+                vertical-alignment: center;
+                overflow: elide;
+                max-width: 320px;
+            }
+        }
+    }
+}

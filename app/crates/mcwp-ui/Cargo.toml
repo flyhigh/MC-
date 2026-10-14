@@ -1,0 +1,27 @@
+[package]
+name = "mcwp-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+mcwp-platform = { path = "../mcwp-platform" }
+mcwp-spec = { path = "../mcwp-spec" }
+raw-window-handle = "0.6.2"
+tracing.workspace = true
+# 面板只用「winit 窗口 + 软件渲染」:不占 GPU、不额外加载显卡驱动,
+# 壁纸那边已经独占着 DX12 了。关窗后这部分内存整体释放。
+slint = { version = "1", default-features = false, features = [
+    "std",
+    "backend-winit",
+    "renderer-software",
+    "compat-1-2",
+    # 通过 `Window::window_handle()` 拿 HWND,给 DWM 圆角/拖动用
+    "raw-window-handle-06",
+    # 拿到底层 winit 窗口,标题栏拖动直接交给 Windows 自己的模态移动循环
+    "unstable-winit-030",
+] }
+
+[build-dependencies]
+slint-build = "1"

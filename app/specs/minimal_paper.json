@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "id": "",
+  "title": "极简纸感",
+  "source": "builtin",
+  "keywords": [
+    "极简纸感"
+  ],
+  "mood": {
+    "calm": 0.85,
+    "focus": 0.6,
+    "energy": 0.1
+  },
+  "palette": [
+    "#F3EEE4",
+    "#E4D9C6",
+    "#C9B79A",
+    "#8A7A63",
+    "#4A4238"
+  ],
+  "scene": {
+    "preset": "minimal_paper",
+    "params": {
+      "grain": 0.3,
+      "softness": 0.65,
+      "warmth": 0.55
+    }
+  },
+  "motion": {
+    "intensity": 0.12,
+    "speed": 0.25
+  },
+  "lighting": {
+    "mode": "auto_ambient",
+    "key_light": 0.5,
+    "follow_desktop_brightness": true
+  },
+  "elements": [],
+  "overlay": {
+    "clock": false,
+    "quote": null
+  },
+  "seed": 20261014
+}

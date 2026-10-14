@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "id": "",
+  "title": "雨夜城市",
+  "source": "builtin",
+  "keywords": [
+    "雨夜城市"
+  ],
+  "mood": {
+    "calm": 0.65,
+    "focus": 0.7,
+    "energy": 0.35
+  },
+  "palette": [
+    "#0B1020",
+    "#1B2A4A",
+    "#4F7CFF",
+    "#9BB8FF",
+    "#E6ECFF"
+  ],
+  "scene": {
+    "preset": "rainy_window_city",
+    "params": {
+      "blur": 0.35,
+      "parallax": 0.25,
+      "rain": 0.65
+    }
+  },
+  "motion": {
+    "intensity": 0.45,
+    "speed": 0.6
+  },
+  "lighting": {
+    "mode": "auto_ambient",
+    "key_light": 0.5,
+    "follow_desktop_brightness": true
+  },
+  "elements": [],
+  "overlay": {
+    "clock": false,
+    "quote": null
+  },
+  "seed": 20261014
+}

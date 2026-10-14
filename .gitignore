@@ -1,0 +1,15 @@
+# Rust 构建产物:本机 target/ 有 10 GB 量级,绝对不能进仓库。
+/app/target/
+
+# tools/subset-panel-font.py 下载 Noto Sans SC 原始 woff2 用的缓存。
+/.fontcache/
+
+# 排查 / 回归截图:百余 MB,而且是"随时重拍"的过程产物。
+/app/shots/
+/app/m0-shot*.png
+
+# 编辑器 / 系统杂物
+.vscode/
+.idea/
+Thumbs.db
+*.swp

@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "id": "",
+  "title": "星云漂流",
+  "source": "builtin",
+  "keywords": [
+    "星云漂流"
+  ],
+  "mood": {
+    "calm": 0.55,
+    "focus": 0.35,
+    "energy": 0.75
+  },
+  "palette": [
+    "#05060F",
+    "#14103A",
+    "#5B2E9E",
+    "#C46BD8",
+    "#F2D6FF"
+  ],
+  "scene": {
+    "preset": "nebula_drift",
+    "params": {
+      "density": 0.55,
+      "glow": 0.6,
+      "swirl": 0.45
+    }
+  },
+  "motion": {
+    "intensity": 0.65,
+    "speed": 0.45
+  },
+  "lighting": {
+    "mode": "auto_ambient",
+    "key_light": 0.5,
+    "follow_desktop_brightness": true
+  },
+  "elements": [],
+  "overlay": {
+    "clock": false,
+    "quote": null
+  },
+  "seed": 20261014
+}

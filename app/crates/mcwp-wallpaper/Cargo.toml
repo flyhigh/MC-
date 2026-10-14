@@ -1,0 +1,20 @@
+[package]
+name = "mcwp-wallpaper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+mcwp-platform = { path = "../mcwp-platform" }
+mcwp-render = { path = "../mcwp-render" }
+mcwp-spec = { path = "../mcwp-spec" }
+mcwp-ui = { path = "../mcwp-ui" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+windows.workspace = true
+
+[features]
+# 排查脚手架(窗口层级 dump、GDI 自检、离屏回读等),默认关闭。
+dev-tools = ["mcwp-platform/dev-tools"]
+

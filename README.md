@@ -1,0 +1,51 @@
+# MC 壁纸
+
+Windows 桌面动态壁纸与个性化工具。壁纸窗口挂在桌面图标之下的「壁纸层」(`WorkerW`),常驻托盘;
+控制面板是一块 Slint 写的 iOS 液态玻璃面板;目标形态是「按工作状态 / 对话生成壁纸」+ 可交互桌宠。
+
+- **语言**:Rust(edition 2024)
+- **渲染**:wgpu → DXGI 合成交换链(`CreateSwapChainForComposition` + `IDCompositionVisual`)
+- **界面**:Slint,进程内按需建窗、关窗即释放;字体子集内嵌,不依赖系统字体
+- **系统集成**:Win32 原生(`Shell_NotifyIconW` 托盘 / `HKCU\...\Run` 开机自启 / DWM 窗口属性),无第三方封装
+
+进度:M0(桌面挂载 + 着色器场景)、M1 的一部分(壁纸库、控制面板、托盘)已完成。
+技术细节与实测数据见 `docxs/MC壁纸-需求与技术方案.md`。
+
+## 构建
+
+```powershell
+cd app
+cargo build --release --workspace
+```
+
+需要 Rust 1.85+。首次构建要拉 wgpu / slint,耗时和体积都不小。
+
+## 运行
+
+```powershell
+.\target\release\mcwp-wallpaper.exe                # 常驻运行,操作入口在托盘右键菜单
+.\target\release\mcwp-wallpaper.exe --panel        # 顺便打开控制面板
+.\target\release\mcwp-wallpaper.exe --preset list  # 列出内置场景预设
+```
+
+其余参数(`--spec` / `--attach` / `--fps` 等,以及 `--window` / `--dump` / `--gdi-only` 这类诊断开关,
+后者需要 `--features dev-tools`)见 `app/crates/mcwp-wallpaper/src/main.rs` 顶部的用法注释。
+
+## 目录
+
+| 路径 | 说明 |
+| --- | --- |
+| `app/crates/mcwp-spec` | `WallpaperSpec` 契约、校验器、内置场景预设 |
+| `app/crates/mcwp-render` | wgpu 渲染器(合成交换链,离屏回读) |
+| `app/crates/mcwp-platform` | 桌面挂载、托盘、开机自启、DWM 玻璃窗口 |
+| `app/crates/mcwp-ui` | Slint 控制面板 + 内嵌子集字体 |
+| `app/crates/mcwp-wallpaper` | 主程序:宿主窗口 + 主循环 |
+| `app/specs/` | 四个内置预设导出的示例 spec |
+| `docxs/` | 需求与技术方案、开源壁纸软件 / 桌宠项目调研 |
+| `tools/` | 图标生成、面板字体子集化、拖动与截图回归脚本 |
+
+## 开发备注
+
+- 改过 `app/crates/mcwp-ui/ui/panel.slint` 里的面板文案后要重跑
+  `python tools/subset-panel-font.py`。面板用的是子集字体,缺字不会报错、只会静静地画不出来。
+- `app/.cargo/config.toml` 把 crates.io 换成了 USTC 镜像(本机直连官方源约 16 KB/s);删掉即回退官方源。

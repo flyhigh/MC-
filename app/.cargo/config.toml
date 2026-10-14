@@ -1,0 +1,11 @@
+# 仅对本项目生效的 cargo 配置(删除本文件即回退官方源)。
+# 探针测速:直连 static.crates.io ≈ 16 KB/s,USTC 镜像 ≈ 392 KB/s。
+
+[source.crates-io]
+replace-with = "ustc"
+
+[source.ustc]
+registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
+
+[net]
+retry = 3
