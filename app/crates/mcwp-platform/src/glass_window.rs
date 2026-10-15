@@ -9,15 +9,21 @@
 //! 3. **拖动**:没有标题栏就没有拖动区,这里用"按下时记住光标 + 窗口原点,之后按光标位移
 //!    移动窗口"来实现。用 `GetCursorPos` 而不是窗口内坐标,是因为窗口跟着鼠标走之后,
 //!    鼠标在窗口内的相对坐标会回到原位,增量为 0,拖不动。
+//! 4. **最小化 / 放大**:系统那颗最小化键和标题栏一起没了,只能自己代劳(`minimize` /
+//!    `WindowZoom`)。放大不能用 `SW_MAXIMIZE` —— 见 `WindowZoom::toggle` 的说明。
 
 use anyhow::Result;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_BORDER_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
-    DwmSetWindowAttribute,
+    DWMWA_BORDER_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_ROUND, DwmSetWindowAttribute,
+};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetWindowRect, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
+    GetCursorPos, GetWindowRect, SW_MINIMIZE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    SetWindowPos, ShowWindow,
 };
 
 /// DWM 的"不要边框"哨兵值(`DWMWA_COLOR_NONE`)。
@@ -117,5 +123,75 @@ impl WindowDrag {
                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
+    }
+}
+
+/// 最小化窗口(顶栏那颗「−」)。
+///
+/// 无边框窗口没有系统菜单,`ShowWindow` 是唯一入口;最小化后仍然能从任务栏恢复,因为
+/// 面板窗口本来就有任务栏按钮(Slint 没把它做成 `WS_EX_TOOLWINDOW`)。
+pub fn minimize(hwnd: isize) -> Result<()> {
+    let _ = unsafe { ShowWindow(hwnd_of(hwnd), SW_MINIMIZE) };
+    Ok(())
+}
+
+/// 面板的「放大 / 还原」状态。
+///
+/// 故意**不走 `SW_MAXIMIZE`**:窗口是 `no-frame`,没有 `WS_THICKFRAME`,系统算"最大化尺寸"
+/// 的那套公式(工作区 + 边框)会退化成整块显示器 —— 最大化之后任务栏被盖住。所以这里自己
+/// 量一次显示器工作区,摆过去;顺带把放大前那块矩形记下来当还原点。
+#[derive(Debug, Default)]
+pub struct WindowZoom {
+    /// 放大前的窗口矩形;`None` = 当前没放大。
+    restore: Option<RECT>,
+}
+
+impl WindowZoom {
+    /// 在「放大」和「还原」之间切换,返回切换之后是不是放大状态。
+    pub fn toggle(&mut self, hwnd: isize) -> Result<bool> {
+        let hwnd = hwnd_of(hwnd);
+
+        // 还原:摆回放大前那块矩形(宽高一起写,所以 `SWP_NOSIZE` 这次不能加)。
+        if let Some(rect) = self.restore.take() {
+            let _ = unsafe {
+                SetWindowPos(
+                    hwnd,
+                    None,
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+            };
+            return Ok(false);
+        }
+
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(hwnd, &mut rect)? };
+
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        let mut info = MONITORINFO {
+            cbSize: core::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            return Ok(false);
+        }
+
+        let work = info.rcWork;
+        self.restore = Some(rect);
+        let _ = unsafe {
+            SetWindowPos(
+                hwnd,
+                None,
+                work.left,
+                work.top,
+                work.right - work.left,
+                work.bottom - work.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        };
+        Ok(true)
     }
 }

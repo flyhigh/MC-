@@ -1,8 +1,10 @@
 // MC 壁纸 · 控制面板 —— 生图界面(iOS 26 液态玻璃风格)
 //
-// 信息架构是两块:
+// 信息架构是两块,顶上再压一条窗口自己的「安全区」(自定义标题栏,见下面「顶部安全区」一段):
 //
-//   ┌──────────────┬────────────────────────────────────────────┐
+//   ┌───────────────────────────────────────────────────────────┐
+//   │ ● MC 壁纸 · 生图                            −      □      × │
+//   ├──────────────┬────────────────────────────────────────────┤
 //   │ 历史对话      │ 会话标题                                    │
 //   │  + 新建对话   │ ──────────────────────────────────────────  │
 //   │  对话一 ·…    │ 消息流(用户的靠右、染色;回复靠左、薄填充)  │
@@ -31,6 +33,8 @@
 //     → 凡是要圆角的地方一律用实色(带 alpha 的实色也算);渐变只留给圆角不重要的地方
 //       (窗口底色、环境光斑)。
 //   * `visible: false` 会被降级成一个 Clip 包裹元素,照样占布局空间;要不占位就用 `if`。
+//   * **Window 的孩子不带 `x` / `y` 时会被居中摆**,不是左上角。满窗口的底色看不出来,
+//     一条 36px 的标题栏会直接跑到正中间 —— 贴边的元素一律显式写 `x: 0px; y: 0px;`。
 //   * 布局的 `alignment` 指的是**主轴**方向:HorizontalLayout 里写 `alignment: center` 会把整条
 //     内容挤到中间(横向 stretch 同时也失效,输入框会塌成文字那么宽)。横向布局一律不写它,
 //     竖直居中交给布局默认的 cross 居中;真要竖排居中就用 VerticalLayout 的 alignment: center。
@@ -475,6 +479,76 @@ component NavRow inherits Rectangle {
     }
 }
 
+// 顶部安全区右边的一颗窗口键:最小化 / 放大 / 还原 / 关闭。
+//
+// 图形一律自己画(横线、方框):内嵌子集只收了面板文案用得到的字形,「最小化」「还原」
+// 这类符号有没有全看运气。关闭那颗是例外 —— × 在子集里(原来的关闭圆钮用的就是它)。
+// 尺寸照 Windows 的惯例:46px 宽、满高、只填充不描边,关闭键悬停变红。
+component CaptionButton inherits Rectangle {
+    in property <int> kind: 1;             // 0 最小化 / 1 放大 / 2 还原 / 3 关闭
+    in property <color> plate: #0B0F19;    // 标题栏底色(「还原」那块要拿它遮掉后面一格)
+
+    callback picked();
+
+    width: 46px;
+    height: 100%;
+    background: touch.has-hover ? (kind == 3 ? #C42B1C : Glass.fill-hover) : #00000000;
+    animate background { duration: 120ms; }
+
+    if kind == 3 : Text {
+        width: 100%;
+        height: 100%;
+        text: "×";
+        color: touch.has-hover ? #FFFFFFFF : Glass.label-2;
+        font-size: 16px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    // 最小化:一条横线
+    if kind == 0 : Rectangle {
+        width: 10px;
+        height: 1px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: Glass.label-2;
+    }
+
+    // 放大:一个方框
+    if kind == 1 : Rectangle {
+        width: 10px;
+        height: 10px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-width: 1px;
+        border-color: Glass.label-2;
+    }
+
+    // 还原:两个错开的方框,前面那格用标题栏底色盖掉后面那格的右下角
+    if kind == 2 : Rectangle {
+        width: 9px;
+        height: 9px;
+        x: (parent.width - self.width) / 2 + 2px;
+        y: (parent.height - self.height) / 2 - 2px;
+        border-width: 1px;
+        border-color: Glass.label-2;
+    }
+    if kind == 2 : Rectangle {
+        width: 9px;
+        height: 9px;
+        x: (parent.width - self.width) / 2 - 2px;
+        y: (parent.height - self.height) / 2 + 2px;
+        border-width: 1px;
+        border-color: Glass.label-2;
+        background: plate;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.picked(); }
+    }
+}
+
 // 右栏:一条消息。用户的气泡靠右、染色;回复靠左、薄填充。
 component MessageRow inherits HorizontalLayout {
     in property <string> body: "";
@@ -555,6 +629,14 @@ export component Panel inherits Window {
     // 真正的拖动由 Rust 侧驱动(见下面三个 drag-* 回调的说明)。
     private property <bool> drag-active: false;
 
+    // 顶部安全区(自定义标题栏)的底色:比玻璃暗一档的实色,跟着 `glass-tint` 走 ——
+    // 换壁纸时窗框的色相也跟着变。用实色是因为软件渲染器下圆角只对实色生效(见文件头)。
+    private property <color> caption-plate: glass-tint.darker(0.62);
+
+    // 窗口是不是放大状态。纯界面状态:真正的窗口状态在 Win32 那侧(见 mcwp_platform::glass_window),
+    // 面板只知道"该把标题栏那颗键画成放大还是还原"。
+    in property <bool> maximized: false;
+
     callback select-preset(int);
     callback values-changed();
     callback save-requested();
@@ -563,6 +645,10 @@ export component Panel inherits Window {
     callback drag-start();
     callback drag-move();
     callback drag-end();
+    // 顶部安全区右边那三颗窗口键。关窗还是原来的 close-requested(直接退出面板事件循环),
+    // 最小化 / 放大交给 Rust 侧调 Win32。
+    callback minimize-requested();
+    callback toggle-maximize-requested();
     // 生图界面:发消息 / 切会话 / 新建会话
     callback send-message(string);
     callback select-conversation(int);
@@ -575,8 +661,10 @@ export component Panel inherits Window {
     // 任务栏 / Alt-Tab 的窗口图标。`@image-url` 走的还是 build.rs 的 EmbedFiles,所以图标
     // 也是编进 exe 的;exe 文件本身的那枚图标另说(那要 rc.exe 写资源,本轮没做)。
     icon: @image-url("../assets/mcwp-icon-256.png");
-    width: 1024px;
-    height: 672px;
+    // 只给「首选」尺寸,不给 `width` / `height`:那两个是**固定**约束(min = max),窗口一被
+    // 系统拉大(放大),根元素还是钉在原尺寸上,内容缩在左上角、右边一大片空玻璃。
+    preferred-width: 1024px;
+    preferred-height: 672px;
     no-frame: true;
     background: ambient-c;
     default-font-family: "MCWP Sans";
@@ -682,41 +770,62 @@ export component Panel inherits Window {
         }
     }
     // ——————————————————————————————
-    // 玻璃上的内容。四周 18px 内边距,离窗口边留出一圈玻璃本色当"边框"
+    // 顶部安全区(自定义标题栏)。满宽贴边 + 实色,刻意和下面的玻璃不同色 —— 它模仿的是
+    // 系统标题栏,不是玻璃上的一张卡片;窗口那圈圆角由 DWM 裁剪,这里不用自己倒角。
+    // 右边三颗键是「最小化 / 放大(还原)/ 关闭」,按 Windows 的排布(最右边是关闭)。
     // ——————————————————————————————
-    VerticalLayout {
+    // `x` / `y` 必须显式写:Window 的孩子不带坐标时会被**居中**摆(不是左上角)—— 100% 宽高
+    // 的元素看不出差别,一条 36px 高的标题栏会直接跑到窗口正中间去。
+    Rectangle {
+        x: 0px;
+        y: 0px;
         width: 100%;
-        height: 100%;
-        padding: 18px;
-        spacing: 12px;
+        height: 36px;
+        background: caption-plate;
 
-        // —— 标题栏(也是拖拽区)—— 
+        // 底下这条发丝线:深色标题栏压着深色玻璃,没有分界会糊成一片
         Rectangle {
-            height: 30px;
+            width: parent.width;
+            height: 1px;
+            y: parent.height - 1px;
+            background: Glass.hairline-dim;
+        }
 
-            drag := TouchArea {
-                pointer-event(e) => {
-                    if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+        // 拖拽区铺满整条。三颗按钮是后声明的,浮在上面,事件先到它们手里(和原来那颗关闭钮一样)。
+        drag := TouchArea {
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                    // 放大状态下不拖:Windows 上拖最大化窗口的标题栏 = 还原 + 继续拖,我们没做
+                    // 这套,干脆当成没接住,免得把一块铺满屏幕的窗口拖出工作区。
+                    if (!root.maximized) {
                         root.drag-active = true;
                         root.drag-start();
-                    } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
-                        if (root.drag-active) {
-                            root.drag-active = false;
-                            root.drag-end();
-                        }
-                    } else if (e.kind == PointerEventKind.move && root.drag-active) {
-                        // 只在还按着的时候转发:窗口没跟着动(手动拖动)时才需要这条。
-                        root.drag-move();
                     }
-                    // Cancel 故意不处理:它就是"指针离开了标题栏"的信号,收了就脱手。
+                } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
+                    if (root.drag-active) {
+                        root.drag-active = false;
+                        root.drag-end();
+                    }
+                } else if (e.kind == PointerEventKind.move && root.drag-active) {
+                    // 只在还按着的时候转发:窗口没跟着动(手动拖动)时才需要这条。
+                    root.drag-move();
                 }
+                // Cancel 故意不处理:它就是"指针离开了标题栏"的信号,收了就脱手。
             }
+            // 双击标题栏 = 放大 / 还原,Windows 的老规矩
+            double-clicked => { root.toggle-maximize-requested(); }
+        }
 
-            HorizontalLayout {
-                width: 100%;
-                // 右边给关闭按钮留位,别让文字压到它下面
-                padding-right: 34px;
-                spacing: 8px;
+        HorizontalLayout {
+            height: 100%;
+            padding-left: 18px;
+            // 右边给三颗窗口键留位,别让标题压到它们下面
+            padding-right: 138px;
+            spacing: 8px;
+
+            // 套一层 VBox:横向布局里定高的小圆点会被顶到行顶边(见文件头那条 alignment 的说明)
+            VerticalLayout {
+                alignment: center;
 
                 Rectangle {
                     width: 6px;
@@ -725,59 +834,62 @@ export component Panel inherits Window {
                     background: accent;
                     opacity: 0.9;
                 }
-                Text {
-                    text: "MC 壁纸";
-                    color: Glass.label-2;
-                    font-size: 12px;
-                    font-weight: 600;
-                    letter-spacing: 0.6px;
-                    vertical-alignment: center;
-                }
-                Text {
-                    text: "·";
-                    color: Glass.label-3;
-                    font-size: 12px;
-                    vertical-alignment: center;
-                }
-                Text {
-                    text: "生图";
-                    color: Glass.label-3;
-                    font-size: 12px;
-                    vertical-alignment: center;
-                }
-
-                Rectangle { horizontal-stretch: 1; }
+            }
+            Text {
+                text: "MC 壁纸";
+                color: Glass.label-2;
+                font-size: 12px;
+                font-weight: 600;
+                letter-spacing: 0.6px;
+                vertical-alignment: center;
+            }
+            Text {
+                text: "·";
+                color: Glass.label-3;
+                font-size: 12px;
+                vertical-alignment: center;
+            }
+            Text {
+                text: "生图";
+                color: Glass.label-3;
+                font-size: 12px;
+                vertical-alignment: center;
             }
 
-            // 关闭按钮:玻璃圆钮 + 一个 ×(不依赖系统字形,子集里带了这颗)
-            Rectangle {
-                width: 26px;
-                height: 26px;
-                x: parent.width - self.width;
-                y: (parent.height - self.height) / 2;
-                border-radius: self.width / 2;
-                border-width: 1px;
-                border-color: close-touch.has-hover ? Glass.hairline : Glass.hairline-dim;
-                background: close-touch.has-hover ? Glass.fill-hover : Glass.fill;
-                animate background { duration: 140ms; }
-                animate border-color { duration: 140ms; }
-
-                Text {
-                    text: "×";
-                    color: Glass.label-2;
-                    font-size: 17px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                    width: 100%;
-                    height: 100%;
-                }
-
-                close-touch := TouchArea {
-                    mouse-cursor: pointer;
-                    clicked => { root.close-requested(); }
-                }
-            }
+            Rectangle { horizontal-stretch: 1; }
         }
+
+        // 右上角三颗窗口键:自右往左 = 关闭 / 放大(还原)/ 最小化
+        CaptionButton {
+            kind: 3;
+            plate: caption-plate;
+            x: parent.width - self.width;
+            picked => { root.close-requested(); }
+        }
+        CaptionButton {
+            kind: root.maximized ? 2 : 1;
+            plate: caption-plate;
+            x: parent.width - self.width * 2;
+            picked => { root.toggle-maximize-requested(); }
+        }
+        CaptionButton {
+            kind: 0;
+            plate: caption-plate;
+            x: parent.width - self.width * 3;
+            picked => { root.minimize-requested(); }
+        }
+    }
+
+    // ——————————————————————————————
+    // 玻璃上的内容。四周 18px 内边距,离窗口边留出一圈玻璃本色当"边框";
+    // 顶上那条 36px 的安全区满宽贴边、放不进这层布局,所以这里让出 54px(= 36 + 18)。
+    // ——————————————————————————————
+    VerticalLayout {
+        width: 100%;
+        height: 100%;
+        padding: 18px;
+        padding-top: 54px;
+        spacing: 12px;
 
         // —— 主体:左栏历史对话 / 右栏会话 —— 
         HorizontalLayout {

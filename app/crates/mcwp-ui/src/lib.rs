@@ -21,7 +21,7 @@ use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use mcwp_platform::glass_window::{apply_glass, WindowDrag};
+use mcwp_platform::glass_window::{WindowDrag, WindowZoom, apply_glass, minimize};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::ComponentHandle;
 use slint::winit_030::WinitWindowAccessor;
@@ -424,15 +424,8 @@ fn build(state: &PanelState, events: Sender<UiEvent>) -> Result<Panel> {
                     }
                 }
                 // 句柄是事件循环里异步取到的;万一用户手快过它,这里再同步试一次。
-                let handle = match hwnd.get() {
-                    0 => match weak.upgrade().and_then(|panel| window_hwnd(&panel)) {
-                        Some(handle) => {
-                            hwnd.set(handle);
-                            handle
-                        }
-                        None => return,
-                    },
-                    handle => handle,
+                let Some(handle) = panel_hwnd(&weak, &hwnd) else {
+                    return;
                 };
                 *drag.borrow_mut() = WindowDrag::begin(handle);
             });
@@ -450,6 +443,50 @@ fn build(state: &PanelState, events: Sender<UiEvent>) -> Result<Panel> {
         ui.on_drag_end(move || {
             *drag.borrow_mut() = None;
         });
+    }
+
+    {
+        // 顶部安全区右边那三颗窗口键里的两颗。和拖动一样在 UI 线程里直接落到 Win32:
+        // 无边框窗口没有系统标题栏,最小化 / 放大都得自己代劳(关窗那颗是 close-requested,
+        // 退出事件循环即可,不用碰 Win32)。
+        //
+        // 「放大」记着自己量过的工作区矩形,所以状态由 `WindowZoom` 持有 —— 它也是面板唯一的
+        // 窗口状态,面板本身仍然不存业务状态。
+        let zoom = Rc::new(RefCell::new(WindowZoom::default()));
+        let weak = ui.as_weak();
+        let hwnd = hwnd.clone();
+
+        {
+            let weak = weak.clone();
+            let hwnd = hwnd.clone();
+            ui.on_minimize_requested(move || {
+                let Some(handle) = panel_hwnd(&weak, &hwnd) else {
+                    return;
+                };
+                if let Err(err) = minimize(handle) {
+                    tracing::warn!("最小化面板失败:{err:?}");
+                }
+            });
+        }
+
+        {
+            let zoom = zoom.clone();
+            let weak = weak.clone();
+            ui.on_toggle_maximize_requested(move || {
+                let Some(handle) = panel_hwnd(&weak, &hwnd) else {
+                    return;
+                };
+                match zoom.borrow_mut().toggle(handle) {
+                    // 面板只关心"该画放大还是还原",窗口状态的真身在 Win32 那侧。
+                    Ok(maximized) => {
+                        if let Some(panel) = weak.upgrade() {
+                            panel.set_maximized(maximized);
+                        }
+                    }
+                    Err(err) => tracing::warn!("放大 / 还原面板失败:{err:?}"),
+                }
+            });
+        }
     }
 
     Ok(ui)
@@ -493,6 +530,21 @@ fn window_hwnd(ui: &Panel) -> Option<isize> {
             tracing::warn!("取面板窗口句柄失败:{err}");
             None
         }
+    }
+}
+
+/// 拿面板窗口的 HWND:优先用 `schedule_glass` 缓存的那份,缓存还是空的就现取一次。
+///
+/// 句柄是事件循环里异步取到的(见 `schedule_glass`),用户手快过它时这里再同步试一次 ——
+/// 拖动与顶栏那两颗窗口键都靠它。
+fn panel_hwnd(weak: &slint::Weak<Panel>, cell: &Rc<Cell<isize>>) -> Option<isize> {
+    match cell.get() {
+        0 => {
+            let handle = weak.upgrade().and_then(|panel| window_hwnd(&panel))?;
+            cell.set(handle);
+            Some(handle)
+        }
+        handle => Some(handle),
     }
 }
 
