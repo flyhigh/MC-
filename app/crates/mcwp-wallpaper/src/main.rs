@@ -13,6 +13,8 @@
 //! mcwp-wallpaper --dump-spec             # 打印当前生效的 spec 与指纹
 //! mcwp-wallpaper --export-presets out/   # 把每个预设导出成示例 spec 文件
 //! mcwp-wallpaper --panel                  # 同时打开 Slint 控制面板
+//! mcwp-wallpaper --ai-selftest "把壁纸调冷一点"   # 只问模型一次,打印回复与规格(不建窗口)
+//! mcwp-wallpaper --panel --ai-ask "雨夜的城市"    # 开面板,并替用户把这句话发出去
 //! mcwp-wallpaper --attach auto            # 挂载策略,见 AttachMode::NAMES
 //! mcwp-wallpaper --show-host              # 额外对挂载目标调用 ShowWindow(排查用)
 //! mcwp-wallpaper --dump                   # 打印桌面窗口层级(排查用)
@@ -52,6 +54,48 @@ use windows::Win32::UI::WindowsAndMessaging::{
 mod sessions;
 
 use sessions::Sessions;
+
+/// 没配模型时,回复位给的东西。**要能照着做**:说清楚去哪儿写那份 ai.json。
+const NO_MODEL_REPLY: &str = "还没配模型,这句话先记着。配好之后就能按它生成壁纸 —— 写一份 \
+%APPDATA%\\MC壁纸\\ai.json(base_url / model / api_key),免费的有智谱 GLM-4-Flash、硅基流动、\
+OpenRouter,启动日志里有完整的配法。";
+
+/// 后台线程把模型结果送回主循环的包裹。
+///
+/// 为什么要绕这一道:模型是秒级往返,主循环是 60 fps —— **绝不能在这里同步等**,否则整个桌面
+/// 卡住(还会带着面板一起卡)。所以发请求丢给线程,结果回到主循环再统一落地。
+struct AiOutcome {
+    /// 这句话属于哪个会话(回复回来时用户可能已经切走了)
+    session: u64,
+    draft: mcwp_ai::Draft,
+}
+
+/// 把一句话交给模型:记进会话 → 起后台线程 → 结果回到主循环落地。返回该显示的状态行文案。
+fn ask_model(
+    text: &str,
+    sessions: &mut Sessions,
+    ai: &Option<mcwp_ai::Client>,
+    spec: &WallpaperSpec,
+    tx: &Sender<AiOutcome>,
+) -> &'static str {
+    let session = sessions.send(text);
+    let Some(client) = ai else {
+        // 没配模型也得有回音:不然用户发完消息看着空荡荡的右栏,只会以为程序坏了
+        sessions.reply(session, NO_MODEL_REPLY);
+        return "没配模型 · 这台机器上还没写 ai.json";
+    };
+    let client = client.clone();
+    let request = text.to_string();
+    // 把当前壁纸一起带上:模型要靠它做"只改一点"这类改动
+    let current = spec.clone();
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let draft = client.draft(&request, &current);
+        // 主线程收摊了(托盘退出)就随它去,没人接的结果没有意义
+        let _ = tx.send(AiOutcome { session, draft });
+    });
+    "正在生成壁纸…"
+}
 
 /// 面板窗口的标题。要和 `panel.slint` 的 `title` 一字不差 —— 单实例守卫靠它找窗口。
 const PANEL_TITLE: PCWSTR = w!("MC 壁纸 · 控制面板");
@@ -110,6 +154,36 @@ fn trace_chain(_hwnd: windows::Win32::Foundation::HWND, _label: &str) {
     mcwp_platform::diag::describe_chain(_hwnd, _label);
 }
 
+/// `--ai-selftest`:问模型一次,把"它给的回复 / 规格 / 指纹"原样摊开。
+///
+/// 接模型时最烦的是"错在哪一层说不清":key 不对、模型名不对、提示词不行、JSON 不合法、值越界……
+/// 这个入口把每一层都打出来 —— 调用了几次、是不是走了降级、最终落地的 spec 长什么样。
+fn run_ai_selftest(request: &str, current: &WallpaperSpec) -> Result<()> {
+    let client = mcwp_ai::Client::new(mcwp_ai::Config::load()?);
+    println!("模型:{}", client.describe());
+    println!("用户说:{request}");
+    let started = Instant::now();
+    let draft = client.draft(request, current);
+    println!(
+        "耗时:{:.1}s  调用:{} 次  降级:{}",
+        started.elapsed().as_secs_f32(),
+        draft.calls,
+        if draft.degraded {
+            "是(模型没接上,走了本地关键词降级)"
+        } else {
+            "否"
+        }
+    );
+    println!("模式:{:?}", draft.mode);
+    println!("回复:{}", draft.reply);
+    if !draft.image_prompt.is_empty() {
+        println!("画面描述(留给以后文生图):{}", draft.image_prompt);
+    }
+    println!("指纹:{}", draft.spec.spec_hash());
+    println!("{}", draft.spec.to_pretty_json());
+    Ok(())
+}
+
 /// 决定这一轮渲染什么:`--spec` 优先,其次 `--preset`,都没有就用默认预设。
 fn load_spec(args: &Args) -> Result<WallpaperSpec> {
     if let Some(path) = args.spec_path.as_deref() {
@@ -126,7 +200,6 @@ fn load_spec(args: &Args) -> Result<WallpaperSpec> {
         None => Ok(WallpaperSpec::from_preset(Preset::DEFAULT)),
     }
 }
-
 
 /// 把「当前 spec + 各预设默认值 + 壁纸库 + 会话」拼成面板的初始状态。
 fn panel_state(
@@ -367,6 +440,10 @@ struct Args {
     export_presets: Option<String>,
     /// 启动时打开控制面板
     panel: bool,
+    /// 只问模型一次,打印结果就退出(不建窗口)
+    ai_selftest: Option<String>,
+    /// 开面板,并替用户把这句话发出去
+    ai_ask: Option<String>,
     stats_interval: Duration,
 }
 
@@ -388,6 +465,8 @@ impl Args {
             dump_spec: false,
             export_presets: None,
             panel: false,
+            ai_selftest: None,
+            ai_ask: None,
             stats_interval: Duration::from_secs(5),
         };
         let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -463,6 +542,14 @@ impl Args {
                     args.panel = true;
                     i += 1;
                 }
+                "--ai-selftest" => {
+                    args.ai_selftest = value.cloned();
+                    i += 2;
+                }
+                "--ai-ask" => {
+                    args.ai_ask = value.cloned();
+                    i += 2;
+                }
                 "--attach" => {
                     match value.and_then(|v| AttachMode::parse(v)) {
                         Some(mode) => args.attach_mode = mode,
@@ -514,7 +601,8 @@ fn main() -> Result<()> {
         || args.plain_window
         || args.dump
         || args.gdi_only
-        || args.selftest;
+        || args.selftest
+        || args.ai_selftest.is_some();
     if !is_diagnostic_run && !claim_single_instance() {
         return Ok(());
     }
@@ -529,6 +617,13 @@ fn main() -> Result<()> {
     );
     if args.dump_spec {
         println!("{}", spec.to_pretty_json());
+    }
+
+    // 「只问模型一次」也是不建窗口的一次性动作:打印回复 + 规格 + 指纹就退出。
+    // 这是接模型时唯一需要的调试入口 —— 不用开面板、不用点鼠标,也不用管中文输入法。
+    if let Some(request) = args.ai_selftest.as_deref() {
+        run_ai_selftest(request, &spec)?;
+        return Ok(());
     }
     #[cfg(not(feature = "dev-tools"))]
     if args.dump || args.gdi_only || args.plain_window || args.selftest || args.show_host {
@@ -597,6 +692,22 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // —— 模型 ——
+    // 没配就只是"少个能力",不是错误:面板照常能开、能聊,回复位会说清楚去哪儿配。
+    let ai = match mcwp_ai::Config::load() {
+        Ok(cfg) => {
+            let client = mcwp_ai::Client::new(cfg);
+            tracing::info!("模型已就绪:{}", client.describe());
+            Some(client)
+        }
+        Err(err) => {
+            tracing::warn!("没配模型,生图先退回提示文案:{err}");
+            None
+        }
+    };
+    // 请求跑在后台线程,结果从这里回到主循环
+    let (ai_tx, ai_rx) = std::sync::mpsc::channel::<AiOutcome>();
+
     // —— 控制面板 ——
     // 面板跑在自己的线程和自己的 Slint 事件循环里;这里只保留一个事件队列,
     // 每帧开头把它清空一次,所以拖动滑杆的下一帧就能看到变化。
@@ -612,6 +723,16 @@ fn main() -> Result<()> {
     } else {
         None
     };
+
+    // `--ai-ask "…"`:开面板之后顺手把这句话发出去。命令行也能生成壁纸,
+    // 顺带成了唯一的"整条链路"自检方式 —— 合成的键盘输入会被本机中文输入法吃掉,打字那条路验不了。
+    if let Some(text) = args.ai_ask.clone() {
+        let status = ask_model(&text, &mut sessions, &ai, &spec, &ai_tx);
+        if let Some(handle) = &panel {
+            handle.refresh_session(sessions.state());
+            handle.set_status(status);
+        }
+    }
 
     // —— 托盘 ——
     // 和宿主窗口同一个线程:宿主主循环的 `PeekMessageW` 取的是整条线程的消息队列,
@@ -663,12 +784,11 @@ fn main() -> Result<()> {
                     brightness = ui_brightness.clamp(0.2, 1.6);
                     params = SceneParams::from_spec(&spec, width as u32, height as u32, brightness);
                 }
-                // —— 生图界面:Rust 侧先记着,模型那一环等 M3 —— 
+                // —— 生图界面:一句话 → 模型给一份壁纸规格 → 换上去 —— 
                 mcwp_ui::UiEvent::SendMessage(text) => {
                     if text.trim().is_empty() {
                         continue;
                     }
-                    sessions.send(&text);
                     // 用户敲的字面大概率超出内嵌字体子集(生僻字、emoji),缺字是静默不画,先记一笔。
                     let missing = mcwp_ui::missing_chars(&text);
                     if !missing.is_empty() {
@@ -677,9 +797,11 @@ fn main() -> Result<()> {
                             missing.len()
                         );
                     }
+                    // 记进会话 + 丢给后台线程;结果几秒后从 ai_rx 回来
+                    let status = ask_model(&text, &mut sessions, &ai, &spec, &ai_tx);
                     if let Some(handle) = &panel {
                         handle.refresh_session(sessions.state());
-                        handle.set_status("AI 未接入 · 这句已经记在当前会话里");
+                        handle.set_status(status);
                     }
                 }
                 mcwp_ui::UiEvent::SelectConversation(index) => {
@@ -796,6 +918,49 @@ fn main() -> Result<()> {
                     }
                 }
             }
+        }
+
+        // —— 模型的结果落地 —— 
+        // 只有会话还在才继续:用户可能在等的时候把这条删了,那就别把壁纸也换掉(会显得"删了还生效")。
+        while let Ok(outcome) = ai_rx.try_recv() {
+            let AiOutcome { session, draft } = outcome;
+            if !sessions.reply(session, &draft.reply) {
+                continue;
+            }
+            spec = draft.spec;
+            params = SceneParams::from_spec(&spec, width as u32, height as u32, brightness);
+            preset_index = mcwp_spec::PRESETS
+                .iter()
+                .position(|candidate| *candidate == spec.preset())
+                .unwrap_or(preset_index);
+            // T3(显式创作)才入库;T2(「冷一点」这类)只改参数 —— 不然聊两句库里就一堆垃圾
+            if draft.mode == mcwp_ai::Mode::Create {
+                match save_to_library(&spec) {
+                    Ok(path) => {
+                        tracing::info!("新壁纸已入壁纸库:{}", path.display());
+                        library = scan_library();
+                    }
+                    Err(err) => tracing::warn!("生成成功但入库失败:{err:?}"),
+                }
+            }
+            let status = if draft.degraded {
+                format!("模型没接上 · 先用内置预设顶了「{}」", spec.title)
+            } else if draft.calls > 1 {
+                format!("已换壁纸 ·「{}」(重试过一次)", spec.title)
+            } else {
+                format!("已换壁纸 ·「{}」", spec.title)
+            };
+            if let Some(handle) = &panel {
+                handle.refresh(panel_state(&spec, brightness, &sessions, &library));
+                handle.set_status(status);
+            }
+            tracing::info!(
+                "应用了模型给的壁纸:{} | 预设={} | 调用={} | 降级={}",
+                spec.title,
+                spec.preset().id(),
+                draft.calls,
+                draft.degraded
+            );
         }
 
         // 会话改过就落盘。放在这儿而不是每个动作里各写一遍:一帧里可能连着好几笔改动

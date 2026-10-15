@@ -12,8 +12,10 @@ Windows 桌面动态壁纸与个性化工具。壁纸窗口挂在桌面图标之
 
 进度:M0(桌面挂载 + 着色器场景)、M1 的一部分(壁纸库、控制面板、托盘)已完成。面板已改成生图
 界面,发消息、切会话、壁纸库列表都能跑通,左栏的会话**右键可以重命名 / 置顶 / 标未读 / 删除**;
-壁纸库的列表由壁纸侧扫 `%APPDATA%\MC壁纸\library` 自动灌进来,点一张就切过去。AI 那一环(M3)还没接
-—— 回复位现在是占位文案;会话与壁纸库都落在 `%APPDATA%\MC壁纸`,退出再开历史还在。
+壁纸库的列表由壁纸侧扫 `%APPDATA%\MC壁纸\library` 自动灌进来,点一张就切过去。M3 的第一段也接上了:
+**一句话 → 模型给一份 `WallpaperSpec` → 本地着色器渲染**(模型不画图);会话与壁纸库都落在
+`%APPDATA%\MC壁纸`,退出再开历史还在。模型要自己配一个 key(见下),没配也能开、也能聊,只是回复位
+会提示去哪儿配。
 技术细节与实测数据见 `docxs/MC壁纸-需求与技术方案.md`。
 
 ## 构建
@@ -36,12 +38,34 @@ cargo build --release --workspace
 其余参数(`--spec` / `--attach` / `--fps` 等,以及 `--window` / `--dump` / `--gdi-only` 这类诊断开关,
 后者需要 `--features dev-tools`)见 `app/crates/mcwp-wallpaper/src/main.rs` 顶部的用法注释。
 
+## 配模型(生图那一环)
+
+任何 **OpenAI 兼容**的服务都能用,换服务商只改一行。写一份 `%APPDATA%\MC壁纸\ai.json`:
+
+```json
+{ "base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4-flash", "api_key": "你的key" }
+```
+
+免费 / 便宜的几家(都已验证本机直连可用):智谱 **GLM-4-Flash**(免费、国内直连,推荐先拿它试)、
+硅基流动(注册送额度)、OpenRouter / Groq(免费档,要能连外网)、DeepSeek(按量计费)。临时试一家也可以
+只设环境变量 `MCWP_AI_KEY` / `MCWP_AI_BASE_URL` / `MCWP_AI_MODEL`(优先级高于 `ai.json`)。
+
+不用 key、不花钱也能回归这条链路:
+
+```powershell
+python tools/fake-ai-server.py --port 8787            # 假的 OpenAI 兼容服务,还能 --mode broken/bad/html/slow 演坏
+$env:MCWP_AI_KEY="fake"; $env:MCWP_AI_BASE_URL="http://127.0.0.1:8787/v1"; $env:MCWP_AI_MODEL="fake-1"
+.\app\target\release\mcwp-wallpaper.exe --ai-selftest "把壁纸调冷一点"   # 只问模型一次,打印规格
+.\app\target\release\mcwp-wallpaper.exe --panel --ai-ask "雨夜的城市"   # 开面板并直接发这句话
+```
+
 ## 目录
 
 | 路径 | 说明 |
 | --- | --- |
 | `app/crates/mcwp-spec` | `WallpaperSpec` 契约、校验器、内置场景预设 |
 | `app/crates/mcwp-render` | wgpu 渲染器(合成交换链,离屏回读) |
+| `app/crates/mcwp-ai` | 对话 → `WallpaperSpec`:OpenAI 兼容客户端、提示词、校验与本地降级 |
 | `app/crates/mcwp-platform` | 桌面挂载、托盘、开机自启、DWM 玻璃窗口 |
 | `app/crates/mcwp-ui` | Slint 控制面板 + 内嵌子集字体 |
 | `app/crates/mcwp-wallpaper` | 主程序:宿主窗口 + 主循环 |
@@ -58,3 +82,6 @@ cargo build --release --workspace
 - 面板自己不存任何东西:会话、壁纸库、当前 spec 都在 `mcwp-wallpaper` 侧,面板只是它们的投影。
   调试时把 `RUST_LOG` 设成 `info,mcwp_wallpaper=debug` 能看到面板发回来的每个事件。
 - `app/.cargo/config.toml` 把 crates.io 换成了 USTC 镜像(本机直连官方源约 16 KB/s);删掉即回退官方源。
+- 模型调用**不能写在主循环里同步等**(秒级往返 vs 60 fps):`mcwp-wallpaper` 那侧是"发请求丢后台线程 →
+  结果从 `ai_rx` 回主循环落地"。面板回归别指望合成键盘输入 —— 本机中文输入法会把字母吃掉,用
+  `--ai-ask` 或 `--ai-selftest`。

@@ -1,0 +1,19 @@
+[package]
+name = "mcwp-ai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+mcwp-spec = { path = "../mcwp-spec" }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+# OpenAI 兼容的 HTTPS 调用。**不用 reqwest**:它会把 tokio 拖进依赖树,成品体积涨一大截;
+# 我们要的只是"发一个 JSON、等一个 JSON",同步阻塞版就够(调用跑在后台线程里)。
+# 必须用 `native-tls`:ureq 的 provider 选择只认这个 feature —— 换 "轻一点" 的
+# `native-tls-no-default` 会连 provider 都不注册,https 请求当场 panic
+# ("provider is Rustls but feature is not enabled")。TLS 走 native-tls → Windows 上是 schannel,
+# 用的是系统证书库(企业代理塞的根证书也认)。
+ureq = { version = "3", default-features = false, features = ["native-tls"] }

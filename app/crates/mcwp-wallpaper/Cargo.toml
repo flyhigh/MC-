@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+mcwp-ai = { path = "../mcwp-ai" }
 mcwp-platform = { path = "../mcwp-platform" }
 mcwp-render = { path = "../mcwp-render" }
 mcwp-spec = { path = "../mcwp-spec" }

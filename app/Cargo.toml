@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/mcwp-platform",
     "crates/mcwp-render",
+    "crates/mcwp-ai",
     "crates/mcwp-spec",
     "crates/mcwp-ui",
     "crates/mcwp-wallpaper",

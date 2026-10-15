@@ -24,9 +24,6 @@ use serde::{Deserialize, Serialize};
 /// 落盘格式的版本。加字段不算破坏性改动,改语义时才 +1(和 `mcwp_spec::SCHEMA_VERSION` 一个规矩)。
 const SCHEMA_VERSION: u32 = 1;
 
-/// 还没接 AI 时的回复占位。故意写清楚"这是占位",免得看着像模型真的回了话。
-const PLACEHOLDER_REPLY: &str = "(AI 未接入 · M3)已记下。接上模型后,这里会给出按这句话生成的壁纸。";
-
 /// 新会话的名字。第一条消息会把它顶掉(见 `title_from`)。
 const NEW_SESSION_TITLE: &str = "新的对话";
 
@@ -229,10 +226,14 @@ impl Sessions {
         }
     }
 
-    /// 记一条用户消息 + 一条占位回复;第一条消息顺手给会话起个名。
-    pub fn send(&mut self, text: &str) {
+    /// 记一条用户消息,返回它落在哪个会话(回复回来时要按 id 找人)。
+    ///
+    /// **不在这里塞回复**:回复要么来自模型(后台线程,几秒后才到),要么来自"没配模型"的提示,
+    /// 两条路都走 `reply()` 落到同一处 —— 省得这里猜是哪一种。
+    pub fn send(&mut self, text: &str) -> u64 {
         let active = self.active_index();
         let session = &mut self.items[active];
+        let id = session.id;
         if session.messages.is_empty() {
             session.title = title_from(text);
         }
@@ -240,13 +241,30 @@ impl Sessions {
             mine: true,
             text: text.into(),
         });
-        session.messages.push(mcwp_ui::ChatMessage {
-            mine: false,
-            text: PLACEHOLDER_REPLY.into(),
-        });
         // 自己刚说过话的会话不该挂着未读点
         session.unread = false;
         self.changed();
+        id
+    }
+
+    /// 往指定会话里补一条"对方说的"消息。找不到那个会话(等待期间被删了)就什么也不做,
+    /// 返回 `false` —— 调用方拿它决定要不要顺手把壁纸也应用上去。
+    pub fn reply(&mut self, id: u64, text: &str) -> bool {
+        let active = self.active;
+        let Some(session) = self.items.iter_mut().find(|session| session.id == id) else {
+            tracing::info!("会话 {id} 已经不在了,这条回复丢掉");
+            return false;
+        };
+        session.messages.push(mcwp_ui::ChatMessage {
+            mine: false,
+            text: text.into(),
+        });
+        // 等回复的时候用户可能已经切走了:那就挂个未读点,别让人错过
+        if id != active {
+            session.unread = true;
+        }
+        self.changed();
+        true
     }
 
     /// 切到左栏的第 `index` 个会话。切过去就当作读过了。
