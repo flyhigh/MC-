@@ -49,6 +49,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
 };
 
+mod sessions;
+
+use sessions::Sessions;
+
 /// 面板窗口的标题。要和 `panel.slint` 的 `title` 一字不差 —— 单实例守卫靠它找窗口。
 const PANEL_TITLE: PCWSTR = w!("MC 壁纸 · 控制面板");
 
@@ -123,217 +127,6 @@ fn load_spec(args: &Args) -> Result<WallpaperSpec> {
     }
 }
 
-/// 生图界面的会话骨架 —— M3 接上 AI 之前,先让这条链路是通的。
-///
-/// 面板不持有任何状态:用户发消息 → `UiEvent::SendMessage` → 这里改内存里的会话 → 整块回填
-/// 面板。现在还没接模型,回复位由 `PLACEHOLDER_REPLY` 占着;等 M3 落地,把 `send()` 里那句
-/// 占位换成「文本 → WallpaperSpec → 应用」的管线即可,面板侧一行都不用动。
-///
-/// 会话只活在内存里(退出即散)。真落盘是 M3 的事:对话历史该跟壁纸库放一起(见方案第五节),
-/// 而不是塞进面板。
-struct Session {
-    /// 会话的身份。列表会重排(置顶会把整组挪到前面),面板那侧的下标随时在变,
-    /// 内部认人一律靠 id,不靠下标。
-    id: u64,
-    title: String,
-    messages: Vec<mcwp_ui::ChatMessage>,
-    /// 置顶的排在列表最前面
-    pinned: bool,
-    /// 有未读:行尾挂个圆点,切进这个会话就清掉
-    unread: bool,
-}
-
-struct Sessions {
-    /// 显示顺序:置顶的一组在前,两组各自保持创建先后
-    items: Vec<Session>,
-    /// 当前会话的 **id**(不是下标 —— 置顶会重排)
-    active: u64,
-    /// 下一个会话的 id
-    next_id: u64,
-    /// 消息版本号,每改一次 +1:面板靠它把消息列表钉到底部
-    revision: i32,
-}
-
-/// 还没接 AI 时的回复占位。故意写清楚"这是占位",免得看着像模型真的回了话。
-const PLACEHOLDER_REPLY: &str = "(AI 未接入 · M3)已记下。接上模型后,这里会给出按这句话生成的壁纸。";
-
-/// 新会话的名字。第一条消息会把它顶掉(见 `title_from`)。
-const NEW_SESSION_TITLE: &str = "新的对话";
-
-impl Sessions {
-    fn new() -> Self {
-        let mut sessions = Self {
-            items: Vec::new(),
-            active: 0,
-            next_id: 1,
-            revision: 0,
-        };
-        sessions.create();
-        // `create` 那一下的 +1 不算:面板刚拿到手,不需要为"钉到底部"再滚一次
-        sessions.revision = 0;
-        sessions
-    }
-
-    /// 当前会话在列表里的下标(面板要的是下标,内部存的是 id)。
-    ///
-    /// 兜底给 0:删除那边保证了列表不空、`active` 一定指得到人,这里只是不给 panic 留机会。
-    fn active_index(&self) -> usize {
-        self.items
-            .iter()
-            .position(|session| session.id == self.active)
-            .unwrap_or(0)
-    }
-
-    /// 交给面板的一整块会话数据。
-    fn state(&self) -> mcwp_ui::SessionState {
-        let active = self.active_index();
-        mcwp_ui::SessionState {
-            conversations: self
-                .items
-                .iter()
-                .map(|session| mcwp_ui::ConversationItem {
-                    heading: session.title.clone().into(),
-                    sub: Self::preview(session).into(),
-                    pinned: session.pinned,
-                    unread: session.unread,
-                })
-                .collect(),
-            current: active,
-            title: self.items[active].title.clone(),
-            messages: self.items[active].messages.clone(),
-            revision: self.revision,
-        }
-    }
-
-    /// 左栏那一行小字:最后一条消息的开头。
-    fn preview(session: &Session) -> String {
-        let Some(last) = session.messages.last() else {
-            return "还没有消息".to_string();
-        };
-        let text = last.text.to_string();
-        if text.chars().count() > 16 {
-            format!("{}…", text.chars().take(16).collect::<String>())
-        } else {
-            text
-        }
-    }
-
-    /// 记一条用户消息 + 一条占位回复;第一条消息顺手给会话起个名。
-    fn send(&mut self, text: &str) {
-        let active = self.active_index();
-        let session = &mut self.items[active];
-        if session.messages.is_empty() {
-            session.title = title_from(text);
-        }
-        session.messages.push(mcwp_ui::ChatMessage {
-            mine: true,
-            text: text.into(),
-        });
-        session.messages.push(mcwp_ui::ChatMessage {
-            mine: false,
-            text: PLACEHOLDER_REPLY.into(),
-        });
-        // 自己刚说过话的会话不该挂着未读点
-        session.unread = false;
-        self.revision += 1;
-    }
-
-    /// 切到左栏的第 `index` 个会话。切过去就当作读过了。
-    fn select(&mut self, index: usize) {
-        let Some(session) = self.items.get_mut(index) else {
-            return;
-        };
-        let id = session.id;
-        session.unread = false;
-        if id != self.active {
-            self.active = id;
-        }
-        self.revision += 1;
-    }
-
-    /// 新建一个空会话并切过去。
-    fn create(&mut self) {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.items.push(Session {
-            id,
-            title: NEW_SESSION_TITLE.to_string(),
-            messages: Vec::new(),
-            pinned: false,
-            unread: false,
-        });
-        self.active = id;
-        self.revision += 1;
-    }
-
-    /// 改名。名字两端空白清掉;清完是空的当作没改 —— 名字是列表里唯一的抓手,不能空。
-    fn rename(&mut self, index: usize, name: &str) {
-        let name = name.trim();
-        if name.is_empty() {
-            return;
-        }
-        let Some(session) = self.items.get_mut(index) else {
-            return;
-        };
-        if session.title == name {
-            return;
-        }
-        session.title = name.to_string();
-        self.revision += 1;
-    }
-
-    /// 删掉第 `index` 个会话。删的是当前会话就落到顶上来的那一条(没有就往前退一格);
-    /// 一条都不剩时补一个空会话 —— 右栏不该为"列表空了"再写一套空状态。
-    fn remove(&mut self, index: usize) {
-        if index >= self.items.len() {
-            return;
-        }
-        let removed = self.items.remove(index);
-        if self.items.is_empty() {
-            self.create();
-        } else if removed.id == self.active {
-            let next = index.min(self.items.len() - 1);
-            self.active = self.items[next].id;
-        }
-        self.revision += 1;
-    }
-
-    /// 置顶 / 取消置顶,返回改完之后是不是置顶状态(面板拿它写状态行)。
-    ///
-    /// 置顶的整组挪到最前面,两组各自保持原来的先后 —— `sort_by_key` 是稳定排序,
-    /// 所以只按"是不是置顶"排,组内的先后不会乱。
-    fn toggle_pin(&mut self, index: usize) -> bool {
-        let Some(session) = self.items.get_mut(index) else {
-            return false;
-        };
-        session.pinned = !session.pinned;
-        let pinned = session.pinned;
-        self.items.sort_by_key(|session| !session.pinned);
-        self.revision += 1;
-        pinned
-    }
-
-    /// 标为未读。故意不切过去、也不动当前会话:它就是个"回头再看"的记号。
-    fn mark_unread(&mut self, index: usize) {
-        let Some(session) = self.items.get_mut(index) else {
-            return;
-        };
-        if !session.unread {
-            session.unread = true;
-            self.revision += 1;
-        }
-    }
-}
-
-/// 用第一条消息给会话起名:多空白折成一个空格,掐头 12 个字。
-fn title_from(text: &str) -> String {
-    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() > 12 {
-        format!("{}…", flat.chars().take(12).collect::<String>())
-    } else {
-        flat
-    }
-}
 
 /// 把「当前 spec + 各预设默认值 + 壁纸库 + 会话」拼成面板的初始状态。
 fn panel_state(
@@ -808,8 +601,9 @@ fn main() -> Result<()> {
     // 面板跑在自己的线程和自己的 Slint 事件循环里;这里只保留一个事件队列,
     // 每帧开头把它清空一次,所以拖动滑杆的下一帧就能看到变化。
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<mcwp_ui::UiEvent>();
-    // 会话数据在壁纸这一侧(Rust),面板只是它的投影;面板关掉再开,历史还在。
-    let mut sessions = Sessions::new();
+    // 会话数据在壁纸这一侧(Rust),面板只是它的投影;面板关掉再开(甚至整个进程重启),
+    // 历史都在 —— 落盘那份就在 `%APPDATA%\MC壁纸\sessions.json`,和壁纸库同目录。
+    let mut sessions = Sessions::load();
     // 壁纸库同理:开面板时先扫一遍库目录,面板打开就是最新的一张列表。
     let mut library = scan_library();
     tracing::info!("壁纸库里有 {} 张壁纸", library.len());
@@ -1004,6 +798,10 @@ fn main() -> Result<()> {
             }
         }
 
+        // 会话改过就落盘。放在这儿而不是每个动作里各写一遍:一帧里可能连着好几笔改动
+        // (发消息 + 切会话),这里只落最后一次;`flush` 自己会看有没有改过。
+        sessions.flush();
+
         // —— 托盘菜单的落地 ——
         let mut quitting = false;
         for action in tray::drain_actions() {
@@ -1104,5 +902,7 @@ fn main() -> Result<()> {
     }
 
     tracing::info!("退出,共渲染 {rendered_total} 帧,跳过 {} 帧", renderer.skipped_frames);
+    // 收尾再落一次:自检时长到点、托盘退出这些路径都是从循环里直接跳出来的。
+    sessions.flush();
     Ok(())
 }

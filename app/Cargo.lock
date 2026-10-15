@@ -2450,6 +2450,8 @@ dependencies = [
  "mcwp-render",
  "mcwp-spec",
  "mcwp-ui",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
  "windows 0.62.2",
