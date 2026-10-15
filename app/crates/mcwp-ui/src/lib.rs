@@ -76,6 +76,14 @@ pub enum UiEvent {
     SelectConversation(usize),
     /// 点了「+ 新建对话」
     NewConversation,
+    /// 左栏右键菜单:把第 `index` 个会话改名(两端空白由壁纸侧清,清完是空名字就不改)
+    RenameConversation(usize, String),
+    /// 左栏右键菜单:删掉第 `index` 个会话
+    DeleteConversation(usize),
+    /// 左栏右键菜单:置顶 / 取消置顶第 `index` 个会话
+    TogglePinConversation(usize),
+    /// 左栏右键菜单:把第 `index` 个会话标为未读(不切过去)
+    MarkConversationUnread(usize),
     /// 面板切到「壁纸库」页:想要一份最新的库列表
     RefreshLibrary,
     /// 点了壁纸库里的第 `index` 张(`PanelState::library` 的下标)
@@ -365,6 +373,39 @@ fn build(state: &PanelState, events: Sender<UiEvent>) -> Result<Panel> {
         let tx = events.clone();
         ui.on_new_conversation(move || {
             let _ = tx.send(UiEvent::NewConversation);
+        });
+    }
+
+    // 左栏会话的右键菜单。四个动作都是「改一个已有的会话」,所以一律带着下标走;
+    // 真正的改名 / 删除规则在壁纸侧(名字怎么裁、删掉当前会话落到哪),面板这边不判断。
+    {
+        let tx = events.clone();
+        ui.on_rename_conversation(move |index, name| {
+            let _ = tx.send(UiEvent::RenameConversation(
+                index.max(0) as usize,
+                name.to_string(),
+            ));
+        });
+    }
+
+    {
+        let tx = events.clone();
+        ui.on_delete_conversation(move |index| {
+            let _ = tx.send(UiEvent::DeleteConversation(index.max(0) as usize));
+        });
+    }
+
+    {
+        let tx = events.clone();
+        ui.on_toggle_pin_conversation(move |index| {
+            let _ = tx.send(UiEvent::TogglePinConversation(index.max(0) as usize));
+        });
+    }
+
+    {
+        let tx = events.clone();
+        ui.on_mark_conversation_unread(move |index| {
+            let _ = tx.send(UiEvent::MarkConversationUnread(index.max(0) as usize));
         });
     }
 

@@ -104,6 +104,10 @@ export struct ChatMessage {
 export struct ConversationItem {
     heading: string,
     sub: string,
+    // 置顶的排在列表最前面(排序在壁纸侧做,面板只画)
+    pinned: bool,
+    // 有未读消息:行尾挂一个染色小圆点,切进这个会话就清掉
+    unread: bool,
 }
 
 // 壁纸库里的一张壁纸(壁纸侧扫描库目录得到)。`accent` 是它调色板里的主色,卡片靠它区分;
@@ -309,9 +313,31 @@ component ConversationRow inherits Rectangle {
     in property <string> heading: "";
     in property <string> sub: "";
     in property <bool> selected: false;
+    in property <bool> pinned: false;
+    in property <bool> unread: false;
+    // 正在改名:两行文案让位给一个输入框(见下面那段 `if renaming`)
+    in property <bool> renaming: false;
     in property <color> accent: #0A84FF;
 
+    // 改名的草稿。只有这一行自己用:面板不存它,回车那一刻才连名字一起交上去,
+    // 所以「点了别处」= 草稿丢掉(改名没提交),和 Esc 一个效果。
+    private property <string> draft: "";
+
+    // 进改名状态时把草稿重置成当前名字。**不能只靠输入框的 `init`**:行元素会被 slint 复用
+    // (列表增删 / 置顶重排都只是换绑模型项),复用到的元素不会再跑一遍 `init`,`draft` 就会
+    // 留着上一次 —— 甚至是别的会话 —— 的名字,回车一敲就把别人的名字盖过来了。
+    changed renaming => {
+        if (root.renaming) {
+            root.draft = root.heading;
+        }
+    }
+
     callback picked();
+    // 右键:告诉我点在**窗口里的**哪个位置(逻辑像素)—— 菜单弹在那儿,所以本行自己把
+    // 行内坐标加上 `absolute-position` 再报上去
+    callback menu-requested(length, length);
+    callback rename-committed(string);
+    callback rename-cancelled();
 
     height: 50px;
     border-radius: Glass.r-card;
@@ -335,12 +361,14 @@ component ConversationRow inherits Rectangle {
 
     VerticalLayout {
         padding-left: 14px;
-        padding-right: 12px;
+        // 右边给行尾那两个状态标(置顶 / 未读)留位,别让标题压到它们下面
+        padding-right: 34px;
         alignment: center;
         spacing: 2px;
 
         Text {
             text: root.heading;
+            visible: !root.renaming;
             color: root.selected ? Glass.label : Glass.label-2;
             font-size: 13px;
             overflow: elide;
@@ -348,15 +376,188 @@ component ConversationRow inherits Rectangle {
         }
         Text {
             text: root.sub;
+            visible: !root.renaming;
             color: Glass.label-3;
             font-size: 11px;
             overflow: elide;
         }
     }
 
+    // —— 行尾的状态标:置顶一根小图钉、未读一个染色圆点 ——
+    // 图形一律自己画:内嵌子集只收面板文案用得上的字形,图钉这种符号没有。
+    if root.pinned : Rectangle {
+        x: parent.width - 30px;
+        y: (parent.height - 12px) / 2;
+        width: 8px;
+        height: 12px;
+
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: 8px;
+            height: 2px;
+            border-radius: 1px;
+            background: Glass.label-3;
+        }
+        Rectangle {
+            x: 3px;
+            y: 3px;
+            width: 2px;
+            height: 9px;
+            background: Glass.label-3;
+        }
+    }
+    if root.unread : Rectangle {
+        x: parent.width - 16px;
+        y: (parent.height - 7px) / 2;
+        width: 7px;
+        height: 7px;
+        border-radius: 3.5px;
+        background: root.accent;
+    }
+
     touch := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.picked(); }
+        pointer-event(e) => {
+            // 右键:菜单弹在点下去的地方(左键那条走 clicked,见文件头关于按钮的说明)。
+            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
+                root.menu-requested(
+                    self.absolute-position.x + self.mouse-x,
+                    self.absolute-position.y + self.mouse-y,
+                );
+            }
+        }
+    }
+
+    // 改名时的输入框。**放在 `touch` 后面** = 浮在整行之上(和标题栏那三颗窗口键同一个
+    // 道理:后声明的先拿事件),敲字、全选、点回来接着改都轮不到下面那颗 TouchArea。
+    if root.renaming : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        border-radius: Glass.r-card;
+        background: #00000052;
+        border-width: 1px;
+        border-color: root.accent.with-alpha(0.65);
+
+        rename-input := TextInput {
+            x: 13px;
+            y: (parent.height - self.height) / 2;
+            width: parent.width - 26px;
+            height: 20px;
+            font-size: 13px;
+            color: Glass.label;
+            vertical-alignment: center;
+            text <=> root.draft;
+
+            // 建出来就把当前名字填上、聚焦、全选:改名的下一步就是敲字,不该让人再点一次
+            init => {
+                self.text = root.heading;
+                self.focus();
+                self.select-all();
+            }
+
+            accepted => { root.rename-committed(self.text); }
+            key-pressed(e) => {
+                // Esc 撤掉这次改名(和系统里改名的习惯一致);其余按键照常交给输入框
+                if (e.text == "\u{1b}") {
+                    root.rename-cancelled();
+                    return accept;
+                }
+                return reject;
+            }
+        }
+    }
+}
+
+// 会话右键菜单里的一行。危险操作(删除)用 `danger` 标出来:悬停整行染红。
+//
+// 菜单里不放图标:内嵌子集里没有铅笔 / 图钉这类符号,画 12px 的几何图形又太像涂鸦,
+// 干脆只用文字 —— 也省得为了菜单再塞一套图片资源进来。
+component MenuRow inherits Rectangle {
+    in property <string> text: "";
+    in property <bool> danger: false;
+
+    callback picked();
+
+    height: 30px;
+    border-radius: 6px;
+    background: touch.has-hover ? (danger ? #C42B1C38 : Glass.fill-hover) : #00000000;
+    animate background { duration: 120ms; easing: ease-out; }
+
+    Text {
+        x: 12px;
+        y: 0px;
+        width: parent.width - 24px;
+        height: parent.height;
+        text: root.text;
+        color: root.danger
+            ? (touch.has-hover ? #FFFFFFFF : Glass.label-2)
+            : (touch.has-hover ? Glass.label : Glass.label-2);
+        font-size: 13px;
+        vertical-alignment: center;
+        overflow: elide;
+        animate color { duration: 120ms; easing: ease-out; }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.picked(); }
+    }
+}
+
+// 一条会话的右键菜单:重命名 / 置顶 / 标记为未读 / 删除。
+//
+// 尺寸(176 × 143)在面板那侧也写着一份(`menu-w` / `menu-h`):菜单得知道自己多大才能
+// 贴着窗口边收住,而布局撑出来的高度面板读不到。改行数 / 行高记得两边一起改。
+component ConversationMenu inherits Rectangle {
+    in property <bool> pinned: false;
+    // 菜单底色。由面板传 `caption-plate`(和顶部安全区同一族色),菜单才不会像块外来的板子。
+    in property <color> plate: #161B28;
+
+    callback rename-picked();
+    callback pin-picked();
+    callback unread-picked();
+    callback delete-picked();
+
+    width: 176px;
+    height: 143px;
+    border-radius: 10px;
+    // 实色(不是玻璃):菜单要压住底下的内容读字,不该透出会话行
+    background: plate;
+    border-width: 1px;
+    border-color: Glass.hairline;
+
+    VerticalLayout {
+        x: 6px;
+        y: 6px;
+        width: parent.width - 12px;
+        height: parent.height - 12px;
+        spacing: 0px;
+
+        MenuRow { text: "重命名"; picked => { root.rename-picked(); } }
+        MenuRow {
+            text: root.pinned ? "取消置顶" : "置顶";
+            picked => { root.pin-picked(); }
+        }
+        MenuRow { text: "标记为未读"; picked => { root.unread-picked(); } }
+
+        // 分隔线:前后各留 5px,和系统菜单里那条一样,把「删除」隔出去
+        Rectangle {
+            height: 11px;
+
+            Rectangle {
+                x: 6px;
+                y: 5px;
+                width: parent.width - 12px;
+                height: 1px;
+                background: Glass.hairline-dim;
+            }
+        }
+
+        MenuRow { text: "删除对话"; danger: true; picked => { root.delete-picked(); } }
     }
 }
 
@@ -637,6 +838,19 @@ export component Panel inherits Window {
     // 面板只知道"该把标题栏那颗键画成放大还是还原"。
     in property <bool> maximized: false;
 
+    // —— 会话的右键菜单:纯界面状态,不进 Rust ——
+    // 菜单开着时:对着第几行 + 那行是不是置顶(决定显示「置顶」还是「取消置顶」)+ 弹出点(窗口坐标)。
+    private property <int> menu-row: -1;
+    private property <bool> menu-pinned: false;
+    private property <length> menu-x: 0px;
+    private property <length> menu-y: 0px;
+    // 菜单尺寸,和 ConversationMenu 里写死的那两个数保持一致(面板靠它把菜单收在窗口内)
+    private property <length> menu-w: 176px;
+    private property <length> menu-h: 143px;
+    // 正在改名的行;-1 = 没人改名。草稿在行自己手里(见 ConversationRow),所以"
+    // 点了别处"和 Esc 是一回事:这次改名作废。
+    private property <int> rename-row: -1;
+
     callback select-preset(int);
     callback values-changed();
     callback save-requested();
@@ -653,6 +867,11 @@ export component Panel inherits Window {
     callback send-message(string);
     callback select-conversation(int);
     callback new-conversation();
+    // 左栏会话的右键菜单:改名 / 删除 / 置顶 / 标为未读
+    callback rename-conversation(int, string);
+    callback delete-conversation(int);
+    callback toggle-pin-conversation(int);
+    callback mark-conversation-unread(int);
     // 壁纸库:点了某一张 / 切进库页时想要一份最新的列表
     callback open-wallpaper(int);
     callback refresh-library();
@@ -682,6 +901,25 @@ export component Panel inherits Window {
             root.send-message(root.draft);
             root.draft = "";
         }
+    }
+
+    // 关掉右键菜单
+    function close-menu() {
+        root.menu-row = -1;
+    }
+
+    // 在窗口坐标 (`at-x`, `at-y`) 处弹菜单,但不许戳出窗口:上下左右各留 8px(和内容层的
+    // 18px 内边距是两个概念,这里只是别让菜单贴着边、露出圆角外面的黑边)。
+    function open-menu(row: int, pinned: bool, at-x: length, at-y: length) {
+        root.menu-row = row;
+        root.menu-pinned = pinned;
+        root.menu-x = max(8px, min(at-x, root.width - root.menu-w - 8px));
+        root.menu-y = max(8px, min(at-y, root.height - root.menu-h - 8px));
+    }
+
+    // 收掉正在改名的那一行,不提交(改名只有回车算数)
+    function stop-rename() {
+        root.rename-row = -1;
     }
 
     // ——————————————————————————————
@@ -907,6 +1145,7 @@ export component Panel inherits Window {
                     accent: root.accent;
                     width: 244px;
                     clicked => {
+                        root.stop-rename();
                         root.view = 0;
                         root.new-conversation();
                     }
@@ -934,14 +1173,28 @@ export component Panel inherits Window {
                         for conv[i] in root.conversations : ConversationRow {
                             heading: conv.heading;
                             sub: conv.sub;
+                            pinned: conv.pinned;
+                            unread: conv.unread;
+                            renaming: i == root.rename-row;
                             selected: i == root.current-conversation && root.view == 0;
                             accent: root.accent;
 
                             picked => {
+                                root.stop-rename();
                                 root.view = 0;
                                 root.current-conversation = i;
                                 root.select-conversation(i);
                             }
+                            menu-requested(x, y) => {
+                                // 先收掉正在改名的行:菜单和输入框同时开着,焦点和命中测试要打架
+                                root.stop-rename();
+                                root.open-menu(i, conv.pinned, x, y);
+                            }
+                            rename-committed(text) => {
+                                root.rename-row = -1;
+                                root.rename-conversation(i, text);
+                            }
+                            rename-cancelled => { root.rename-row = -1; }
                         }
                     }
                 }
@@ -951,13 +1204,17 @@ export component Panel inherits Window {
                     text: "壁纸参数";
                     active: root.view == 1;
                     accent: root.accent;
-                    picked => { root.view = root.view == 1 ? 0 : 1; }
+                    picked => {
+                        root.stop-rename();
+                        root.view = root.view == 1 ? 0 : 1;
+                    }
                 }
                 NavRow {
                     text: "壁纸库";
                     active: root.view == 2;
                     accent: root.accent;
                     picked => {
+                        root.stop-rename();
                         root.view = root.view == 2 ? 0 : 2;
                         // 切进库页时问一次:库目录被外面改过(手工删、拷别人的壁纸进来)也能跟上
                         if (root.view == 2) { root.refresh-library(); }
@@ -967,7 +1224,10 @@ export component Panel inherits Window {
                     text: "设置";
                     active: root.view == 3;
                     accent: root.accent;
-                    picked => { root.view = root.view == 3 ? 0 : 3; }
+                    picked => {
+                        root.stop-rename();
+                        root.view = root.view == 3 ? 0 : 3;
+                    }
                 }
             }
             // ============ 右栏:会话 / 参数 / 库 / 设置 ============
@@ -1300,6 +1560,49 @@ export component Panel inherits Window {
                         max-width: 320px;
                     }
                 }
+            }
+        }
+    }
+
+    // ——————————————————————————————
+    // 会话的右键菜单浮层。**最后声明** = 盖在所有东西之上:菜单开着的时候,连顶部那三颗
+    // 窗口键也点不到(点一下先关菜单),和系统菜单的行为一致。
+    // ——————————————————————————————
+    if root.menu-row >= 0 : Rectangle {
+        // 铺满整窗。Window 的孩子不带 x / y 会被居中摆,这里显式钉在左上角(见文件头)。
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+
+        // 点菜单以外的地方就收掉。它铺满整窗,菜单声明在它后面 —— 后声明的浮在上面,
+        // 所以照旧是"点菜单里的项 → 那一项;点别处 → 关菜单"。
+        dismiss := TouchArea {
+            clicked => { root.close-menu(); }
+        }
+
+        ConversationMenu {
+            x: root.menu-x;
+            y: root.menu-y;
+            pinned: root.menu-pinned;
+            plate: root.caption-plate.brighter(0.06);
+
+            rename-picked => {
+                // 先开输入框、再收菜单:顺序反过来的话 `menu-row` 已经归 -1,拿不到行号了
+                root.rename-row = root.menu-row;
+                root.close-menu();
+            }
+            pin-picked => {
+                root.toggle-pin-conversation(root.menu-row);
+                root.close-menu();
+            }
+            unread-picked => {
+                root.mark-conversation-unread(root.menu-row);
+                root.close-menu();
+            }
+            delete-picked => {
+                root.delete-conversation(root.menu-row);
+                root.close-menu();
             }
         }
     }
