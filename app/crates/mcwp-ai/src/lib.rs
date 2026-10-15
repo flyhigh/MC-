@@ -13,6 +13,9 @@
 //!   T3/T2,3 s 太紧(中文长回复常态 5~15 s)。调用跑在后台线程 + 面板显示"生成中…",等得起。
 //! - **不传 `response_format: json_object`**:各家的兼容实现对这个字段态度不一(有的直接 400),
 //!   提示词里已经写死"只输出 JSON",再加一道本地提取,比赌服务商实现稳。
+//! - **`thinking` 只在配置里显式写了才发**:智谱 GLM-4.7 系列默认开深度思考,一句"换张壁纸"也要先
+//!   想十几秒;可这个字段别家不认(理由同 `response_format`)。所以做成可选 —— `ai.json` 里写了
+//!   `"thinking": false` 才带上 `{"type":"disabled"}`,不写就完全不出现在请求体里。
 //! - `image_prompt` 是**给以后留的钩子**:3.2 的 B 档(文生图 + 2.5D)要用,现在只落日志。
 
 use std::path::PathBuf;
@@ -23,13 +26,16 @@ use mcwp_spec::{Preset, Source, WallpaperSpec};
 use serde::{Deserialize, Serialize};
 use ureq::tls::{TlsConfig, TlsProvider};
 
-/// 没配服务商时的默认值:指向 DeepSeek(方案 12.2 的建议),但**免费的那几家也是同一套接口**,
-/// 换个 `base_url` 就行 —— 智谱 `https://open.bigmodel.cn/api/paas/v4`、
-/// 硅基流动 `https://api.siliconflow.cn/v1`、OpenRouter `https://openrouter.ai/api/v1`。
-pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
+/// 没配服务商时的默认值:指向**智谱**(2026-10-15 拍板先拿它的免费档试)。
+/// 免费的那几家都是同一套 OpenAI 兼容接口,换个 `base_url` 就行 ——
+/// 硅基流动 `https://api.siliconflow.cn/v1`、OpenRouter `https://openrouter.ai/api/v1`、
+/// DeepSeek `https://api.deepseek.com`(按量计费)。
+pub const DEFAULT_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
 
-/// 默认模型。换服务商时 `model` 也得跟着换(比如智谱要写 `glm-4-flash`)。
-pub const DEFAULT_MODEL: &str = "deepseek-chat";
+/// 默认模型:智谱免费档里的 GLM-4-Flash(`glm-4-flash` 是它的别名,写全版本号更明确)。
+/// 智谱另有个**也免费**的 `glm-4.7-flash`,更新更强,但它属于默认开深度思考的 4.7 系列 ——
+/// 想换过去记得同时配 `"thinking": false`,不然一句话要等十几秒。
+pub const DEFAULT_MODEL: &str = "glm-4-flash-250414";
 
 /// 请求超时(见文件头说明)。
 const TIMEOUT: Duration = Duration::from_secs(45);
@@ -74,6 +80,8 @@ pub struct Config {
     pub base_url: String,
     pub model: String,
     pub api_key: String,
+    /// 「深度思考」开关。`None` = 请求体里不带这个字段(对不认它的服务商最安全)。
+    pub thinking: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -84,6 +92,8 @@ struct ConfigFile {
     model: String,
     #[serde(default)]
     api_key: String,
+    #[serde(default)]
+    thinking: Option<bool>,
 }
 
 impl Config {
@@ -114,10 +124,20 @@ impl Config {
         let Some(api_key) = env("MCWP_AI_KEY").or_else(|| non_empty(&raw.api_key)) else {
             return Err(anyhow!("{}", Self::missing_key_hint()));
         };
+        // 环境变量写了就认它:`1/true/on/yes` 算开,写别的都算关;没写就跟着 ai.json。
+        let thinking = env("MCWP_AI_THINKING")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            })
+            .or(raw.thinking);
         Ok(Self {
             base_url,
             model,
             api_key,
+            thinking,
         })
     }
 
@@ -128,13 +148,14 @@ impl Config {
             .unwrap_or_else(|_| "%APPDATA%\\MC壁纸\\ai.json".to_string());
         format!(
             "还没配模型。写一份 {path}:\n\
-             {{\"base_url\": \"https://open.bigmodel.cn/api/paas/v4\", \"model\": \"glm-4-flash\", \"api_key\": \"你的key\"}}\n\
+             {{\"base_url\": \"{DEFAULT_BASE_URL}\", \"model\": \"{DEFAULT_MODEL}\", \"api_key\": \"你的key\"}}\n\
              免费可用的有几家(都是同一套 OpenAI 兼容接口,换 base_url / model 就行):\n\
-             · 智谱 GLM-4-Flash —— 免费、国内直连:https://open.bigmodel.cn/api/paas/v4 + glm-4-flash\n\
+             · 智谱 GLM-4-Flash —— 免费、国内直连,内置默认:{DEFAULT_BASE_URL} + {DEFAULT_MODEL}\n\
+             · 智谱 GLM-4.7-Flash —— 也免费、更新更强:model 换 glm-4.7-flash,再加 \"thinking\": false\n\
              · 硅基流动 —— 注册送额度:https://api.siliconflow.cn/v1\n\
              · OpenRouter / Groq —— 免费档,需要能连外网\n\
-             · DeepSeek —— 按量计费(便宜):{DEFAULT_BASE_URL} + {DEFAULT_MODEL}\n\
-             临时试一家也可以只设环境变量 MCWP_AI_KEY / MCWP_AI_BASE_URL / MCWP_AI_MODEL。"
+             · DeepSeek —— 按量计费(便宜):https://api.deepseek.com + deepseek-chat\n\
+             临时试一家也可以只设环境变量 MCWP_AI_KEY / MCWP_AI_BASE_URL / MCWP_AI_MODEL / MCWP_AI_THINKING。"
         )
     }
 }
@@ -176,7 +197,11 @@ impl Client {
             .nth(1)
             .and_then(|rest| rest.split('/').next())
             .unwrap_or(&self.cfg.base_url);
-        format!("{host} · {}", self.cfg.model)
+        let thinking = match self.cfg.thinking {
+            Some(false) => " · 不思考",
+            _ => "",
+        };
+        format!("{host} · {}{thinking}", self.cfg.model)
     }
 
     /// `base_url` 后面补 `/chat/completions`。写成完整的 endpoint 也认(免得有人贴整条 URL 上来)。
@@ -266,6 +291,7 @@ impl Client {
             messages,
             temperature: 0.7,
             stream: false,
+            thinking: self.cfg.thinking.map(Thinking::new),
         })?;
         let mut response = self
             .agent
@@ -552,6 +578,24 @@ struct ChatRequest<'a> {
     messages: &'a [Message],
     temperature: f32,
     stream: bool,
+    /// 不写就不序列化 —— 见文件头:`thinking` 是智谱专有的,别家可能直接 400。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Thinking>,
+}
+
+/// 智谱那套「深度思考」开关。只在配置里显式写了才发。
+#[derive(Debug, Serialize)]
+struct Thinking {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+impl Thinking {
+    fn new(enabled: bool) -> Self {
+        Self {
+            kind: if enabled { "enabled" } else { "disabled" },
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]

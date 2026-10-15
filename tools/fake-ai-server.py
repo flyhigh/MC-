@@ -23,6 +23,8 @@ r"""假的 OpenAI 兼容模型服务 —— 给「对话 → 壁纸规格」这�
     --mode bad     返回字段越界 / 预设不存在的 spec —— 验 `normalize()` 夹紧
 
 `--mode broken` 这类会数请求次数,写进 `--log` 指定的文件(默认 fake-ai.log),方便断言"到底打了几次"。
+`--dump` 另外把**收上来的请求体**逐条落一份(一行一个 JSON),用来断言客户端到底发了哪些字段 ——
+比如 `thinking` 该不该出现,看这个比看回答准。
 """
 
 import argparse
@@ -115,6 +117,7 @@ def build_reply(text: str, mode: str, broken_values: bool) -> dict:
 class Handler(BaseHTTPRequestHandler):
     mode = "good"
     log_path = "fake-ai.log"
+    dump_path = None
     requests = 0
 
     def log_message(self, *args):  # 别把访问日志刷到终端上
@@ -125,6 +128,12 @@ class Handler(BaseHTTPRequestHandler):
         with open(self.log_path, "a", encoding="utf-8") as handle:
             handle.write(f"{Handler.requests}\t{note}\n")
 
+    def dump(self, payload: dict):
+        if not Handler.dump_path:
+            return
+        with open(Handler.dump_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length).decode("utf-8", "replace")
@@ -132,6 +141,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(raw)
         except json.JSONDecodeError:
             payload = {}
+        self.dump(payload)
         messages = payload.get("messages", [])
         users = [m.get("content", "") for m in messages if m.get("role") == "user"]
         # 重试那轮会多一条 user 消息(内容是"上面那份 JSON 有问题…"),拿它判断这是第几次
@@ -199,10 +209,12 @@ def main():
         help="good 正常 / broken 第一次半截 JSON / html 返回 HTML / slow 慢 3 秒 / bad 越界的 spec",
     )
     parser.add_argument("--log", default="fake-ai.log", help="请求计数写这儿")
+    parser.add_argument("--dump", default=None, help="把收到的请求体逐条写这儿(一行一个 JSON)")
     args = parser.parse_args()
 
     Handler.mode = args.mode
     Handler.log_path = args.log
+    Handler.dump_path = args.dump
     Handler.requests = 0
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"假模型服务已起:http://127.0.0.1:{args.port}/v1  mode={args.mode}  日志={args.log}")
