@@ -123,8 +123,126 @@ fn load_spec(args: &Args) -> Result<WallpaperSpec> {
     }
 }
 
-/// 把「当前 spec + 各预设默认值」拼成面板的初始状态。
-fn panel_state(spec: &WallpaperSpec, brightness: f32) -> mcwp_ui::PanelState {
+/// 生图界面的会话骨架 —— M3 接上 AI 之前,先让这条链路是通的。
+///
+/// 面板不持有任何状态:用户发消息 → `UiEvent::SendMessage` → 这里改内存里的会话 → 整块回填
+/// 面板。现在还没接模型,回复位由 `PLACEHOLDER_REPLY` 占着;等 M3 落地,把 `send()` 里那句
+/// 占位换成「文本 → WallpaperSpec → 应用」的管线即可,面板侧一行都不用动。
+///
+/// 会话只活在内存里(退出即散)。真落盘是 M3 的事:对话历史该跟壁纸库放一起(见方案第五节),
+/// 而不是塞进面板。
+struct Session {
+    title: String,
+    messages: Vec<mcwp_ui::ChatMessage>,
+}
+
+struct Sessions {
+    items: Vec<Session>,
+    active: usize,
+    /// 消息版本号,每改一次 +1:面板靠它把消息列表钉到底部
+    revision: i32,
+}
+
+/// 还没接 AI 时的回复占位。故意写清楚"这是占位",免得看着像模型真的回了话。
+const PLACEHOLDER_REPLY: &str = "(AI 未接入 · M3)已记下。接上模型后,这里会给出按这句话生成的壁纸。";
+
+impl Sessions {
+    fn new() -> Self {
+        Self {
+            items: vec![Session {
+                title: "新的对话".to_string(),
+                messages: Vec::new(),
+            }],
+            active: 0,
+            revision: 0,
+        }
+    }
+
+    /// 交给面板的一整块会话数据。
+    fn state(&self) -> mcwp_ui::SessionState {
+        mcwp_ui::SessionState {
+            conversations: self
+                .items
+                .iter()
+                .enumerate()
+                .map(|(index, session)| mcwp_ui::ConversationItem {
+                    heading: session.title.clone().into(),
+                    sub: self.preview(index).into(),
+                })
+                .collect(),
+            current: self.active,
+            title: self.items[self.active].title.clone(),
+            messages: self.items[self.active].messages.clone(),
+            revision: self.revision,
+        }
+    }
+
+    /// 左栏那一行小字:最后一条消息的开头。
+    fn preview(&self, index: usize) -> String {
+        let Some(last) = self.items[index].messages.last() else {
+            return "还没有消息".to_string();
+        };
+        let text = last.text.to_string();
+        if text.chars().count() > 16 {
+            format!("{}…", text.chars().take(16).collect::<String>())
+        } else {
+            text
+        }
+    }
+
+    /// 记一条用户消息 + 一条占位回复;第一条消息顺手给会话起个名。
+    fn send(&mut self, text: &str) {
+        let session = &mut self.items[self.active];
+        if session.messages.is_empty() {
+            session.title = title_from(text);
+        }
+        session.messages.push(mcwp_ui::ChatMessage {
+            mine: true,
+            text: text.into(),
+        });
+        session.messages.push(mcwp_ui::ChatMessage {
+            mine: false,
+            text: PLACEHOLDER_REPLY.into(),
+        });
+        self.revision += 1;
+    }
+
+    /// 切到左栏的第 `index` 个会话。
+    fn select(&mut self, index: usize) {
+        if index < self.items.len() && index != self.active {
+            self.active = index;
+            self.revision += 1;
+        }
+    }
+
+    /// 新建一个空会话并切过去。
+    fn create(&mut self) {
+        self.items.push(Session {
+            title: "新的对话".to_string(),
+            messages: Vec::new(),
+        });
+        self.active = self.items.len() - 1;
+        self.revision += 1;
+    }
+}
+
+/// 用第一条消息给会话起名:多空白折成一个空格,掐头 12 个字。
+fn title_from(text: &str) -> String {
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > 12 {
+        format!("{}…", flat.chars().take(12).collect::<String>())
+    } else {
+        flat
+    }
+}
+
+/// 把「当前 spec + 各预设默认值 + 壁纸库 + 会话」拼成面板的初始状态。
+fn panel_state(
+    spec: &WallpaperSpec,
+    brightness: f32,
+    sessions: &Sessions,
+    library: &[LibraryEntry],
+) -> mcwp_ui::PanelState {
     // 每张卡片自带它的三个参数名与默认值,这样点卡片时面板不用等 Rust 回话就能先自己更新。
     let presets = mcwp_spec::PRESETS
         .iter()
@@ -158,7 +276,9 @@ fn panel_state(spec: &WallpaperSpec, brightness: f32) -> mcwp_ui::PanelState {
         preset_index,
         title: spec.title.clone(),
         hint: spec.keyword_hint(),
-        fingerprint: spec.spec_hash(),
+        // 面板上那条「指纹」用库里的身份口径(归一化后的 hash):和存进库时的文件名、
+        // 壁纸库页里那串字符都是同一个 —— 同一张壁纸到处都念得通。
+        fingerprint: library_id(spec),
         summary: preset.summary().to_string(),
         palette: spec.palette.clone(),
         labels: [
@@ -173,6 +293,9 @@ fn panel_state(spec: &WallpaperSpec, brightness: f32) -> mcwp_ui::PanelState {
         ],
         brightness,
         motion: spec.motion.intensity,
+        session: sessions.state(),
+        library: library_items(library),
+        library_current: library_current(spec, library),
     }
 }
 
@@ -182,9 +305,11 @@ fn panel_state(spec: &WallpaperSpec, brightness: f32) -> mcwp_ui::PanelState {
 fn open_panel(
     spec: &WallpaperSpec,
     brightness: f32,
+    sessions: &Sessions,
+    library: &[LibraryEntry],
     events: &Sender<mcwp_ui::UiEvent>,
 ) -> Option<mcwp_ui::PanelHandle> {
-    let state = panel_state(spec, brightness);
+    let state = panel_state(spec, brightness, sessions, library);
     // 面板字体是子集化的,文案里冒出新字就会画不出来,先摊在日志里。
     for (field, missing) in state.missing_chars() {
         tracing::warn!("面板字体缺字:{field} 里的 {missing:?} 不在内嵌子集内");
@@ -201,28 +326,128 @@ fn open_panel(
     }
 }
 
+/// 壁纸库目录:`%APPDATA%\MC壁纸\library`,一张壁纸 = 一个 JSON,文件名就是 spec 指纹。
+fn library_root() -> Result<PathBuf> {
+    Ok(std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("读不到 APPDATA,无法定位壁纸库目录"))?
+        .join("MC壁纸")
+        .join("library"))
+}
+
+/// 一份 spec 在壁纸库里的 id(也就是文件名)。
+///
+/// `id` 自己不参与指纹计算,所以先把 source 归一成 Snapshot、算完 hash 再当作文件名 ——
+/// 反复存同一份壁纸不会冒出新条目,存与读也用同一把尺子。
+fn library_id(spec: &WallpaperSpec) -> String {
+    let mut stored = spec.clone();
+    stored.source = mcwp_spec::Source::Snapshot;
+    stored.normalize();
+    stored.id = stored.spec_hash();
+    stored.id
+}
+
 /// 存进壁纸库:一张壁纸 = 一个 JSON,文件名就是 spec 指纹,所以重复保存天然去重。
 ///
 /// 这是壁纸库的第一个版本(文件版);等要做标签、历史、缩略图时再换 SQLite。
 fn save_to_library(spec: &WallpaperSpec) -> Result<PathBuf> {
-    let root = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("读不到 APPDATA,无法定位壁纸库目录"))?
-        .join("MC壁纸")
-        .join("library");
+    let root = library_root()?;
     std::fs::create_dir_all(&root)
         .with_context(|| format!("创建壁纸库目录失败:{}", root.display()))?;
 
+    // 落盘的那份是"快照":source 钉成 Snapshot,文件名用归一化后的指纹。
     let mut stored = spec.clone();
     stored.source = mcwp_spec::Source::Snapshot;
     stored.normalize();
-    // `id` 不参与指纹计算,所以先算 hash 再写进去,反复存同一份不会冒出新条目。
-    stored.id = stored.spec_hash();
+    stored.id = library_id(spec);
 
     let path = root.join(format!("{}.json", stored.id));
     std::fs::write(&path, stored.to_pretty_json())
         .with_context(|| format!("写入壁纸失败:{}", path.display()))?;
     Ok(path)
+}
+
+/// 壁纸库里的一个条目:面板要显示的那份(纯数据)+ spec 真身(点它的时候要切过去)。
+struct LibraryEntry {
+    item: mcwp_ui::LibraryItem,
+    spec: WallpaperSpec,
+}
+
+/// 扫一遍壁纸库目录,最近存的排最前。
+///
+/// 面板不碰文件系统:库列表的真相在壁纸这一侧,面板只是它的投影 —— 和会话数据一个道理。
+/// 库目录是用户可写的地方(手工删文件、拷别人的壁纸进去都算正常用法),所以坏 JSON 只记一条
+/// 日志跳过,不能因为它让整块面板打不开。
+fn scan_library() -> Vec<LibraryEntry> {
+    let root = match library_root() {
+        Ok(root) => root,
+        Err(err) => {
+            tracing::warn!("扫壁纸库失败:{err}");
+            return Vec::new();
+        }
+    };
+    // 一次都没存过时目录还不存在,这是正常状态,不是错误。
+    let Ok(dir) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = dir
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|entry| {
+            let path = entry.path();
+            let stamp = entry.metadata().ok()?.modified().ok()?;
+            Some((stamp, path))
+        })
+        .collect();
+    files.sort_by(|left, right| right.0.cmp(&left.0));
+
+    files
+        .into_iter()
+        .filter_map(|(_, path)| match std::fs::read_to_string(&path) {
+            Ok(text) => match WallpaperSpec::parse(&text) {
+                Ok(spec) => {
+                    // 每张壁纸的卡片用自己调色板里的主色,一眼能认出是哪张。
+                    let accent = mcwp_ui::glass_colors(&spec.palette).accent();
+                    Some(LibraryEntry {
+                        item: mcwp_ui::LibraryItem {
+                            // 面板拿它与"当前壁纸"比对,所以用归一化后的指纹当身份 ——
+                            // 手工拷进来的文件(没有 id 字段)也算得出来,点一下就认识它了。
+                            id: library_id(&spec).into(),
+                            title: spec.title.clone().into(),
+                            hint: spec.keyword_hint().into(),
+                            summary: spec.preset().summary().into(),
+                            accent,
+                        },
+                        spec,
+                    })
+                }
+                Err(err) => {
+                    tracing::warn!("壁纸库里的 {} 解析失败,跳过:{err}", path.display());
+                    None
+                }
+            },
+            Err(err) => {
+                tracing::warn!("读壁纸库里的 {} 失败,跳过:{err}", path.display());
+                None
+            }
+        })
+        .collect()
+}
+
+/// 交给面板的那份库列表(只有显示数据,spec 真身留在这一侧)。
+fn library_items(library: &[LibraryEntry]) -> Vec<mcwp_ui::LibraryItem> {
+    library.iter().map(|entry| entry.item.clone()).collect()
+}
+
+/// 当前生效的壁纸在库里的 id;不在库里(比如刚用内置预设改了参数、还没存过)就是空串。
+fn library_current(spec: &WallpaperSpec, library: &[LibraryEntry]) -> String {
+    let id = library_id(spec);
+    library
+        .iter()
+        .any(|entry| entry.item.id == id)
+        .then_some(id)
+        .unwrap_or_default()
 }
 
 #[derive(Debug)]
@@ -484,8 +709,13 @@ fn main() -> Result<()> {
     // 面板跑在自己的线程和自己的 Slint 事件循环里;这里只保留一个事件队列,
     // 每帧开头把它清空一次,所以拖动滑杆的下一帧就能看到变化。
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<mcwp_ui::UiEvent>();
+    // 会话数据在壁纸这一侧(Rust),面板只是它的投影;面板关掉再开,历史还在。
+    let mut sessions = Sessions::new();
+    // 壁纸库同理:开面板时先扫一遍库目录,面板打开就是最新的一张列表。
+    let mut library = scan_library();
+    tracing::info!("壁纸库里有 {} 张壁纸", library.len());
     let mut panel = if args.panel {
-        open_panel(&spec, brightness, &ui_tx)
+        open_panel(&spec, brightness, &sessions, &library, &ui_tx)
     } else {
         None
     };
@@ -523,6 +753,7 @@ fn main() -> Result<()> {
         // 这一帧要切到哪张预设:面板和托盘两个来源都往这里投票,循环末尾统一落地。
         let mut wanted_preset: Option<usize> = None;
         while let Ok(event) = ui_rx.try_recv() {
+            tracing::debug!("面板事件:{event:?}");
             match event {
                 mcwp_ui::UiEvent::SelectPreset(index) => wanted_preset = Some(index),
                 mcwp_ui::UiEvent::Values {
@@ -539,6 +770,38 @@ fn main() -> Result<()> {
                     brightness = ui_brightness.clamp(0.2, 1.6);
                     params = SceneParams::from_spec(&spec, width as u32, height as u32, brightness);
                 }
+                // —— 生图界面:Rust 侧先记着,模型那一环等 M3 —— 
+                mcwp_ui::UiEvent::SendMessage(text) => {
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    sessions.send(&text);
+                    // 用户敲的字面大概率超出内嵌字体子集(生僻字、emoji),缺字是静默不画,先记一笔。
+                    let missing = mcwp_ui::missing_chars(&text);
+                    if !missing.is_empty() {
+                        tracing::warn!(
+                            "这条消息里有 {} 个字符不在内嵌字体内:{missing:?}",
+                            missing.len()
+                        );
+                    }
+                    if let Some(handle) = &panel {
+                        handle.refresh_session(sessions.state());
+                        handle.set_status("AI 未接入 · 这句已经记在当前会话里");
+                    }
+                }
+                mcwp_ui::UiEvent::SelectConversation(index) => {
+                    sessions.select(index);
+                    if let Some(handle) = &panel {
+                        handle.refresh_session(sessions.state());
+                    }
+                }
+                mcwp_ui::UiEvent::NewConversation => {
+                    sessions.create();
+                    if let Some(handle) = &panel {
+                        handle.refresh_session(sessions.state());
+                        handle.set_status("新对话");
+                    }
+                }
                 mcwp_ui::UiEvent::Save => match save_to_library(&spec) {
                     Ok(path) => {
                         let name = path
@@ -546,7 +809,13 @@ fn main() -> Result<()> {
                             .map(|name| name.to_string_lossy().to_string())
                             .unwrap_or_default();
                         tracing::info!("已存为壁纸:{}", path.display());
+                        // 库里多了一张:顺手重扫一遍灌回面板,不用等下次开面板。
+                        library = scan_library();
                         if let Some(panel) = &panel {
+                            panel.refresh_library(
+                                library_items(&library),
+                                library_current(&spec, &library),
+                            );
                             panel.set_status(format!("已存为壁纸 · {name}"));
                         }
                     }
@@ -579,6 +848,32 @@ fn main() -> Result<()> {
                     }
                     tracing::info!("控制面板已关闭");
                 }
+                // 面板切到「壁纸库」页时问一次,库目录被外面改过(手工删、拷进来)也能跟上。
+                mcwp_ui::UiEvent::RefreshLibrary => {
+                    library = scan_library();
+                    if let Some(handle) = &panel {
+                        handle.refresh_library(
+                            library_items(&library),
+                            library_current(&spec, &library),
+                        );
+                    }
+                }
+                // 点库里的某一张:直接换成它,和托盘切预设走同一套落地逻辑。
+                mcwp_ui::UiEvent::OpenWallpaper(index) => {
+                    if let Some(entry) = library.get(index) {
+                        spec = entry.spec.clone();
+                        params = SceneParams::from_spec(&spec, width as u32, height as u32, brightness);
+                        preset_index = mcwp_spec::PRESETS
+                            .iter()
+                            .position(|candidate| *candidate == spec.preset())
+                            .unwrap_or(0);
+                        tracing::info!("切换到壁纸库:{}({})", entry.item.title, entry.item.id);
+                        if let Some(handle) = &panel {
+                            handle.refresh(panel_state(&spec, brightness, &sessions, &library));
+                            handle.set_status(format!("已切到 {}", entry.item.title));
+                        }
+                    }
+                }
             }
         }
 
@@ -593,7 +888,8 @@ fn main() -> Result<()> {
                             tracing::warn!("控制面板还没建好窗口,稍后再点一次");
                         }
                     } else {
-                        panel = open_panel(&spec, brightness, &ui_tx);
+                        library = scan_library();
+                        panel = open_panel(&spec, brightness, &sessions, &library, &ui_tx);
                     }
                 }
                 TrayAction::NextPreset => {
@@ -628,7 +924,7 @@ fn main() -> Result<()> {
                 if let Some(handle) = &panel {
                     // 面板自己点卡片时已经先改过自己了,这次回填是无副作用的对齐;
                     // 托盘切换则全靠它把面板同步过来。
-                    handle.refresh(panel_state(&spec, brightness));
+                    handle.refresh(panel_state(&spec, brightness, &sessions, &library));
                 }
                 tracing::info!("切换到预设:{}", preset.id());
             }

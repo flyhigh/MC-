@@ -53,6 +53,25 @@ RESERVE = (
     "墙壁纸库管理导入导出推荐随机切换刷新同步服务器密钥模型回复提问发送消息"
 )
 
+def cjk_base() -> set:
+    """GB2312 一级汉字(3755 个常用字)。
+
+    为什么整表塞进来:面板上有个输入框,用户敲什么字都得画得出来 —— 子集字体缺字是
+    静默不画(不报错、不回落),聊天框里冒空白比多占 1 MB 难查得多。GB2312 一级字是
+    "常用汉字"最省事的定义:不用联网拉字频表,`gb2312` 编解码器就在标准库里,
+    覆盖日常中文绰绰有余。生僻字(人名、化学名)仍会缺,缺字由 Rust 侧的
+    `missing_chars()` 记进日志。
+    """
+    chars = set()
+    for high in range(0xB0, 0xD8):
+        for low in range(0xA1, 0xFF):
+            try:
+                chars.add(bytes([high, low]).decode("gb2312"))
+            except UnicodeDecodeError:
+                continue
+    return chars
+
+
 # 只出现在日志/注释里、面板不会显示的字符。源字体没有也不影响面板,列在这里免得脚本报错。
 IGNORE_MISSING = "\u2192\u2190\u2264\u2265\u00d7"
 
@@ -99,7 +118,24 @@ def spec_charset() -> set:
 
 
 def charset() -> set:
-    chars = set(EXTRA) | set(RESERVE) | slint_charset() | rust_charset() | spec_charset()
+    """regular 字面要整份:面板上有输入框,用户敲什么字都得画得出来(见 cjk_base 的说明)。"""
+    return {c for c in (static_charset() | cjk_base()) if c.isprintable()}
+
+
+def static_charset() -> set:
+    """面板自己的文案(静态):.slint 的字面量与注释、Rust 侧字面量、预留状态词、示例 spec。
+
+    这份是 bold 字面的全部内容 —— bold 只用来画标题/标签这些写死的字。
+    动态文案(会话名、消息、输入框、壁纸名)一律走 regular(见 panel.slint 顶部的字重约定),
+    所以 bold 不必背 GB2312 整表:一个字体面会被整份解析进内存,收窄它就是十几 MB。
+    """
+    chars = (
+        set(EXTRA)
+        | set(RESERVE)
+        | slint_charset()
+        | rust_charset()
+        | spec_charset()
+    )
     return {c for c in chars if c.isprintable()}
 
 
@@ -153,27 +189,28 @@ def rename(ttf_path: str, weight: int, style: str) -> None:
 
 
 def main() -> int:
-    chars = charset()
+    # regular 画动态文案(整份),bold 只画面板自己的静态文案 —— 见 static_charset() 的说明。
+    per_weight = {"regular": charset(), "bold": static_charset()}
+    chars = per_weight["regular"]
     os.makedirs(OUT_DIR, exist_ok=True)
     print(f"面板字符集:{len(chars)} 个字符")
+    print(f"  其中 bold(静态文案)要 {len(per_weight['bold'])} 个")
 
     # 源字体里没有的字符没法子集化,提前查出来:除了明确忽略的,其余都是硬错误。
     sources = {name: source_ttf(weight) for name, (weight, _) in WEIGHTS.items()}
     available = cmap_of(TTFont(sources["regular"]))
-    unavailable = sorted(
-        c for c in chars if ord(c) not in available and c not in IGNORE_MISSING
-    )
-    if unavailable:
-        print(f"!! 源字体缺字 {len(unavailable)} 个:{''.join(unavailable[:40])}")
-        print("   (面板要显示的字符必须能子集化;只出现在日志里的字符请加进 IGNORE_MISSING)")
-        return 1
+    # 常用字表按"源字体里有没有"过滤:差的那几个异体字不值得为它中止一次构建。
+    skipped = [c for c in chars if c not in IGNORE_MISSING and ord(c) not in available]
+    if skipped:
+        print(f"   (源字体没有的 {len(skipped)} 个字符已跳过:{''.join(sorted(skipped)[:20])}")
     subset_chars = sorted(c for c in chars if ord(c) in available)
 
     for name, (weight, style) in WEIGHTS.items():
+        weight_chars = sorted(c for c in per_weight[name] if ord(c) in available)
         out = os.path.join(OUT_DIR, f"panel-cjk-{name}.ttf")
         subset_main([
             sources[name],
-            f"--text={''.join(subset_chars)}",
+            f"--text={''.join(weight_chars)}",
             "--output-file=" + out,
             "--layout-features=",          # 面板不需要连字/字距特性
             "--no-hinting",
@@ -186,7 +223,7 @@ def main() -> int:
 
         font = TTFont(out)
         covered = cmap_of(font)
-        missing = [c for c in subset_chars if ord(c) not in covered]
+        missing = [c for c in weight_chars if ord(c) not in covered]
         if missing:
             print(f"  !! {os.path.basename(out)} 缺字 {len(missing)} 个:{''.join(missing[:40])}")
             return 1

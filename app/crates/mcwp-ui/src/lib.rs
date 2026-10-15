@@ -70,6 +70,16 @@ pub enum UiEvent {
         brightness: f32,
         motion: f32,
     },
+    /// 用户在输入框里发了一条消息(生图界面)
+    SendMessage(String),
+    /// 点开了左栏里的某个会话(左栏下标)
+    SelectConversation(usize),
+    /// 点了「+ 新建对话」
+    NewConversation,
+    /// 面板切到「壁纸库」页:想要一份最新的库列表
+    RefreshLibrary,
+    /// 点了壁纸库里的第 `index` 张(`PanelState::library` 的下标)
+    OpenWallpaper(usize),
     /// 「存为壁纸」
     Save,
     /// 「恢复默认」
@@ -92,6 +102,56 @@ pub struct PanelState {
     pub params: [f32; 3],
     pub brightness: f32,
     pub motion: f32,
+    /// 生图界面:左栏历史 + 右栏会话
+    pub session: SessionState,
+    /// 壁纸库:由壁纸侧扫描库目录得到,面板只负责画(和会话数据同一个道理)
+    pub library: Vec<LibraryItem>,
+    /// 当前生效的壁纸在库里的 id;空串表示这张还没存进库
+    pub library_current: String,
+}
+
+/// 生图界面的会话数据:左栏的会话列表 + 当前会话的消息。
+///
+/// 面板不持有任何状态,所以换会话、发消息都是「Rust 改数据 → 整块回填」。`revision`
+/// 每改一次 +1:消息列表靠它把滚动位置钉到底部(内容长高了才需要滚,面板自己看不出来)。
+///
+/// M3 接上 AI 之前,这些会话只活在内存里,退出即散 —— 真正的对话历史该跟壁纸库一样落盘,
+/// 那是 M3 的事。
+#[derive(Debug, Clone, Default)]
+pub struct SessionState {
+    /// 左栏:历史对话
+    pub conversations: Vec<ConversationItem>,
+    /// 当前选中的会话(左栏下标)
+    pub current: usize,
+    /// 右栏标题
+    pub title: String,
+    /// 当前会话的消息(按时间顺序)
+    pub messages: Vec<ChatMessage>,
+    /// 消息版本号
+    pub revision: i32,
+}
+
+impl SessionState {
+    /// 会话列表与消息里,内嵌字体画不出来的字符。用户输入的字面覆盖不到是常态,
+    /// 所以调用方拿到非空结果时按「记一笔」处理就好,不用当错误。
+    pub fn missing_chars(&self) -> Vec<(String, Vec<char>)> {
+        let mut fields: Vec<(String, String)> = Vec::new();
+        fields.push(("标题".into(), self.title.clone()));
+        for (index, conversation) in self.conversations.iter().enumerate() {
+            fields.push((format!("会话{index} 标题"), conversation.heading.to_string()));
+            fields.push((format!("会话{index} 预览"), conversation.sub.to_string()));
+        }
+        for (index, message) in self.messages.iter().enumerate() {
+            fields.push((format!("消息{index}"), message.text.to_string()));
+        }
+        fields
+            .into_iter()
+            .filter_map(|(name, text)| {
+                let missing = missing_chars(&text);
+                (!missing.is_empty()).then_some((name, missing))
+            })
+            .collect()
+    }
 }
 
 impl PanelState {
@@ -106,13 +166,21 @@ impl PanelState {
             fields.push((format!("预设{index} 标题"), preset.title.to_string()));
             fields.push((format!("预设{index} 说明"), preset.summary.to_string()));
         }
-        fields
+        // 库里的壁纸名是动态的(AI 生成 / 用户存的),同样要盯缺字
+        for (index, item) in self.library.iter().enumerate() {
+            fields.push((format!("库{index} 标题"), item.title.to_string()));
+            fields.push((format!("库{index} 关键词"), item.hint.to_string()));
+        }
+        let mut missing_fields: Vec<(String, Vec<char>)> = fields
             .into_iter()
             .filter_map(|(name, text)| {
                 let missing = missing_chars(&text);
                 (!missing.is_empty()).then_some((name, missing))
             })
-            .collect()
+            .collect();
+        // 会话标题与消息是用户/模型给的动态字面,缺字是常态,和上面那些静态文案一样列出来
+        missing_fields.extend(self.session.missing_chars());
+        missing_fields
     }
 }
 
@@ -152,6 +220,26 @@ impl PanelHandle {
                 panel.set_param_c(params[2]);
                 panel.set_brightness(brightness);
                 panel.set_motion(motion);
+            }
+        });
+    }
+
+    /// 整块回填会话视图(左栏列表 + 当前会话的消息)。发消息 / 切会话 / 新建会话都走它。
+    pub fn refresh_session(&self, session: SessionState) {
+        let weak = self.weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(panel) = weak.upgrade() {
+                apply_session(&panel, &session);
+            }
+        });
+    }
+
+    /// 整块回填壁纸库(存了新壁纸、面板切到库页时用)。
+    pub fn refresh_library(&self, library: Vec<LibraryItem>, current: String) {
+        let weak = self.weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(panel) = weak.upgrade() {
+                apply_library(&panel, library, current);
             }
         });
     }
@@ -256,6 +344,41 @@ fn build(state: &PanelState, events: Sender<UiEvent>) -> Result<Panel> {
         let tx = events.clone();
         ui.on_reset_requested(move || {
             let _ = tx.send(UiEvent::Reset);
+        });
+    }
+
+    {
+        let tx = events.clone();
+        ui.on_send_message(move |text| {
+            let _ = tx.send(UiEvent::SendMessage(text.to_string()));
+        });
+    }
+
+    {
+        let tx = events.clone();
+        ui.on_select_conversation(move |index| {
+            let _ = tx.send(UiEvent::SelectConversation(index.max(0) as usize));
+        });
+    }
+
+    {
+        let tx = events.clone();
+        ui.on_new_conversation(move || {
+            let _ = tx.send(UiEvent::NewConversation);
+        });
+    }
+
+    {
+        let tx = events.clone();
+        ui.on_open_wallpaper(move |index| {
+            let _ = tx.send(UiEvent::OpenWallpaper(index.max(0) as usize));
+        });
+    }
+
+    {
+        let tx = events.clone();
+        ui.on_refresh_library(move || {
+            let _ = tx.send(UiEvent::RefreshLibrary);
         });
     }
 
@@ -373,6 +496,19 @@ fn window_hwnd(ui: &Panel) -> Option<isize> {
     }
 }
 
+/// 把会话数据写进面板:左栏列表、右栏标题与消息。
+fn apply_session(ui: &Panel, session: &SessionState) {
+    ui.set_conversations(slint::ModelRc::new(slint::VecModel::from(
+        session.conversations.clone(),
+    )));
+    ui.set_current_conversation(session.current as i32);
+    ui.set_session_title(session.title.clone().into());
+    ui.set_messages(slint::ModelRc::new(slint::VecModel::from(
+        session.messages.clone(),
+    )));
+    ui.set_message_revision(session.revision);
+}
+
 /// 把一份面板状态写进已经建好的面板。初始化与「托盘切预设」共用同一段。
 fn apply_state(ui: &Panel, state: &PanelState) {
     let colors = glass_colors(&state.palette);
@@ -398,4 +534,12 @@ fn apply_state(ui: &Panel, state: &PanelState) {
     ui.set_param_c(state.params[2]);
     ui.set_brightness(state.brightness);
     ui.set_motion(state.motion);
+    apply_session(ui, &state.session);
+    apply_library(ui, state.library.clone(), state.library_current.clone());
+}
+
+/// 把壁纸库写进面板:列表本身 + 当前生效的是哪一张(画成选中态)。
+fn apply_library(ui: &Panel, library: Vec<LibraryItem>, current: String) {
+    ui.set_library(slint::ModelRc::new(slint::VecModel::from(library)));
+    ui.set_library_current(current.into());
 }

@@ -1,14 +1,17 @@
 # MC 壁纸
 
 Windows 桌面动态壁纸与个性化工具。壁纸窗口挂在桌面图标之下的「壁纸层」(`WorkerW`),常驻托盘;
-控制面板是一块 Slint 写的 iOS 液态玻璃面板;目标形态是「按工作状态 / 对话生成壁纸」+ 可交互桌宠。
+控制面板是一块 Slint 写的 iOS 液态玻璃**生图界面**(左栏历史对话 + 右栏会话,壁纸参数 / 壁纸库 /
+设置挂在左栏底部);目标形态是「按工作状态 / 对话生成壁纸」+ 可交互桌宠。
 
 - **语言**:Rust(edition 2024)
 - **渲染**:wgpu → DXGI 合成交换链(`CreateSwapChainForComposition` + `IDCompositionVisual`)
 - **界面**:Slint,进程内按需建窗、关窗即释放;字体子集内嵌,不依赖系统字体
 - **系统集成**:Win32 原生(`Shell_NotifyIconW` 托盘 / `HKCU\...\Run` 开机自启 / DWM 窗口属性),无第三方封装
 
-进度:M0(桌面挂载 + 着色器场景)、M1 的一部分(壁纸库、控制面板、托盘)已完成。
+进度:M0(桌面挂载 + 着色器场景)、M1 的一部分(壁纸库、控制面板、托盘)已完成。面板已改成生图
+界面,发消息、切会话、壁纸库列表都能跑通;壁纸库的列表由壁纸侧扫 `%APPDATA%\MC壁纸\library`
+自动灌进来,点一张就切过去。AI 那一环(M3)还没接 —— 回复位现在是占位文案。
 技术细节与实测数据见 `docxs/MC壁纸-需求与技术方案.md`。
 
 ## 构建
@@ -48,4 +51,8 @@ cargo build --release --workspace
 
 - 改过 `app/crates/mcwp-ui/ui/panel.slint` 里的面板文案后要重跑
   `python tools/subset-panel-font.py`。面板用的是子集字体,缺字不会报错、只会静静地画不出来。
+- 面板字体分两档:**regular 是全字集**(GB2312 一级汉字,画消息 / 输入框这类动态文案),
+  **bold 只收面板自己的静态文案**。所以动态文案一律不能用 `font-weight: 600`,否则静默缺字。
+- 面板自己不存任何东西:会话、壁纸库、当前 spec 都在 `mcwp-wallpaper` 侧,面板只是它们的投影。
+  调试时把 `RUST_LOG` 设成 `info,mcwp_wallpaper=debug` 能看到面板发回来的每个事件。
 - `app/.cargo/config.toml` 把 crates.io 换成了 USTC 镜像(本机直连官方源约 16 KB/s);删掉即回退官方源。

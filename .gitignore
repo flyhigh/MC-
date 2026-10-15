@@ -11,6 +11,12 @@
 /app/shots/
 /app/m0-shot*.png
 
+# 面板回归用的临时暂存目录(截图 / 日志),同上,随时可重拍。
+/.shots/
+
+# Python 工具跑出来的字节码缓存。
+__pycache__/
+
 # 编辑器 / 系统杂物
 .vscode/
 .idea/

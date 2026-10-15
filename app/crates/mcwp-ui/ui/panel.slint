@@ -1,27 +1,54 @@
-// MC 壁纸 · 控制面板(iOS 26 液态玻璃风格)
+// MC 壁纸 · 控制面板 —— 生图界面(iOS 26 液态玻璃风格)
 //
-// 视觉依据:Apple HIG「Materials / Liquid Glass」+ WWDC25 §219《Meet Liquid Glass》。
-// 落到这个面板上的三条原则:
+// 信息架构是两块:
 //
-//   1. 玻璃是「功能层」,浮在内容层之上。所以窗口里先铺一层环境底(ambient),玻璃面板盖在
-//      上面;玻璃内部不再叠玻璃,只用薄填充 / 白色高光 / 发丝线(HIG:不要 glass on glass)。
-//   2. 玻璃要能"折射"。软件渲染器没有真·背景模糊,替代做法是:环境底由我们自己画(天然就是
-//      柔和的),再用半透明 + 顶部高光 + 底部内缘暗线去模拟 lensing。
-//   3. 玻璃铺满整个窗口:窗口那圈圆角由 DWM 画(约 8px),我们画的每一层都跟它对齐 ——
-//      自己画大了,窗口里会露出一小块背景色拼成的"墙角"。卡片再用更小的圆角嵌在里面。
+//   ┌──────────────┬────────────────────────────────────────────┐
+//   │ 历史对话      │ 会话标题                                    │
+//   │  + 新建对话   │ ──────────────────────────────────────────  │
+//   │  对话一 ·…    │ 消息流(用户的靠右、染色;回复靠左、薄填充)  │
+//   │  对话二 ·…    │                                             │
+//   │  …            │ ──────────────────────────────────────────  │
+//   │  壁纸参数     │ [ 说一句想看到的样子…         ] [ 发送 ]    │
+//   │  壁纸库       │                                             │
+//   │  设置         │                                             │
+//   └──────────────┴────────────────────────────────────────────┘
 //
-// 软件渲染器的能力边界(踩过才知道):
+// 左栏是会话历史常驻的位置,底部三项把右栏换成参数 / 库 / 设置 —— 原来「壁纸 / 库 / 设置」
+// 三个页签的内容没丢,只是从顶部挪到了左栏底部,顶上那一行留给会话标题。`view` 是纯界面状态
+// (0 会话 / 1 参数 / 2 库 / 3 设置),不进 Rust;切视图一律用 `if` 而不是 `visible`。
+//
+// 壁纸库页的列表不写死在面板里:壁纸侧扫过 `%APPDATA%\MC壁纸\library` 再整块灌进来
+// (`library` / `library-current`),切到库页时回调 `refresh-library` 要一份最新的 ——
+// 库目录是用户可写的地方,面板自己不去读文件。
+//
+// —— 视觉与软件渲染器的能力边界(踩过才知道,别重犯)——
 //   * 支持:线性/径向渐变、圆角、alpha 混合、旋转、颜色插值动画
 //   * 不支持:backdrop-blur、盒阴影(draw_box_shadow 是 TODO)、裁剪路径、渐变描边
 //     → 阴影用「径向渐变暗斑」伪造,描边一律实色
-//   * **圆角只对实色背景生效**。software_renderer.rs 的 `process_rectangle_impl` 里,
-//     渐变是单独一条分支:它把整个矩形直接刷下去(不看 radius),随后那次
-//     `process_rounded_rectangle` 拿到的 inner_color 是透明的,等于什么也没画。
-//     表现就是「发丝线描边是圆的、填充是直角」—— 分段控件的滑片会变成一块直角砖。
-//     → 凡是要圆角的地方一律用实色;渐变只留给圆角不重要的地方(窗口底色、环境光斑)。
-//       液态玻璃的厚度感改用发丝高光 + 半透明层表达。
+//   * **圆角只对实色背景生效**。software_renderer.rs 的 `process_rectangle_impl` 里,渐变是
+//     单独一条分支:它把整个矩形直接刷下去(不看 radius),随后那次 `process_rounded_rectangle`
+//     拿到的 inner_color 是透明的,等于什么也没画。表现就是「发丝线描边是圆的、填充是直角」。
+//     → 凡是要圆角的地方一律用实色(带 alpha 的实色也算);渐变只留给圆角不重要的地方
+//       (窗口底色、环境光斑)。
+//   * `visible: false` 会被降级成一个 Clip 包裹元素,照样占布局空间;要不占位就用 `if`。
+//   * 布局的 `alignment` 指的是**主轴**方向:HorizontalLayout 里写 `alignment: center` 会把整条
+//     内容挤到中间(横向 stretch 同时也失效,输入框会塌成文字那么宽)。横向布局一律不写它,
+//     竖直居中交给布局默认的 cross 居中;真要竖排居中就用 VerticalLayout 的 alignment: center。
+//     反过来也要注意:HBox 里**定宽高**的孩子(圆点、色卡、胶囊按钮)没有"竖直居中"可言,
+//     它们会被摆在这一行的顶边 —— 要居中就套一层 `VerticalLayout { alignment: center; }`。
 //
-// 与 Rust 的唯一接口还是下面这些 property / callback,面板自己不持有任何持久状态。
+// 玻璃的三条原则(Apple HIG「Materials / Liquid Glass」+ WWDC25 §219):
+//   1. 玻璃是功能层,浮在内容层之上:先铺环境底,玻璃盖上去;玻璃内部不再叠玻璃,
+//      只用薄填充 / 白色高光 / 发丝线。
+//   2. 软件渲染器没有真·背景模糊,「折射」靠半透明 + 顶部高光 + 底部内缘暗线模拟。
+//   3. 玻璃铺满整个窗口,圆角跟 DWM 画的那圈对齐,卡片再用更小的圆角嵌在里面。
+//
+// 字重约定:动态文案(会话名、消息、输入框里的字)一律用 regular —— 内嵌的 regular 是
+// 全字集(GB2312 一级字,见 tools/subset-panel-font.py),bold 只收了面板自己的静态文案,
+// 拿 bold 画用户输入的字会静默缺字。标题的层级感靠字号/颜色,不靠字重。
+//
+// 与 Rust 的唯一接口还是下面这些 property / callback,面板自己不持有任何持久状态:
+// 会话列表与消息也是 Rust 传进来的模型,面板只负责画。
 
 // 把子集字体编进 exe。Slint 认 `import "xxx.ttf"` 这种写法:build.rs 的 EmbedFiles 会把
 // 字体数据塞进二进制,生成的初始化代码再调 register_font_from_memory() 注册族名。
@@ -49,6 +76,7 @@ global Glass {
     out property <length> r-card: 12px;
 }
 
+// 参数视图里的一张预设卡片(原来是"壁纸"页的主内容)。
 export struct PresetItem {
     id: string,
     title: string,
@@ -62,6 +90,27 @@ export struct PresetItem {
     motion: float,
 }
 
+// 一条消息。`mine` = 用户自己发的那条。
+export struct ChatMessage {
+    mine: bool,
+    text: string,
+}
+
+// 左栏里的一条历史对话。
+export struct ConversationItem {
+    heading: string,
+    sub: string,
+}
+
+// 壁纸库里的一张壁纸(壁纸侧扫描库目录得到)。`accent` 是它调色板里的主色,卡片靠它区分;
+// 真缩略图要拿 spec 渲染一张才准,那是后面的事,先不假装有。
+export struct LibraryItem {
+    id: string,
+    title: string,
+    hint: string,
+    summary: string,
+    accent: color,
+}
 // 玻璃上的「胶囊」按钮。主操作是 tinted(染色玻璃),次操作是普通玻璃。
 component Pill inherits Rectangle {
     in property <string> text: "";
@@ -103,6 +152,7 @@ component Pill inherits Rectangle {
     }
 
     touch := TouchArea {
+        mouse-cursor: pointer;
         clicked => { root.clicked(); }
     }
 }
@@ -139,7 +189,6 @@ component GlassSlider inherits VerticalLayout {
         height: 30px;
         border-radius: 15px;
         // 凹槽:实色压暗 + 内缘暗线,读起来像被"挖"进玻璃里。
-        // 原来这里用「上暗下亮」的反向渐变 —— 但渐变画不出圆角,整条凹槽会变成直角。
         background: #0000003D;
         border-width: 1px;
         border-color: Glass.hairline-dim;
@@ -151,7 +200,6 @@ component GlassSlider inherits VerticalLayout {
             width: max(0px, min(parent.width - 2px, knob.x + knob.width / 2 - 1px));
             height: parent.height - 2px;
             border-radius: (parent.height - 2px) / 2;
-            // 实色,理由同 track:渐变会让这一截连两头都是直的
             background: accent.brighter(0.10);
             opacity: 0.92;
         }
@@ -162,20 +210,17 @@ component GlassSlider inherits VerticalLayout {
             y: (parent.height - self.height) / 2;
             x: clamp((parent.width - self.width) * (root.value - root.minimum) / (root.maximum - root.minimum), 0px, parent.width - self.width);
             border-radius: self.width / 2;
-            // 实色,理由同 track(渐变会让旋钮从圆变成方块)
             background: #FFFFFF;
             border-width: 1px;
             border-color: #FFFFFFE6;
             animate x { duration: 120ms; easing: ease-out; }
-            // 原先这里还有一层「上半部白色弧」当玻璃球镜面:它在白色旋钮上本来就是白压白、
-            // 看不见,又因为是渐变而只会画出一个直角浅色块,所以删掉。
         }
 
         touch := TouchArea {
+            mouse-cursor: pointer;
             pointer-event(e) => {
                 // `move` 事件是"悬停也会来"的:不加 `touch.pressed` 这道闸,鼠标只是从滑杆上
-                // 划过就会改值 —— 面板上五个滑杆会被一次挥动全部带动,拖动窗口时尤其明显。
-                // down 事件本身即按下,不用再判 pressed。
+                // 划过就会改值 —— 面板上几个滑杆会被一次挥动全部带动。
                 if (e.kind == PointerEventKind.down
                     || (e.kind == PointerEventKind.move && touch.pressed)) {
                     root.value = root.minimum + clamp((touch.mouse-x - knob.width / 2) / (track.width - knob.width), 0, 1) * (root.maximum - root.minimum);
@@ -187,8 +232,7 @@ component GlassSlider inherits VerticalLayout {
         }
     }
 }
-
-// 预设卡片。选中的用染色玻璃表示,未选中的是薄填充。
+// 参数视图里的预设卡片。选中的用染色玻璃表示,未选中的是薄填充。
 component PresetRow inherits Rectangle {
     in property <bool> selected: false;
     in property <string> heading: "";
@@ -211,16 +255,20 @@ component PresetRow inherits Rectangle {
         padding-left: 12px;
         padding-right: 12px;
         spacing: 10px;
-        alignment: center;
+        // 不写 alignment:横向布局的它是主轴方向,会把内容挤到中间(见文件顶部)
 
-        // 选中指示器:一颗小圆点(渐变),未选中时几乎不可见
-        Rectangle {
-            width: 7px;
-            height: 7px;
-            border-radius: 3.5px;
-            background: selected ? accent : Glass.label-3;
-            opacity: selected ? 1 : 0.35;
-            animate opacity { duration: 160ms; }
+        // 选中指示器:一颗小圆点(套 VBox 才能在行内竖直居中,见文件顶部的布局说明)
+        VerticalLayout {
+            alignment: center;
+
+            Rectangle {
+                width: 7px;
+                height: 7px;
+                border-radius: 3.5px;
+                background: selected ? accent : Glass.label-3;
+                opacity: selected ? 1 : 0.35;
+                animate opacity { duration: 160ms; }
+            }
         }
 
         VerticalLayout {
@@ -247,92 +295,245 @@ component PresetRow inherits Rectangle {
     }
 
     touch := TouchArea {
+        mouse-cursor: pointer;
         clicked => { root.picked(); }
     }
 }
 
-// 分段控件(页签)。iOS 的 segmented control:胶囊凹槽 + 一块会滑动的染色玻璃。
-component SegTabs inherits Rectangle {
-    in property <[string]> items;
-    in property <int> current: 0;
+// 左栏:一条历史对话。
+component ConversationRow inherits Rectangle {
+    in property <string> heading: "";
+    in property <string> sub: "";
+    in property <bool> selected: false;
     in property <color> accent: #0A84FF;
 
-    callback picked(int);
+    callback picked();
 
-    height: 36px;
-    border-radius: self.height / 2;
-    // 和滑杆的凹槽同一套语言:实色压暗 + 内缘发丝线。
-    // 原先是渐变 —— 所以这条凹槽的填充一直是直角,只有那圈发丝线是圆的。
-    background: #0000003D;
+    height: 50px;
+    border-radius: Glass.r-card;
+    // 未选中时不画描边(透明描边 + 实色填充,圆角才生效)
     border-width: 1px;
-    border-color: Glass.hairline-dim;
+    border-color: selected ? accent.with-alpha(0.5) : #FFFFFF00;
+    background: selected
+        ? accent.with-alpha(touch.has-hover ? 0.22 : 0.16)
+        : (touch.has-hover ? Glass.fill-hover : #FFFFFF00);
+    animate background { duration: 160ms; easing: ease-out; }
 
-    // 选中项的滑片:等宽,跟着 current 平移;切换时动画滑过去
+    // 选中指示条:贴在左内缘的一小截染蓝竖条
     Rectangle {
-        width: (parent.width - 8px) / max(1, root.items.length);
-        height: parent.height - 8px;
-        x: 4px + self.width * root.current;
-        y: 4px;
-        border-radius: self.height / 2;
-        // 实色:圆角才生效(渐变会被画成一块直角砖)。染色玻璃的厚度感交给下面那条发丝高光。
-        background: accent;
-        opacity: 0.92;
-        animate x { duration: 180ms; easing: ease-out; }
+        x: 1px;
+        y: 10px;
+        width: 2px;
+        height: parent.height - 20px;
+        border-radius: 1px;
+        background: root.selected ? root.accent : #FFFFFF00;
+    }
 
-        Rectangle {
-            x: parent.width * 0.14;
-            y: 1px;
-            width: parent.width * 0.72;
-            height: 1px;
-            border-radius: 0.5px;
-            background: Glass.specular;
-            opacity: 0.65;
+    VerticalLayout {
+        padding-left: 14px;
+        padding-right: 12px;
+        alignment: center;
+        spacing: 2px;
+
+        Text {
+            text: root.heading;
+            color: root.selected ? Glass.label : Glass.label-2;
+            font-size: 13px;
+            overflow: elide;
+            animate color { duration: 160ms; }
+        }
+        Text {
+            text: root.sub;
+            color: Glass.label-3;
+            font-size: 11px;
+            overflow: elide;
         }
     }
 
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.picked(); }
+    }
+}
+
+// 壁纸库里的一张壁纸:左边一块主色色卡(缩略图的占位),右边标题 + 关键词,尾巴上挂指纹。
+component LibraryRow inherits Rectangle {
+    in property <string> heading: "";
+    in property <string> sub: "";
+    in property <string> meta: "";
+    in property <color> accent: #0A84FF;
+    in property <bool> selected: false;
+
+    callback picked();
+
+    height: 54px;
+    border-radius: Glass.r-card;
+    // 未选中时不画描边(透明描边 + 实色填充,圆角才生效)
+    border-width: 1px;
+    border-color: selected ? accent.with-alpha(0.5) : #FFFFFF00;
+    background: selected
+        ? accent.with-alpha(touch.has-hover ? 0.22 : 0.16)
+        : (touch.has-hover ? Glass.fill-hover : #FFFFFF00);
+    animate background { duration: 160ms; easing: ease-out; }
+
     HorizontalLayout {
-        padding: 4px;
-        for item[i] in root.items : Rectangle {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 12px;
+
+        // 这里不要写 alignment:横向布局的 alignment 是主轴(水平)方向,写了会把整条内容
+        // 挤到中间去(和左栏 NavRow 是同一个坑);竖直居中交给布局默认的 cross 居中。
+
+        // 色卡:这张壁纸自己的主色(实色才有圆角,渐变画不出圆角)。
+        // 套 VBox 是为了在 54px 的行里竖直居中,见文件顶部的布局说明。
+        VerticalLayout {
+            alignment: center;
+
+            Rectangle {
+                width: 36px;
+                height: 36px;
+                border-radius: 10px;
+                background: root.accent;
+            }
+        }
+
+        VerticalLayout {
             horizontal-stretch: 1;
+            alignment: center;
+            spacing: 2px;
 
             Text {
-                text: item;
-                color: i == root.current ? Glass.label : Glass.label-2;
+                text: root.heading;
+                color: root.selected ? Glass.label : Glass.label-2;
                 font-size: 13px;
-                font-weight: i == root.current ? 600 : 400;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-                width: 100%;
-                height: 100%;
-                animate color { duration: 180ms; }
+                overflow: elide;
             }
+            Text {
+                text: root.sub;
+                color: Glass.label-3;
+                font-size: 11px;
+                overflow: elide;
+            }
+        }
 
-            TouchArea {
-                mouse-cursor: pointer;
-                clicked => { root.picked(i); }
+        Text {
+            text: root.meta;
+            color: Glass.label-3;
+            font-size: 10px;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.picked(); }
+    }
+}
+
+// 左栏底部:切到「壁纸参数 / 壁纸库 / 设置」。再点一次回到会话。
+component NavRow inherits Rectangle {
+    in property <string> text: "";
+    in property <bool> active: false;
+    in property <color> accent: #0A84FF;
+
+    callback picked();
+
+    height: 32px;
+    border-radius: 8px;
+    background: active
+        ? accent.with-alpha(0.18)
+        : (touch.has-hover ? Glass.fill-hover : #FFFFFF00);
+    animate background { duration: 140ms; easing: ease-out; }
+
+    HorizontalLayout {
+        padding-left: 11px;
+        spacing: 9px;
+
+        // 套一层 VBox:横向布局里定高的圆点会被顶到行顶边,竖直居中得靠 VBox 的主轴居中
+        VerticalLayout {
+            alignment: center;
+
+            Rectangle {
+                width: 6px;
+                height: 6px;
+                border-radius: 3px;
+                background: active ? accent : Glass.label-3;
+                opacity: active ? 1 : 0.45;
+            }
+        }
+        Text {
+            text: root.text;
+            color: active ? Glass.label : Glass.label-2;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.picked(); }
+    }
+}
+
+// 右栏:一条消息。用户的气泡靠右、染色;回复靠左、薄填充。
+component MessageRow inherits HorizontalLayout {
+    in property <string> body: "";
+    in property <bool> mine: false;
+    in property <color> accent: #0A84FF;
+
+    // 靠边:用户消息靠右、回复靠左(伸缩项吃掉剩余空间),两侧各留 6px 给圆角喘口气
+    padding-left: 6px;
+    padding-right: 6px;
+    if mine : Rectangle { horizontal-stretch: 1; }
+    if !mine : Rectangle { horizontal-stretch: 1; }
+
+    bubble := Rectangle {
+        // 贴着内容大小,不被行高拉伸
+        vertical-stretch: 0;
+        horizontal-stretch: 0;
+        min-width: 56px;
+        max-width: 440px;
+        border-radius: 14px;
+        border-width: 1px;
+        border-color: mine ? accent.with-alpha(0.45) : Glass.hairline-dim;
+        // 实色(带 alpha 的实色也算),圆角才生效
+        background: mine ? accent.with-alpha(0.26) : Glass.fill;
+
+        VerticalLayout {
+            padding: 10px;
+            Text {
+                text: root.body;
+                wrap: word-wrap;
+                color: Glass.label;
+                font-size: 13px;
             }
         }
     }
 }
-
 export component Panel inherits Window {
+    // —— 会话视图:左栏历史 + 右栏消息 ——
+    in property <[ConversationItem]> conversations;
+    in-out property <int> current-conversation: 0;
+    in property <string> session-title: "";
+    in property <[ChatMessage]> messages;
+    // 壁纸库:列表与「当前是哪张」都由 Rust 灌进来,面板不碰文件系统
+    in property <[LibraryItem]> library;
+    in property <string> library-current: "";
+    // 每来一条新消息 Rust 就 +1:消息列表靠它把自己钉到底部(内容长高时自动滚到底)
+    in property <int> message-revision: 0;
+    // 输入框里还没发出去的字。纯界面状态,和输入框双向绑定。
+    in-out property <string> draft: "";
+
+    // 右栏当前显示哪个视图:0 = 会话,1 = 壁纸参数,2 = 壁纸库,3 = 设置。纯界面状态,不进 Rust。
+    in-out property <int> view: 0;
+
+    // —— 参数视图(原来「壁纸」页那一套)——
     in property <[PresetItem]> presets;
     in-out property <int> current-preset: 0;
-    // 页签。0 = 壁纸(下面的「当前壁纸」+「预设/参数」两块就是它的内容),
-    // 1 = 库,2 = 设置。纯界面状态,不进 Rust。
-    in-out property <int> page: 0;
     in property <string> wallpaper-title: "—";
     in property <string> wallpaper-hint: "";
     in property <string> fingerprint: "";
     in-out property <string> preset-summary: "";
-
-    // 环境底色板由 Rust 按当前壁纸调色板算出来,玻璃因此会"透"出当前壁纸的色。
-    in property <color> ambient-a: #1B2A4A;
-    in property <color> ambient-b: #4F7CFF;
-    in property <color> ambient-c: #0B1020;
-    in property <color> glass-tint: #10141F;
-    in property <color> accent: #0A84FF;
-
     in-out property <string> label-a: "";
     in-out property <string> label-b: "";
     in-out property <string> label-c: "";
@@ -342,6 +543,14 @@ export component Panel inherits Window {
     in-out property <float> brightness: 1.0;
     in-out property <float> motion: 0.5;
     in property <string> status: "";
+
+    // 环境底色板由 Rust 按当前壁纸调色板算出来,玻璃因此会"透"出当前壁纸的色。
+    in property <color> ambient-a: #1B2A4A;
+    in property <color> ambient-b: #4F7CFF;
+    in property <color> ambient-c: #0B1020;
+    in property <color> glass-tint: #10141F;
+    in property <color> accent: #0A84FF;
+
     // 左键是否正按在标题栏上。只用来判断"这次抬起要不要收尾",
     // 真正的拖动由 Rust 侧驱动(见下面三个 drag-* 回调的说明)。
     private property <bool> drag-active: false;
@@ -351,21 +560,23 @@ export component Panel inherits Window {
     callback save-requested();
     callback reset-requested();
     callback close-requested();
-    // 无边框窗口没有系统标题栏,拖动得自己接。分三个动作,而不是一条"是否按住"的布尔:
-    // TouchArea 的 `pressed` 只在指针位于自己那条窄带里才为真,拖快一点指针就出界,
-    // 它会立刻 pressed=false 并补发一个 cancel —— 拖动等于半路脱手,窗口停住不再跟手。
-    // 所以这里只认左键 down / up,并要求 Rust 侧不要依赖"按住"状态。
     callback drag-start();
     callback drag-move();
     callback drag-end();
+    // 生图界面:发消息 / 切会话 / 新建会话
+    callback send-message(string);
+    callback select-conversation(int);
+    callback new-conversation();
+    // 壁纸库:点了某一张 / 切进库页时想要一份最新的列表
+    callback open-wallpaper(int);
+    callback refresh-library();
 
     title: "MC 壁纸 · 控制面板";
     // 任务栏 / Alt-Tab 的窗口图标。`@image-url` 走的还是 build.rs 的 EmbedFiles,所以图标
     // 也是编进 exe 的;exe 文件本身的那枚图标另说(那要 rc.exe 写资源,本轮没做)。
-    // 图标由 tools/make-icon.py 画,改配色重跑那个脚本即可。
     icon: @image-url("../assets/mcwp-icon-256.png");
-    width: 940px;
-    height: 648px;
+    width: 1024px;
+    height: 672px;
     no-frame: true;
     background: ambient-c;
     default-font-family: "MCWP Sans";
@@ -376,6 +587,14 @@ export component Panel inherits Window {
     changed param-c => { root.values-changed(); }
     changed brightness => { root.values-changed(); }
     changed motion => { root.values-changed(); }
+
+    // 发消息:空输入不发(免得刷出一堆空气泡)
+    function submit() {
+        if (root.draft != "") {
+            root.send-message(root.draft);
+            root.draft = "";
+        }
+    }
 
     // ——————————————————————————————
     // 内容层:环境底。代替真实的背景模糊 —— 我们自己画一层柔和的多色渐变,
@@ -444,8 +663,7 @@ export component Panel inherits Window {
             height: 1px;
             background: @linear-gradient(90deg, #00000000 0%, Glass.rim-dark 50%, #00000000 100%);
         }
-        // 5) 左右内缘反光:玻璃边缘把光"折"进来的一道亮边,上亮下无 ——
-        //    真·lensing 要 backdrop-blur 才做得到,这里只借这道边暗示折射
+        // 5) 左右内缘反光:玻璃边缘把光"折"进来的一道亮边,上亮下无
         Rectangle {
             x: 0.5px;
             y: 14px;
@@ -463,7 +681,6 @@ export component Panel inherits Window {
             opacity: 0.55;
         }
     }
-
     // ——————————————————————————————
     // 玻璃上的内容。四周 18px 内边距,离窗口边留出一圈玻璃本色当"边框"
     // ——————————————————————————————
@@ -497,6 +714,8 @@ export component Panel inherits Window {
 
             HorizontalLayout {
                 width: 100%;
+                // 右边给关闭按钮留位,别让文字压到它下面
+                padding-right: 34px;
                 spacing: 8px;
 
                 Rectangle {
@@ -521,7 +740,7 @@ export component Panel inherits Window {
                     vertical-alignment: center;
                 }
                 Text {
-                    text: "液态玻璃预览";
+                    text: "生图";
                     color: Glass.label-3;
                     font-size: 12px;
                     vertical-alignment: center;
@@ -530,7 +749,7 @@ export component Panel inherits Window {
                 Rectangle { horizontal-stretch: 1; }
             }
 
-            // 关闭按钮:玻璃圆钮 + 两道旋转 45° 的细线(不依赖字体里有没有叉号字形)
+            // 关闭按钮:玻璃圆钮 + 一个 ×(不依赖系统字形,子集里带了这颗)
             Rectangle {
                 width: 26px;
                 height: 26px;
@@ -543,16 +762,14 @@ export component Panel inherits Window {
                 animate background { duration: 140ms; }
                 animate border-color { duration: 140ms; }
 
-                Rectangle {
+                Text {
+                    text: "×";
+                    color: Glass.label-2;
+                    font-size: 17px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
                     width: 100%;
                     height: 100%;
-                    Text {
-                        text: "×";
-                        color: Glass.label-2;
-                        font-size: 17px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
                 }
 
                 close-touch := TouchArea {
@@ -562,206 +779,415 @@ export component Panel inherits Window {
             }
         }
 
-        // —— 页签 ——
-        // 切页用 if 而不是 visible:Slint 把 visible=false 降级成一个 Clip 包裹元素,
-        // 元素照样占布局空间(试过,页面会缩在底部)。if 才是"根本没构造"。
-        SegTabs {
-            items: ["壁纸", "库", "设置"];
-            current: root.page;
-            accent: root.accent;
-            picked(index) => { root.page = index; }
-        }
+        // —— 主体:左栏历史对话 / 右栏会话 —— 
+        HorizontalLayout {
+            vertical-stretch: 1;
+            spacing: 14px;
 
-        // —— 当前壁纸(薄填充,不是玻璃)—— 
-        if root.page == 0 : Rectangle {
-            height: 66px;
-            border-radius: Glass.r-card;
-            background: Glass.fill;
+            // ============ 左栏:历史对话 ============
+            VerticalLayout {
+                width: 244px;
+                spacing: 8px;
 
-            HorizontalLayout {
-                padding-left: 16px;
-                padding-right: 16px;
-                spacing: 18px;
-                alignment: center;
-
-                VerticalLayout {
-                    alignment: center;
-                    spacing: 2px;
-                    Text { text: "当前壁纸"; color: Glass.label-3; font-size: 11px; }
-                    Text {
-                        text: root.wallpaper-title;
-                        color: Glass.label;
-                        font-size: 17px;
-                        font-weight: 600;
+                Pill {
+                    text: "+ 新建对话";
+                    primary: true;
+                    accent: root.accent;
+                    width: 244px;
+                    clicked => {
+                        root.view = 0;
+                        root.new-conversation();
                     }
                 }
 
-                Rectangle { width: 1px; height: 30px; background: Glass.hairline-dim; }
-
-                VerticalLayout {
-                    alignment: center;
-                    spacing: 2px;
-                    Text { text: "关键词"; color: Glass.label-3; font-size: 11px; }
-                    Text { text: root.wallpaper-hint; color: Glass.label-2; font-size: 13px; }
-                }
-
-                VerticalLayout {
-                    alignment: center;
-                    spacing: 2px;
-                    Text { text: "指纹"; color: Glass.label-3; font-size: 11px; }
-                    Text { text: root.fingerprint; color: Glass.label-2; font-size: 13px; }
-                }
-
-                Rectangle { horizontal-stretch: 1; }
-            }
-        }
-
-        // —— 主体:左预设 / 右参数 —— 
-        if root.page == 0 : HorizontalLayout {
-            spacing: 14px;
-            vertical-stretch: 1;
-
-            VerticalLayout {
-                width: 336px;
-                spacing: 8px;
-
                 Text {
-                    text: "场景预设";
+                    text: "历史对话";
                     color: Glass.label-3;
                     font-size: 11px;
                     font-weight: 600;
                     letter-spacing: 0.5px;
                 }
 
-                for preset[i] in root.presets : PresetRow {
-                    selected: i == root.current-preset;
-                    heading: preset.title;
-                    sub: preset.summary;
-                    accent: root.accent;
+                flick-conv := Flickable {
+                    vertical-stretch: 1;
+                    viewport-width: self.width;
+                    // 条目定高(50px)+ 6px 间距,内容高度直接算:比问布局要稳
+                    viewport-height: max(self.height, root.conversations.length * 56px - 6px);
 
-                    picked => {
-                        root.current-preset = i;
-                        root.label-a = preset.label-a;
-                        root.label-b = preset.label-b;
-                        root.label-c = preset.label-c;
-                        root.param-a = preset.value-a;
-                        root.param-b = preset.value-b;
-                        root.param-c = preset.value-c;
-                        root.motion = preset.motion;
-                        root.preset-summary = preset.summary;
-                        root.select-preset(i);
+                    conv-list := VerticalLayout {
+                        width: flick-conv.viewport-width;
+                        spacing: 6px;
+                        alignment: start;
+
+                        for conv[i] in root.conversations : ConversationRow {
+                            heading: conv.heading;
+                            sub: conv.sub;
+                            selected: i == root.current-conversation && root.view == 0;
+                            accent: root.accent;
+
+                            picked => {
+                                root.view = 0;
+                                root.current-conversation = i;
+                                root.select-conversation(i);
+                            }
+                        }
                     }
                 }
 
-                Rectangle { vertical-stretch: 1; }
+                // 底部三个入口:再点一次当前项就回到会话
+                NavRow {
+                    text: "壁纸参数";
+                    active: root.view == 1;
+                    accent: root.accent;
+                    picked => { root.view = root.view == 1 ? 0 : 1; }
+                }
+                NavRow {
+                    text: "壁纸库";
+                    active: root.view == 2;
+                    accent: root.accent;
+                    picked => {
+                        root.view = root.view == 2 ? 0 : 2;
+                        // 切进库页时问一次:库目录被外面改过(手工删、拷别人的壁纸进来)也能跟上
+                        if (root.view == 2) { root.refresh-library(); }
+                    }
+                }
+                NavRow {
+                    text: "设置";
+                    active: root.view == 3;
+                    accent: root.accent;
+                    picked => { root.view = root.view == 3 ? 0 : 3; }
+                }
             }
-
-            Rectangle {
+            // ============ 右栏:会话 / 参数 / 库 / 设置 ============
+            VerticalLayout {
                 horizontal-stretch: 1;
-                border-radius: Glass.r-card;
-                background: Glass.fill;
+                spacing: 10px;
 
-                VerticalLayout {
-                    padding: 14px;
-                    spacing: 2px;
+                // 头部:会话标题(或当前视图名)
+                HorizontalLayout {
+                    height: 26px;
+                    spacing: 10px;
+                    // 不写 alignment:否则标题会跑到中间,靠右的信息也没法贴边
 
                     Text {
-                        text: "场景参数";
-                        color: Glass.label-3;
-                        font-size: 11px;
-                        font-weight: 600;
-                        letter-spacing: 0.5px;
+                        text: root.view == 0
+                            ? root.session-title
+                            : (root.view == 1 ? "壁纸参数" : (root.view == 2 ? "壁纸库" : "设置"));
+                        color: Glass.label;
+                        font-size: 17px;
+                        vertical-alignment: center;
                     }
 
-                    GlassSlider { label: root.label-a; minimum: 0; maximum: 1; accent: root.accent; value <=> root.param-a; }
-                    GlassSlider { label: root.label-b; minimum: 0; maximum: 1; accent: root.accent; value <=> root.param-b; }
-                    GlassSlider { label: root.label-c; minimum: 0; maximum: 1; accent: root.accent; value <=> root.param-c; }
+                    Rectangle { horizontal-stretch: 1; }
 
-                    Rectangle { height: 1px; background: Glass.hairline-dim; }
-
-                    GlassSlider { label: "桌面亮度"; minimum: 0.2; maximum: 1.6; accent: root.accent; value <=> root.brightness; }
-                    GlassSlider { label: "动势"; minimum: 0; maximum: 1; accent: root.accent; value <=> root.motion; }
+                    if root.view == 0 : Text {
+                        text: "当前壁纸 · " + root.wallpaper-title;
+                        color: Glass.label-3;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        max-width: 280px;
+                    }
+                    if root.view == 1 : Text {
+                        text: "指纹 " + root.fingerprint;
+                        color: Glass.label-3;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
                 }
-            }
-        }
 
-        // —— 页签 2:壁纸库(占位,先定信息架构)—— 
-        if root.page == 1 : Rectangle {
-            vertical-stretch: 1;
-            border-radius: Glass.r-card;
-            background: Glass.fill;
+                // —— 视图 0:会话 —— 
+                if root.view == 0 : VerticalLayout {
+                    vertical-stretch: 1;
+                    spacing: 10px;
 
-            VerticalLayout {
-                alignment: center;
-                spacing: 6px;
+                    // 空态:还没有消息
+                    if root.messages.length == 0 : Rectangle {
+                        vertical-stretch: 1;
+                        border-radius: Glass.r-card;
+                        background: Glass.fill;
 
-                Text {
-                    text: "壁纸库";
-                    color: Glass.label;
-                    font-size: 22px;
-                    font-weight: 600;
-                    horizontal-alignment: center;
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 6px;
+
+                            Text {
+                                text: "还没有开始";
+                                color: Glass.label;
+                                font-size: 16px;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                            }
+                            Text {
+                                text: "说一句想要的样子,比如「雨夜城市,再冷一点」";
+                                color: Glass.label-3;
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                            }
+                        }
+                    }
+
+                    // 消息流
+                    if root.messages.length > 0 : flick-msg := Flickable {
+                        vertical-stretch: 1;
+                        viewport-width: self.width;
+                        viewport-height: msg-list.preferred-height;
+
+                        // 新消息到达 / 切了会话:钉到底部(viewport-y 是滚动偏移,0 = 顶部)。
+                        // `changed` 的语法只认本元素作用域里的属性名(写不了 `root.xxx`),
+                        // 所以先把 root 的两个信号引成本地属性,再监听它们。
+                        private property <int> revision: root.message-revision;
+                        private property <int> conversation: root.current-conversation;
+                        changed revision => {
+                            self.viewport-y = max(0px, self.viewport-height - self.height);
+                        }
+                        changed conversation => {
+                            self.viewport-y = max(0px, self.viewport-height - self.height);
+                        }
+
+                        msg-list := VerticalLayout {
+                            width: flick-msg.viewport-width;
+                            spacing: 10px;
+                            alignment: start;
+
+                            for msg[i] in root.messages : MessageRow {
+                                body: msg.text;
+                                mine: msg.mine;
+                                accent: root.accent;
+                            }
+                        }
+                    }
                 }
+
+                // —— 视图 1:壁纸参数(原来「壁纸」页的内容,原样搬过来)—— 
+                if root.view == 1 : HorizontalLayout {
+                    vertical-stretch: 1;
+                    spacing: 14px;
+
+                    VerticalLayout {
+                        width: 300px;
+                        spacing: 8px;
+
+                        Text {
+                            text: "场景预设";
+                            color: Glass.label-3;
+                            font-size: 11px;
+                            font-weight: 600;
+                            letter-spacing: 0.5px;
+                        }
+
+                        for preset[i] in root.presets : PresetRow {
+                            selected: i == root.current-preset;
+                            heading: preset.title;
+                            sub: preset.summary;
+                            accent: root.accent;
+
+                            picked => {
+                                root.current-preset = i;
+                                root.label-a = preset.label-a;
+                                root.label-b = preset.label-b;
+                                root.label-c = preset.label-c;
+                                root.param-a = preset.value-a;
+                                root.param-b = preset.value-b;
+                                root.param-c = preset.value-c;
+                                root.motion = preset.motion;
+                                root.preset-summary = preset.summary;
+                                root.select-preset(i);
+                            }
+                        }
+
+                        Rectangle { vertical-stretch: 1; }
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        border-radius: Glass.r-card;
+                        background: Glass.fill;
+
+                        VerticalLayout {
+                            padding: 14px;
+                            spacing: 2px;
+
+                            Text {
+                                text: "场景参数";
+                                color: Glass.label-3;
+                                font-size: 11px;
+                                font-weight: 600;
+                                letter-spacing: 0.5px;
+                            }
+
+                            GlassSlider { label: root.label-a; minimum: 0; maximum: 1; accent: root.accent; value <=> root.param-a; }
+                            GlassSlider { label: root.label-b; minimum: 0; maximum: 1; accent: root.accent; value <=> root.param-b; }
+                            GlassSlider { label: root.label-c; minimum: 0; maximum: 1; accent: root.accent; value <=> root.param-c; }
+
+                            Rectangle { height: 1px; background: Glass.hairline-dim; }
+
+                            GlassSlider { label: "桌面亮度"; minimum: 0.2; maximum: 1.6; accent: root.accent; value <=> root.brightness; }
+                            GlassSlider { label: "动势"; minimum: 0; maximum: 1; accent: root.accent; value <=> root.motion; }
+                        }
+                    }
+                }
+
+                // —— 视图 2:壁纸库(列表由壁纸侧扫库目录灌进来,点一张就切过去)—— 
+                if root.view == 2 : Rectangle {
+                    vertical-stretch: 1;
+                    border-radius: Glass.r-card;
+                    background: Glass.fill;
+
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 10px;
+
+                        Text {
+                            text: "库里存着的每一张都在这里,点一张就切过去";
+                            color: Glass.label-3;
+                            font-size: 11px;
+                        }
+
+                        // 空态:一次都没存过时,教怎么存第一张
+                        if root.library.length == 0 : Rectangle {
+                            vertical-stretch: 1;
+
+                            Text {
+                                text: "库还是空的 —— 到「壁纸参数」里调好,点一下「存为壁纸」,这里就会多出一张。";
+                                color: Glass.label-3;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        if root.library.length > 0 : Flickable {
+                            vertical-stretch: 1;
+                            viewport-width: self.width;
+                            // 条目定高(54px)+ 10px 间距,内容高度直接算:比问布局要稳
+                            viewport-height: max(self.height, root.library.length * 64px - 10px);
+
+                            VerticalLayout {
+                                width: parent.width;
+                                spacing: 10px;
+                                alignment: start;
+
+                                for item[i] in root.library : LibraryRow {
+                                    heading: item.title;
+                                    sub: item.hint;
+                                    meta: item.id;
+                                    accent: item.accent;
+                                    selected: item.id == root.library-current;
+
+                                    picked => { root.open-wallpaper(i); }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // —— 视图 3:设置(占位)—— 
+                if root.view == 3 : Rectangle {
+                    vertical-stretch: 1;
+                    border-radius: Glass.r-card;
+                    background: Glass.fill;
+
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 6px;
+
+                        Text {
+                            text: "设置";
+                            color: Glass.label;
+                            font-size: 22px;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                        }
+                        Text {
+                            text: "模型密钥 / 开机自启 / 省电策略 · 待接入";
+                            color: Glass.label-3;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+
+                // —— 状态行(一次性的反馈都放这儿)—— 
                 Text {
-                    text: "缩略图网格 / 搜索 / 一键切换 · 待接入";
+                    text: root.status;
                     color: Glass.label-3;
-                    font-size: 12px;
-                    horizontal-alignment: center;
+                    font-size: 11px;
+                    height: 14px;
+                    vertical-alignment: center;
+                    overflow: elide;
                 }
-            }
-        }
 
-        // —— 页签 3:设置(占位)—— 
-        if root.page == 2 : Rectangle {
-            vertical-stretch: 1;
-            border-radius: Glass.r-card;
-            background: Glass.fill;
+                // —— 底栏:会话是输入框,参数是操作按钮 —— 
+                if root.view == 0 : Rectangle {
+                    height: 46px;
+                    border-radius: self.height / 2;
+                    // 实色凹槽 + 发丝线,和滑杆轨道同一套语言
+                    background: #0000003D;
+                    border-width: 1px;
+                    border-color: input.has-focus ? root.accent.with-alpha(0.65) : Glass.hairline-dim;
+                    animate border-color { duration: 140ms; easing: ease-out; }
 
-            VerticalLayout {
-                alignment: center;
-                spacing: 6px;
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 6px;
+                        spacing: 8px;
+                        // 不写 alignment:写了输入框会塌成文字那么宽并居中
 
-                Text {
-                    text: "设置";
-                    color: Glass.label;
-                    font-size: 22px;
-                    font-weight: 600;
-                    horizontal-alignment: center;
+                        input := TextInput {
+                            horizontal-stretch: 1;
+                            font-size: 13px;
+                            color: Glass.label;
+                            vertical-alignment: center;
+                            text <=> root.draft;
+                            accepted => { root.submit(); }
+                        }
+
+                        // 发送胶囊竖直居中(横向布局里它会贴着上沿,见文件顶部的布局说明)
+                        VerticalLayout {
+                            alignment: center;
+
+                            Pill {
+                                text: "发送";
+                                primary: true;
+                                accent: root.accent;
+                                width: 76px;
+                                clicked => { root.submit(); }
+                            }
+                        }
+                    }
+
+                    // 占位文案:TextInput 没有 placeholder 属性,拿一条绝对定位的 Text 盖上
+                    Text {
+                        x: 15px;
+                        y: (parent.height - self.height) / 2;
+                        text: "说一句想看到的样子…";
+                        color: Glass.label-3;
+                        font-size: 13px;
+                        visible: root.draft == "";
+                    }
                 }
-                Text {
-                    text: "开机自启 / 托盘开关 / 省电策略 · 待接入";
-                    color: Glass.label-3;
-                    font-size: 12px;
-                    horizontal-alignment: center;
+
+                if root.view == 1 : HorizontalLayout {
+                    height: 34px;
+                    spacing: 10px;
+                    // 不写 alignment:两个按钮贴左边,说明文字贴右边
+
+                    Pill { text: "存为壁纸"; primary: true; accent: root.accent; clicked => { root.save-requested(); } }
+                    Pill { text: "恢复默认"; accent: root.accent; clicked => { root.reset-requested(); } }
+
+                    Rectangle { horizontal-stretch: 1; }
+
+                    Text {
+                        text: root.preset-summary;
+                        color: Glass.label-3;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        max-width: 320px;
+                    }
                 }
-            }
-        }
-
-        // —— 底部 —— 
-        HorizontalLayout {
-            height: 34px;
-            spacing: 10px;
-            alignment: center;
-
-            if root.page == 0 : Pill { text: "存为壁纸"; primary: true; accent: root.accent; clicked => { root.save-requested(); } }
-            if root.page == 0 : Pill { text: "恢复默认"; accent: root.accent; clicked => { root.reset-requested(); } }
-
-            Text {
-                text: root.status;
-                color: Glass.label-2;
-                font-size: 12px;
-                vertical-alignment: center;
-            }
-
-            Rectangle { horizontal-stretch: 1; }
-
-            if root.page == 0 : Text {
-                text: root.preset-summary;
-                color: Glass.label-3;
-                font-size: 11px;
-                vertical-alignment: center;
-                overflow: elide;
-                max-width: 320px;
             }
         }
     }
