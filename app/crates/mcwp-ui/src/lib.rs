@@ -94,6 +94,10 @@ pub enum UiEvent {
         api_key: String,
         thinking: ThinkingChoice,
     },
+    /// 对话进行中点「暂停」:这一轮的请求作废(结果回来会被丢掉)。
+    PauseRun,
+    /// 点「继续」:把暂停那一轮原样再跑一遍。
+    ResumeRun,
     /// 点了壁纸库里的第 `index` 张(`PanelState::library` 的下标)
     OpenWallpaper(usize),
     /// 「存为壁纸」
@@ -191,6 +195,32 @@ impl ThinkingChoice {
             None => Self::Unset,
             Some(true) => Self::Enabled,
             Some(false) => Self::Disabled,
+        }
+    }
+}
+
+/// 这一轮对话跑到哪儿了 —— 面板靠它决定右下角那颗钮长什么样。
+///
+/// 状态归壁纸侧(Rust)所有:请求是在那边发出去的,只有它知道"结果还没回来"。面板只是投影,
+/// 所以走 `PanelHandle::set_run_state()` 单独灌,不进 `SessionState`(理由同 `AiConfigState`:
+/// 会话整块回填会因为换壁纸、切会话随时发生,而这里最需要的是"准,但不跟着乱刷")。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunState {
+    /// 闲着:可以发新消息
+    Idle,
+    /// 正在跑:发送键变成暂停圆钮
+    Running,
+    /// 已暂停:输入框空着时是「继续」,一旦打字就变回「发送」
+    Paused,
+}
+
+impl RunState {
+    /// 面板那边收的是整数:0 / 1 / 2。
+    fn index(self) -> i32 {
+        match self {
+            Self::Idle => 0,
+            Self::Running => 1,
+            Self::Paused => 2,
         }
     }
 }
@@ -338,6 +368,19 @@ impl PanelHandle {
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(panel) = weak.upgrade() {
                 apply_ai(&panel, &ai);
+            }
+        });
+    }
+
+    /// 告诉面板"这一轮对话跑到哪儿了":换了就灌一次。
+    ///
+    /// 只在**起跑 / 暂停 / 落地**这三个时刻调 —— 那颗钮的样子完全由它决定,漏一次就会停在
+    /// 错的形态上(比如跑完了还显示暂停键)。
+    pub fn set_run_state(&self, state: RunState) {
+        let weak = self.weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(panel) = weak.upgrade() {
+                panel.set_run_state(state.index());
             }
         });
     }
@@ -523,6 +566,18 @@ fn build(state: &PanelState, events: Sender<UiEvent>) -> Result<Panel> {
                 api_key: api_key.to_string(),
                 thinking: ThinkingChoice::from_index(thinking),
             });
+        });
+    }
+
+    {
+        // 暂停 / 继续:面板只转发一下,作废哪一轮、重新发什么是壁纸侧的事。
+        let tx = events.clone();
+        ui.on_pause_run(move || {
+            let _ = tx.send(UiEvent::PauseRun);
+        });
+        let tx = events.clone();
+        ui.on_resume_run(move || {
+            let _ = tx.send(UiEvent::ResumeRun);
         });
     }
 

@@ -165,6 +165,43 @@ component Pill inherits Rectangle {
     }
 }
 
+// 对话进行中那颗「停止生成」圆钮:实心圆 + 一个方块。
+//
+// **符号是自己画的,不走字体** —— 内嵌子集字体缺字是静默的(见 11.9),图标一旦缺字形就是整块
+// 空白,比少个汉字还难看。
+//
+// 深色面板上"实心黑圆"会糊进背景里:所以反过来 —— 浅色圆 + 深色方块(参考图的暗色版)。
+//
+// **这里画不了三角**(本来想用三角表示「继续」):Slint 的 `Path` 在软件渲染器里是个 TODO
+// (`i-slint-core/src/software_renderer.rs` 的 `draw_path` 是空实现),写了也是静默不画 ——
+// 实测踩过。"继续"因此用胶囊文字(Pill),反正那颗钮的文字本来就是中文。
+component RunButton inherits Rectangle {
+    in property <color> ink: #12141C;
+
+    callback clicked();
+
+    width: 36px;
+    height: 36px;
+    border-radius: 18px;
+    background: touch.has-hover ? #FFFFFF : Glass.label;
+    animate background { duration: 140ms; easing: ease-out; }
+
+    // 圆角方块
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 12px;
+        height: 12px;
+        border-radius: 2px;
+        background: root.ink;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
 // iOS 风格滑杆:粗胶囊轨道 + 白色圆钮。
 component GlassSlider inherits VerticalLayout {
     in property <string> label: "";
@@ -756,11 +793,14 @@ component MessageRow inherits HorizontalLayout {
     in property <bool> mine: false;
     in property <color> accent: #0A84FF;
 
-    // 靠边:用户消息靠右、回复靠左(伸缩项吃掉剩余空间),两侧各留 6px 给圆角喘口气
+    // 靠边:用户消息靠右、回复靠左,两侧各留 6px 给圆角喘口气。
+    //
+    // **两处都靠"往另一边垫一个伸缩项"实现,所以那个伸缩项的先后位置就是左右的分界线** ——
+    // 用户的垫在气泡前面,回复的垫在后面。原来两条都写在气泡前面,结果回复也贴着右边缘
+    // (和用户消息糊成一列,看不出谁说的),实测踩过。
     padding-left: 6px;
     padding-right: 6px;
     if mine : Rectangle { horizontal-stretch: 1; }
-    if !mine : Rectangle { horizontal-stretch: 1; }
 
     bubble := Rectangle {
         // 贴着内容大小,不被行高拉伸
@@ -784,6 +824,8 @@ component MessageRow inherits HorizontalLayout {
             }
         }
     }
+
+    if !mine : Rectangle { horizontal-stretch: 1; }
 }
 
 // 设置页里的一行:左边固定宽的标签 + 右边一个输入框。三行(接口地址 / 模型名 / Key)共用它,
@@ -912,6 +954,9 @@ export component Panel inherits Window {
     in property <int> message-revision: 0;
     // 输入框里还没发出去的字。纯界面状态,和输入框双向绑定。
     in-out property <string> draft: "";
+    // 这一轮对话跑到哪儿了:0 = 闲着 / 1 = 正在跑(发送键变成暂停圆钮)/ 2 = 已暂停。
+    // 由 Rust 在起跑、暂停、落地这三个时刻灌进来 —— 它不属于会话数据,面板自己算不出来。
+    in property <int> run-state: 0;
 
     // —— 设置页:模型配置(接生图那一环)——
     // 这四个是 in-out,但**不放进 PanelState**:它们平时是用户在编辑,而 `refresh()`
@@ -994,6 +1039,9 @@ export component Panel inherits Window {
     callback send-message(string);
     callback select-conversation(int);
     callback new-conversation();
+    // 对话进行中的暂停 / 继续
+    callback pause-run();
+    callback resume-run();
     // 左栏会话的右键菜单:改名 / 删除 / 置顶 / 标为未读
     callback rename-conversation(int, string);
     callback delete-conversation(int);
@@ -1081,6 +1129,7 @@ export component Panel inherits Window {
         background: @radial-gradient(circle, accent 0%, #00000000 66%);
         opacity: 0.28;
     }
+
 
     // ——————————————————————————————
     // 功能层:一整块玻璃,铺满窗口(圆角和窗口对齐)。内部只用薄填充(不再叠玻璃)。
@@ -1434,16 +1483,56 @@ export component Panel inherits Window {
                         viewport-width: self.width;
                         viewport-height: msg-list.preferred-height;
 
-                        // 新消息到达 / 切了会话:钉到底部(viewport-y 是滚动偏移,0 = 顶部)。
-                        // `changed` 的语法只认本元素作用域里的属性名(写不了 `root.xxx`),
-                        // 所以先把 root 的两个信号引成本地属性,再监听它们。
+                        // —— 钉到底部:面板刚打开 / 新消息到 / 切了会话 ——
+                        //
+                        // `viewport-y` 是**滚动偏移,往下滚是负值**:内容比视口高时,"到底"的位置是
+                        // `height - viewport-height`。写成正数会被 Flickable 自己夹回 0(它的合法区间
+                        // 就是 `[height - viewport-height, 0]`,见 i-slint-core 的 `ensure_in_bound`),
+                        // 表现就是"永远停在顶部,最新那条得手动滚" —— 实测踩过。
+                        //
+                        // 也不能只写一次:消息数组变的那一刻布局还没重算,这时候读 `viewport-height`
+                        // (它绑着 `msg-list.preferred-height`)拿到的是旧值,算出来的偏移量就差一条。
+                        // 而"内容高度一变就去写 viewport-y"这条更直接的路走不通 —— 那个通知正好从
+                        // 布局求值中间发出来,在它里面改滚动位置会 panic(`Recursion detected`),
+                        // 绕一层本地属性也一样;`init` 里直接读/写这两个属性同样踩"正在求值的属性",
+                        // 一样 panic。
+                        //
+                        // 所以:`changed` 里先按当前(可能是旧的)高度钉一次,再让一个短命定时器在
+                        // **后面几帧**里反复重钉 —— 每次重新读一遍高度,总有一次读到的是布局重算之后
+                        // 的值。停的条件**只能是次数**,不能是"钉到位了没":那个判断同样会读到旧值,
+                        // 于是第一次就以为自己已经到底、提前把自己停掉(实测就是这么停的)。
+                        // 8 次 ≈ 0.13 s:够跨过布局,又短到来不及和用户手动滚动的动作打架。
+                        //
+                        // `changed` 的语法只认本元素作用域里的属性名(写不了 `root.xxx`),所以先把
+                        // root 的两个信号引成本地属性,再监听它们。
                         private property <int> revision: root.message-revision;
                         private property <int> conversation: root.current-conversation;
+                        private property <int> tries: 0;
+                        // `init` 里**只**能启动定时器:这时候 Flickable 自己的几何还没算完,读
+                        // `viewport-height` / `height` 会踩到"正在求值的属性"上,当场 panic
+                        // (`Recursion detected`)—— 实测踩过。所以钉的那一下留给定时器的第一帧。
+                        init => { self.start-pin(); }
                         changed revision => {
-                            self.viewport-y = max(0px, self.viewport-height - self.height);
+                            self.viewport-y = min(0px, self.height - self.viewport-height);
+                            self.start-pin();
                         }
                         changed conversation => {
-                            self.viewport-y = max(0px, self.viewport-height - self.height);
+                            self.viewport-y = min(0px, self.height - self.viewport-height);
+                            self.start-pin();
+                        }
+
+                        function start-pin() {
+                            self.tries = 0;
+                            pin.running = true;
+                        }
+                        pin := Timer {
+                            interval: 16ms;
+                            running: false;
+                            triggered => {
+                                flick-msg.viewport-y = min(0px, flick-msg.height - flick-msg.viewport-height);
+                                flick-msg.tries += 1;
+                                self.running = flick-msg.tries < 8;
+                            }
                         }
 
                         msg-list := VerticalLayout {
@@ -1709,16 +1798,45 @@ export component Panel inherits Window {
                             accepted => { root.submit(); }
                         }
 
-                        // 发送胶囊竖直居中(横向布局里它会贴着上沿,见文件顶部的布局说明)
+                        // 发送 / 暂停 / 继续三态共用**同一个 76px 宽的格子**:宽度写死,切状态时
+                        // 输入框不会跟着抖一下。三颗钮竖直居中(横向布局里它们会贴着上沿,见文件
+                        // 顶部的布局说明)。
                         VerticalLayout {
                             alignment: center;
 
-                            Pill {
-                                text: "发送";
-                                primary: true;
-                                accent: root.accent;
+                            HorizontalLayout {
                                 width: 76px;
-                                clicked => { root.submit(); }
+
+                                if root.run-state == 1 : HorizontalLayout {
+                                    alignment: end;
+                                    RunButton {
+                                        clicked => { root.pause-run(); }
+                                    }
+                                }
+
+                                // 暂停之后:输入框空着就是「继续」(接着跑刚才那句),一旦开始
+                                // 打字就变回「发送」—— 用户敲了新东西,意思就是这一句别管了,跑新的。
+                                if root.run-state == 2 && root.draft == "" : HorizontalLayout {
+                                    alignment: end;
+                                    Pill {
+                                        text: "继续";
+                                        primary: true;
+                                        accent: root.accent;
+                                        width: 76px;
+                                        clicked => { root.resume-run(); }
+                                    }
+                                }
+
+                                if root.run-state == 0 || (root.run-state == 2 && root.draft != "") : HorizontalLayout {
+                                    alignment: end;
+                                    Pill {
+                                        text: "发送";
+                                        primary: true;
+                                        accent: root.accent;
+                                        width: 76px;
+                                        clicked => { root.submit(); }
+                                    }
+                                }
                             }
                         }
                     }

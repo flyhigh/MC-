@@ -66,34 +66,90 @@ API Key 就能用了 —— 智谱 GLM-4-Flash 免费,去 bigmodel.cn 注册后�
 struct AiOutcome {
     /// 这句话属于哪个会话(回复回来时用户可能已经切走了)
     session: u64,
+    /// 第几轮。暂停过、或者用户又发了新的一句之后,旧请求的结果会晚一步回来 —— 认轮次丢弃。
+    run: u64,
     draft: mcwp_ai::Draft,
 }
 
-/// 把一句话交给模型:记进会话 → 起后台线程 → 结果回到主循环落地。返回该显示的状态行文案。
-fn ask_model(
+/// 一次「交给模型」的完整任务:跑哪句话 + 属于哪个会话。
+///
+/// 之所以要留成一份可重复使用的记录:HTTP 请求**没法从半路续上**,所以「继续」只能是"把同一份
+/// 任务重跑一遍";而这些字段缺一个都重跑不了 —— 会话 id 决定回复往哪儿放,原话就是请求本身。
+#[derive(Debug, Clone)]
+struct Mission {
+    /// 归属会话(回复回来时用户可能已经切走、甚至把这条删了)
+    session: u64,
+    /// 用户那句话
+    text: String,
+}
+
+/// 当前这一轮的处境。面板右下角那颗钮的样子就是它的投影。
+#[derive(Debug)]
+enum Run {
+    /// 已经发出去、结果还没回来的那一轮。`id` 用来认结果:对不上的结果一律丢弃。
+    Running { id: u64, mission: Mission },
+    /// 被暂停的那一轮:请求已经放弃(结果回来会被丢掉),但用户点「继续」时还要原地重跑。
+    Paused(Mission),
+}
+
+/// 当前这一轮该显示成什么。
+fn run_state(run: Option<&Run>) -> mcwp_ui::RunState {
+    match run {
+        None => mcwp_ui::RunState::Idle,
+        Some(Run::Running { .. }) => mcwp_ui::RunState::Running,
+        Some(Run::Paused(_)) => mcwp_ui::RunState::Paused,
+    }
+}
+
+/// 新消息:先记进会话,再跑。
+fn start_run(
     text: &str,
     sessions: &mut Sessions,
     ai: &Option<mcwp_ai::Client>,
     spec: &WallpaperSpec,
     tx: &Sender<AiOutcome>,
-) -> &'static str {
-    let session = sessions.send(text);
+    id: u64,
+) -> (&'static str, Option<Mission>) {
+    let mission = Mission {
+        session: sessions.send(text),
+        text: text.to_string(),
+    };
+    run_mission(mission, sessions, ai, spec, tx, id)
+}
+
+/// 把一份任务丢给后台线程(新消息和「继续」走的都是这一条路)。
+///
+/// 没配模型时当场把提示写进会话、返回 `None` —— 那种情况没有"在跑"这一轮,面板的钮也就不该
+/// 变成暂停键。**绝不在这里同步等模型**(见 `AiOutcome` 的说明)。
+fn run_mission(
+    mission: Mission,
+    sessions: &mut Sessions,
+    ai: &Option<mcwp_ai::Client>,
+    spec: &WallpaperSpec,
+    tx: &Sender<AiOutcome>,
+    id: u64,
+) -> (&'static str, Option<Mission>) {
     let Some(client) = ai else {
         // 没配模型也得有回音:不然用户发完消息看着空荡荡的右栏,只会以为程序坏了
-        sessions.reply(session, NO_MODEL_REPLY);
-        return "没配模型 · 去左下角「设置」里填一个 API Key";
+        sessions.reply(mission.session, NO_MODEL_REPLY);
+        return ("没配模型 · 去左下角「设置」里填一个 API Key", None);
     };
     let client = client.clone();
-    let request = text.to_string();
+    let request = mission.text.clone();
+    let session = mission.session;
     // 把当前壁纸一起带上:模型要靠它做"只改一点"这类改动
     let current = spec.clone();
     let tx = tx.clone();
     std::thread::spawn(move || {
         let draft = client.draft(&request, &current);
         // 主线程收摊了(托盘退出)就随它去,没人接的结果没有意义
-        let _ = tx.send(AiOutcome { session, draft });
+        let _ = tx.send(AiOutcome {
+            session,
+            run: id,
+            draft,
+        });
     });
-    "正在生成壁纸…"
+    ("正在生成壁纸…", Some(mission))
 }
 
 /// 设置页要显示的模型配置:盘上那份(空字段已经用内置默认补上)+ 有没有环境变量在盖它。
@@ -749,6 +805,10 @@ fn main() -> Result<()> {
     };
     // 请求跑在后台线程,结果从这里回到主循环
     let (ai_tx, ai_rx) = std::sync::mpsc::channel::<AiOutcome>();
+    // 当前这一轮(在跑 / 被暂停 / 没有)。`run_id` 只增不减:每起一轮换一个,结果回来时拿它对
+    // 暗号 —— 暂停之后、或者又发了新的一句之后,旧请求的结果会晚一步回来,对不上就丢掉。
+    let mut run: Option<Run> = None;
+    let mut run_id: u64 = 0;
 
     // —— 控制面板 ——
     // 面板跑在自己的线程和自己的 Slint 事件循环里;这里只保留一个事件队列,
@@ -770,14 +830,20 @@ fn main() -> Result<()> {
     // 用户正在输入的 key 冲掉(理由见 `mcwp_ui::AiConfigState` 的说明)。
     if let Some(handle) = &panel {
         handle.refresh_ai(ai_config_state());
+        // 面板可能是"跑到一半才打开"的(面板能关掉再开),所以这一份也得灌 —— 不然那颗钮会
+        // 停在「发送」上,而底下其实正跑着一轮。
+        handle.set_run_state(run_state(run.as_ref()));
     }
 
     // `--ai-ask "…"`:开面板之后顺手把这句话发出去。命令行也能生成壁纸,
     // 顺带成了唯一的"整条链路"自检方式 —— 合成的键盘输入会被本机中文输入法吃掉,打字那条路验不了。
     if let Some(text) = args.ai_ask.clone() {
-        let status = ask_model(&text, &mut sessions, &ai, &spec, &ai_tx);
+        run_id += 1;
+        let (status, mission) = start_run(&text, &mut sessions, &ai, &spec, &ai_tx, run_id);
+        run = mission.map(|mission| Run::Running { id: run_id, mission });
         if let Some(handle) = &panel {
             handle.refresh_session(sessions.state());
+            handle.set_run_state(run_state(run.as_ref()));
             handle.set_status(status);
         }
     }
@@ -845,11 +911,59 @@ fn main() -> Result<()> {
                             missing.len()
                         );
                     }
-                    // 记进会话 + 丢给后台线程;结果几秒后从 ai_rx 回来
-                    let status = ask_model(&text, &mut sessions, &ai, &spec, &ai_tx);
+                    // 记进会话 + 丢给后台线程;结果几秒后从 ai_rx 回来。
+                    //
+                    // 正在跑的时候用户又发一句(包括"暂停之后打字再发"):上一轮就地作废 ——
+                    // 换一个 run_id 就够,旧结果回来认不上轮次,自己会被丢掉。用户的原话是
+                    // "发送之后跑下一个",所以这里不是排队,是**取代**。
+                    run_id += 1;
+                    let (status, mission) =
+                        start_run(&text, &mut sessions, &ai, &spec, &ai_tx, run_id);
+                    run = mission.map(|mission| Run::Running { id: run_id, mission });
                     if let Some(handle) = &panel {
                         handle.refresh_session(sessions.state());
+                        handle.set_run_state(run_state(run.as_ref()));
                         handle.set_status(status);
+                    }
+                }
+                // 暂停:把这一轮的请求作废,但**任务本身留着** —— 用户点「继续」要原地重跑它。
+                //
+                // 说实话:HTTP 请求掐不断(ureq 没有取消接口),所以这里是"回来就丢掉"——
+                // 线程照样跑完(几秒),结果带着旧的 run_id 回主循环,认不上就直接扔。
+                // 不这么做的话只能等它跑完才能响应,那"暂停"就成了假的。
+                mcwp_ui::UiEvent::PauseRun => {
+                    if let Some(Run::Running { mission, .. }) = run.take() {
+                        tracing::info!("暂停这一轮(会话 {},那句话留着待续)", mission.session);
+                        run = Some(Run::Paused(mission));
+                        if let Some(handle) = &panel {
+                            handle.set_run_state(mcwp_ui::RunState::Paused);
+                            handle.set_status("已暂停 · 点继续接着跑这一句");
+                        }
+                    }
+                }
+                // 继续:把暂停那一轮原样再跑一遍。
+                //
+                // **不重新往会话里塞用户那句话** —— 它已经在会话里了,再塞一遍就变成两条。
+                // 真正重发的是请求本身(模型那边不知道我们暂停过)。
+                mcwp_ui::UiEvent::ResumeRun => {
+                    if let Some(Run::Paused(mission)) = run.take() {
+                        // 会话可能在暂停期间被删了,那就别再续了
+                        if !sessions.exists(mission.session) {
+                            tracing::info!("暂停那一轮的会话已经被删掉,不再继续");
+                            if let Some(handle) = &panel {
+                                handle.set_run_state(mcwp_ui::RunState::Idle);
+                                handle.set_status("这条会话已经删掉了");
+                            }
+                            continue;
+                        }
+                        run_id += 1;
+                        let (status, mission) =
+                            run_mission(mission, &mut sessions, &ai, &spec, &ai_tx, run_id);
+                        run = mission.map(|mission| Run::Running { id: run_id, mission });
+                        if let Some(handle) = &panel {
+                            handle.set_run_state(run_state(run.as_ref()));
+                            handle.set_status(status);
+                        }
                     }
                 }
                 mcwp_ui::UiEvent::SelectConversation(index) => {
@@ -992,7 +1106,21 @@ fn main() -> Result<()> {
         // —— 模型的结果落地 —— 
         // 只有会话还在才继续:用户可能在等的时候把这条删了,那就别把壁纸也换掉(会显得"删了还生效")。
         while let Ok(outcome) = ai_rx.try_recv() {
-            let AiOutcome { session, draft } = outcome;
+            let AiOutcome {
+                session,
+                run: outcome_run,
+                draft,
+            } = outcome;
+            // 认轮次:暂停过、或者用户又发了新的一句之后,旧请求的结果会晚一步回来 —— 扔掉。
+            if !matches!(&run, Some(Run::Running { id, .. }) if *id == outcome_run) {
+                tracing::info!("丢掉过期的一轮(第 {outcome_run} 轮已经不是当前这一轮)");
+                continue;
+            }
+            // 落地之后就不在跑了 —— 这颗钮必须回到「发送」,漏了它就永远停在暂停键上
+            run = None;
+            if let Some(handle) = &panel {
+                handle.set_run_state(mcwp_ui::RunState::Idle);
+            }
             if !sessions.reply(session, &draft.reply) {
                 continue;
             }

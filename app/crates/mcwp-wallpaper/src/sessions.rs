@@ -267,6 +267,12 @@ impl Sessions {
         true
     }
 
+    /// 这个会话还在吗?「继续」之前问一句 —— 用户完全可能在暂停期间把它删了,
+    /// 那时候接着跑只会把结果丢进空气里。
+    pub fn exists(&self, id: u64) -> bool {
+        self.items.iter().any(|session| session.id == id)
+    }
+
     /// 切到左栏的第 `index` 个会话。切过去就当作读过了。
     pub fn select(&mut self, index: usize) {
         let Some(session) = self.items.get_mut(index) else {
