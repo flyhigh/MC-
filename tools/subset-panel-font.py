@@ -80,6 +80,7 @@ RUST_SOURCES = [
     "crates/mcwp-spec/src/presets.rs",
     "crates/mcwp-spec/src/lib.rs",
     "crates/mcwp-ui/src/lib.rs",
+    "crates/mcwp-ai/src/lib.rs",
     "crates/mcwp-wallpaper/src/main.rs",
 ]
 

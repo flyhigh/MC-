@@ -40,30 +40,34 @@ cargo build --release --workspace
 
 ## 配模型(生图那一环)
 
-任何 **OpenAI 兼容**的服务都能用,换服务商只改一行。写一份 `%APPDATA%\MC壁纸\ai.json`:
+任何一个 **OpenAI 兼容**的服务都能用,换服务商只改一行。在面板左下角 **设置** 里填,点「保存」立刻生效
+(不用重启程序):
+
+| 项 | 内置默认(2026-10-15 定的:先拿智谱的免费档跑) |
+| --- | --- |
+| 接口地址 | `https://open.bigmodel.cn/api/paas/v4` |
+| 模型名 | `glm-4-flash-250414` |
+| API Key | 去 [bigmodel.cn](https://www.bigmodel.cn/) 注册后拿,**不要钱** |
+| 深度思考 | 三档:`不发` / `开启` / `关闭` |
+
+地址和模型名一打开就填好了,所以实际上只要贴一个 key。保存写进 `%APPDATA%\MC壁纸\ai.json`,下次启动
+自动读回来:
 
 ```json
 { "base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4-flash-250414", "api_key": "你的key" }
 ```
 
-以上**就是内置默认**(2026-10-15 定的:先拿智谱的免费档跑)。key 去
-[bigmodel.cn](https://www.bigmodel.cn/) 注册后拿,不要钱。没有这份 `ai.json` 也能正常启动 —— 只在你
-发消息时回一句"还没配模型",不会拦着面板。
+没有这份 `ai.json`、没填 key 也都能正常启动 —— 只在你发消息时回一句"还没配模型",不会拦着面板。
 
-智谱另有一个**也免费**的 `glm-4.7-flash`,更新更强,但它属于默认开深度思考的 4.7 系列;换过去请把
-`"thinking": false` 一起写上,否则一句"换张壁纸"要等十几秒:
+**「深度思考」为什么是三档。** `不发` = 请求体里不带 `thinking` 字段(不认它的服务商只能这样);
+`开启` / `关闭` = 显式发 `true` / `false`。智谱另有一个**也免费**的 `glm-4.7-flash`,更新更强,但它属于
+默认开深度思考的 4.7 系列;换过去记得选「关闭」,否则一句"换张壁纸"要等十几秒。4 代的 `glm-4-flash`
+不在支持 thinking 的名单里,保持「不发」就是最快的那档。
 
-```json
-{ "base_url": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4.7-flash", "api_key": "你的key", "thinking": false }
-```
-
-`thinking` **只在显式写了才发**(`true` / `false` 都认)——别家不认这个字段,不写就完全不出现在请求体里,
-和 `response_format` 同一个道理。
-
-其他几家也都是同一套 OpenAI 兼容接口,换个 `base_url` / `model` 就行:硅基流动(注册送额度)、
+其他几家也都是同一套 OpenAI 兼容接口,换个接口地址 / 模型名就行:硅基流动(注册送额度)、
 OpenRouter / Groq(免费档,要能连外网)、DeepSeek(按量计费,`https://api.deepseek.com` +
 `deepseek-chat`)。临时试一家也可以只设环境变量 `MCWP_AI_KEY` / `MCWP_AI_BASE_URL` / `MCWP_AI_MODEL` /
-`MCWP_AI_THINKING`(优先级高于 `ai.json`)。
+`MCWP_AI_THINKING`(优先级高于 `ai.json`;设了它们,设置页会提醒"在这儿改的不会生效")。
 
 不用 key、不花钱也能回归这条链路:
 

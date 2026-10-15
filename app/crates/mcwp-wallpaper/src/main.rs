@@ -55,10 +55,9 @@ mod sessions;
 
 use sessions::Sessions;
 
-/// 没配模型时,回复位给的东西。**要能照着做**:说清楚去哪儿写那份 ai.json。
-const NO_MODEL_REPLY: &str = "还没配模型,这句话先记着。配好之后就能按它生成壁纸 —— 写一份 \
-%APPDATA%\\MC壁纸\\ai.json(base_url / model / api_key),免费的有智谱 GLM-4-Flash、硅基流动、\
-OpenRouter,启动日志里有完整的配法。";
+/// 没配模型时,回复位给的东西。**要能照着做**:直接告诉用户去哪儿填。
+const NO_MODEL_REPLY: &str = "还没配模型,这句话先记着。面板左下角「设置」里填上接口地址和一个 \
+API Key 就能用了 —— 智谱 GLM-4-Flash 免费,去 bigmodel.cn 注册后把 key 贴进去就行。";
 
 /// 后台线程把模型结果送回主循环的包裹。
 ///
@@ -82,7 +81,7 @@ fn ask_model(
     let Some(client) = ai else {
         // 没配模型也得有回音:不然用户发完消息看着空荡荡的右栏,只会以为程序坏了
         sessions.reply(session, NO_MODEL_REPLY);
-        return "没配模型 · 这台机器上还没写 ai.json";
+        return "没配模型 · 去左下角「设置」里填一个 API Key";
     };
     let client = client.clone();
     let request = text.to_string();
@@ -95,6 +94,48 @@ fn ask_model(
         let _ = tx.send(AiOutcome { session, draft });
     });
     "正在生成壁纸…"
+}
+
+/// 设置页要显示的模型配置:盘上那份(空字段已经用内置默认补上)+ 有没有环境变量在盖它。
+fn ai_config_state() -> mcwp_ui::AiConfigState {
+    let stored = mcwp_ai::Config::stored();
+    mcwp_ui::AiConfigState {
+        base_url: stored.base_url,
+        model: stored.model,
+        api_key: stored.api_key,
+        thinking: mcwp_ui::ThinkingChoice::from_option(stored.thinking),
+        env_override: mcwp_ai::Config::env_override(),
+    }
+}
+
+/// 设置页点了「保存」:落盘 + **就地换掉客户端**,返回一行状态给面板。
+///
+/// 就地重建是重点 —— 不重建的话用户得重启程序才生效,而"配完还得重启"是这类设置页最容易挨骂的
+/// 地方。写盘失败时原来的客户端原样留着:配置没写成,能力也不该跟着消失。
+fn save_ai_config(stored: &mcwp_ai::Stored, ai: &mut Option<mcwp_ai::Client>) -> String {
+    if let Err(err) = mcwp_ai::Config::save(stored) {
+        tracing::error!("写 ai.json 失败:{err:?}");
+        return format!("保存失败:{err}");
+    }
+    if mcwp_ai::Config::env_override() {
+        // 环境变量优先级更高:写得进去,但不生效。不说明白,用户只会觉得"保存没反应"。
+        return "已写入 ai.json · 但环境变量在生效,实际用的是它们".to_string();
+    }
+    match mcwp_ai::Config::load() {
+        Ok(cfg) => {
+            let client = mcwp_ai::Client::new(cfg);
+            let describe = client.describe();
+            tracing::info!("模型配置已更新:{describe}");
+            *ai = Some(client);
+            format!("模型已保存 · {describe}")
+        }
+        Err(err) => {
+            // 没填 key 是常态(先存地址、回头再补 key),别当错误报
+            tracing::info!("模型配置已保存,但还不能用:{err}");
+            *ai = None;
+            "已保存 · 还没填 API Key".to_string()
+        }
+    }
 }
 
 /// 面板窗口的标题。要和 `panel.slint` 的 `title` 一字不差 —— 单实例守卫靠它找窗口。
@@ -694,7 +735,8 @@ fn main() -> Result<()> {
 
     // —— 模型 ——
     // 没配就只是"少个能力",不是错误:面板照常能开、能聊,回复位会说清楚去哪儿配。
-    let ai = match mcwp_ai::Config::load() {
+    // `mut`:设置页保存之后要就地换掉它(见 `save_ai_config`)。
+    let mut ai = match mcwp_ai::Config::load() {
         Ok(cfg) => {
             let client = mcwp_ai::Client::new(cfg);
             tracing::info!("模型已就绪:{}", client.describe());
@@ -723,6 +765,12 @@ fn main() -> Result<()> {
     } else {
         None
     };
+
+    // 设置页的模型配置:开面板时灌一次。之后只在「保存成功」时再灌 —— 平时不碰它,免得把
+    // 用户正在输入的 key 冲掉(理由见 `mcwp_ui::AiConfigState` 的说明)。
+    if let Some(handle) = &panel {
+        handle.refresh_ai(ai_config_state());
+    }
 
     // `--ai-ask "…"`:开面板之后顺手把这句话发出去。命令行也能生成壁纸,
     // 顺带成了唯一的"整条链路"自检方式 —— 合成的键盘输入会被本机中文输入法吃掉,打字那条路验不了。
@@ -915,6 +963,27 @@ fn main() -> Result<()> {
                             handle.refresh(panel_state(&spec, brightness, &sessions, &library));
                             handle.set_status(format!("已切到 {}", entry.item.title));
                         }
+                    }
+                }
+                // 设置页点了保存:写 ai.json + 就地重建客户端,不用重启程序。
+                mcwp_ui::UiEvent::SaveAiConfig {
+                    base_url,
+                    model,
+                    api_key,
+                    thinking,
+                } => {
+                    let stored = mcwp_ai::Stored {
+                        // 一律 trim:从输入框里复制粘贴十有八九带空格/换行,而 key 多一个空格就是 401
+                        base_url: base_url.trim().to_string(),
+                        model: model.trim().to_string(),
+                        api_key: api_key.trim().to_string(),
+                        thinking: thinking.to_option(),
+                    };
+                    let status = save_ai_config(&stored, &mut ai);
+                    if let Some(handle) = &panel {
+                        // 回填一次:trim 之后的值要显示回来,用户才知道真存进去的是什么
+                        handle.refresh_ai(ai_config_state());
+                        handle.set_status(status);
                     }
                 }
             }

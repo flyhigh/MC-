@@ -71,10 +71,12 @@ pub enum Mode {
     Create,
 }
 
-/// 配置。优先级:**环境变量 > `%APPDATA%\MC壁纸\ai.json` > 内置默认**。
+/// 一份**能直接用**的配置(缺哪个字段都已经填上默认值),`Client::new` 收的就是它。
 ///
-/// 环境变量那三个(`MCWP_AI_KEY` / `MCWP_AI_BASE_URL` / `MCWP_AI_MODEL`)是给"临时试一家"
-/// 和自检用的;日常用写进配置文件,免得把 key 塞进快捷方式。
+/// 优先级:**环境变量 > `%APPDATA%\MC壁纸\ai.json` > 内置默认**。
+///
+/// 环境变量那几个(`MCWP_AI_KEY` / `MCWP_AI_BASE_URL` / `MCWP_AI_MODEL` / `MCWP_AI_THINKING`)
+/// 是给"临时试一家"和自检用的;日常走面板的设置页,写进配置文件 —— 免得把 key 塞进快捷方式。
 #[derive(Debug, Clone)]
 pub struct Config {
     pub base_url: String,
@@ -84,31 +86,26 @@ pub struct Config {
     pub thinking: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct ConfigFile {
+/// 落盘的那份配置,也就是 `%APPDATA%\MC壁纸\ai.json` 的内容。
+///
+/// 单独做成公开类型,是因为**面板的设置页要拿它回填输入框** —— 那时候多半还没配 key,
+/// `Config::load()` 会直接报错,回填不了。读写共用这一份字段定义,免得两边漂移。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Stored {
     #[serde(default)]
-    base_url: String,
+    pub base_url: String,
     #[serde(default)]
-    model: String,
+    pub model: String,
     #[serde(default)]
-    api_key: String,
-    #[serde(default)]
-    thinking: Option<bool>,
+    pub api_key: String,
+    /// 见文件头:只在设置页里显式勾了才写出来(`None` 连字段都不落),免得把别家 400 掉。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<bool>,
 }
 
 impl Config {
     pub fn load() -> Result<Self> {
-        let raw = config_file()
-            .ok()
-            .and_then(|path| std::fs::read_to_string(&path).ok())
-            .and_then(|text| match serde_json::from_str::<ConfigFile>(&text) {
-                Ok(file) => Some(file),
-                Err(err) => {
-                    tracing::warn!("ai.json 解析失败,这次当没配:{err}");
-                    None
-                }
-            })
-            .unwrap_or_default();
+        let raw = read_stored().unwrap_or_default();
 
         let env = |key: &str| {
             std::env::var(key)
@@ -139,6 +136,51 @@ impl Config {
             api_key,
             thinking,
         })
+    }
+
+    /// 给设置页回填:**文件里现在写着什么**,空着的字段用内置默认补上。
+    ///
+    /// 特意不合并环境变量 —— 界面要显示的是"这份文件的内容",改了才写得回去;
+    /// 环境变量盖没盖住由 `env_override()` 单独告诉界面。
+    pub fn stored() -> Stored {
+        let mut file = read_stored().unwrap_or_default();
+        if file.base_url.trim().is_empty() {
+            file.base_url = DEFAULT_BASE_URL.to_string();
+        }
+        if file.model.trim().is_empty() {
+            file.model = DEFAULT_MODEL.to_string();
+        }
+        file
+    }
+
+    /// 把设置页填的东西写回 `ai.json`。
+    ///
+    /// 落盘用**临时文件 + 改名**(和会话那份同理,见 `sessions.rs`):直接往 `ai.json` 上盖,
+    /// 写到一半掉电就只剩半截 JSON,而这份文件里存着 key,坏掉最难查。写出来是带缩进的格式,
+    /// 用户自己打开看 / 手改都方便。
+    pub fn save(stored: &Stored) -> Result<()> {
+        let path = config_file()?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("建目录失败:{}", dir.display()))?;
+        }
+        let text = serde_json::to_string_pretty(stored).context("序列化模型配置失败")?;
+        let temp = path.with_extension("json.tmp");
+        std::fs::write(&temp, text).with_context(|| format!("写失败:{}", temp.display()))?;
+        std::fs::rename(&temp, &path).with_context(|| format!("替换失败:{}", path.display()))?;
+        Ok(())
+    }
+
+    /// 有环境变量在盖配置文件的字段吗?面板据此提醒一句:"你在这儿改的不会生效"。
+    pub fn env_override() -> bool {
+        [
+            "MCWP_AI_KEY",
+            "MCWP_AI_BASE_URL",
+            "MCWP_AI_MODEL",
+            "MCWP_AI_THINKING",
+        ]
+        .iter()
+        .any(|key| std::env::var(key).is_ok_and(|value| !value.trim().is_empty()))
     }
 
     /// 没配 key 时给人话,别只丢一句"缺少 api_key"。
@@ -521,6 +563,20 @@ fn config_file() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("读不到 APPDATA,无法定位模型配置"))?
         .join("MC壁纸")
         .join("ai.json"))
+}
+
+/// 读盘上那份 `ai.json`。**读不懂就当没配**(返回 `None`),而不是把错误抛给调用方 ——
+/// 用户能改的地方,坏文件不该让程序打不开,和会话 / 壁纸库那边一个态度。
+fn read_stored() -> Option<Stored> {
+    let path = config_file().ok()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str::<Stored>(&text) {
+        Ok(file) => Some(file),
+        Err(err) => {
+            tracing::warn!("ai.json 解析失败,这次当没配:{err}");
+            None
+        }
+    }
 }
 
 /// 提示词:把"能填什么"讲死,把"怎么答"讲死,其余交给模型。

@@ -86,6 +86,14 @@ pub enum UiEvent {
     MarkConversationUnread(usize),
     /// 面板切到「壁纸库」页:想要一份最新的库列表
     RefreshLibrary,
+    /// 设置页点了「保存」:接口地址 / 模型名 / API Key / 深度思考。
+    /// 校验、落盘、重建客户端全在壁纸侧 —— 面板不碰文件系统(和会话、壁纸库一个规矩)。
+    SaveAiConfig {
+        base_url: String,
+        model: String,
+        api_key: String,
+        thinking: ThinkingChoice,
+    },
     /// 点了壁纸库里的第 `index` 张(`PanelState::library` 的下标)
     OpenWallpaper(usize),
     /// 「存为壁纸」
@@ -118,13 +126,81 @@ pub struct PanelState {
     pub library_current: String,
 }
 
+/// 设置页要显示的模型配置。
+///
+/// 它**故意不进 `PanelState`**:整块 `refresh()` 会在换壁纸、切会话时随时触发,而设置页那几个
+/// 输入框里可能正是用户敲到一半的 key —— 那样会被整块回填冲掉。所以这份单独走
+/// `PanelHandle::refresh_ai()`,只在「打开面板」和「保存成功」两个时刻灌一次。
+#[derive(Debug, Clone, Default)]
+pub struct AiConfigState {
+    pub base_url: String,
+    pub model: String,
+    pub api_key: String,
+    /// 「深度思考」选的哪一档
+    pub thinking: ThinkingChoice,
+    /// 有 `MCWP_AI_*` 环境变量在生效:界面上要提醒一句,不然用户改完发现没反应。
+    pub env_override: bool,
+}
+
+/// 设置页里「深度思考」这一项。
+///
+/// 三态是必须的:落盘时 `None`(**不发这个字段**)和 `Some(false)`(发 `disabled`)是两个不同的
+/// 请求体 —— 不认 `thinking` 的服务商只能走前者(传了可能直接 400),而智谱 4.7 系列又想显式关掉它。
+/// 一个布尔开关表达不了这三件事,所以界面上是一排小胶囊。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThinkingChoice {
+    /// 请求体里不带这个字段,由服务商自己定(不认 `thinking` 的服务商选这个)
+    #[default]
+    Unset,
+    /// 显式打开
+    Enabled,
+    /// 显式关掉
+    Disabled,
+}
+
+impl ThinkingChoice {
+    /// 面板传上来的是一排胶囊的下标(0/1/2);认不出的按「不发」处理,别让手滑改坏请求体。
+    fn from_index(index: i32) -> Self {
+        match index {
+            1 => Self::Enabled,
+            2 => Self::Disabled,
+            _ => Self::Unset,
+        }
+    }
+
+    fn index(self) -> i32 {
+        match self {
+            Self::Unset => 0,
+            Self::Enabled => 1,
+            Self::Disabled => 2,
+        }
+    }
+
+    /// 落进 `ai.json` 的样子。`None` 意味着那个字段根本不写出来。
+    pub fn to_option(self) -> Option<bool> {
+        match self {
+            Self::Unset => None,
+            Self::Enabled => Some(true),
+            Self::Disabled => Some(false),
+        }
+    }
+
+    /// 从 `ai.json` 读回来的反向映射。老配置里没有这个字段就是 `None` → 「不发」。
+    pub fn from_option(value: Option<bool>) -> Self {
+        match value {
+            None => Self::Unset,
+            Some(true) => Self::Enabled,
+            Some(false) => Self::Disabled,
+        }
+    }
+}
+
 /// 生图界面的会话数据:左栏的会话列表 + 当前会话的消息。
 ///
 /// 面板不持有任何状态,所以换会话、发消息都是「Rust 改数据 → 整块回填」。`revision`
 /// 每改一次 +1:消息列表靠它把滚动位置钉到底部(内容长高了才需要滚,面板自己看不出来)。
 ///
-/// M3 接上 AI 之前,消息里回复的位置还是占位文案。数据本身由壁纸侧落盘(和壁纸库同一个目录),
-/// 面板这一侧永远只是投影 —— 它不碰文件系统。
+/// 数据本身由壁纸侧落盘(和壁纸库同一个目录),面板这一侧永远只是投影 —— 它不碰文件系统。
 #[derive(Debug, Clone, Default)]
 pub struct SessionState {
     /// 左栏:历史对话
@@ -248,6 +324,20 @@ impl PanelHandle {
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(panel) = weak.upgrade() {
                 apply_library(&panel, library, current);
+            }
+        });
+    }
+
+    /// 回填设置页的模型配置。
+    ///
+    /// **只在「面板刚打开」和「保存成功」两个时刻调**:设置页那几个输入框平时是用户在编辑,
+    /// 而 `refresh()` 会因为换壁纸 / 切会话随时整块回填 —— 把配置塞进 `PanelState` 会把
+    /// 用户正在敲的字冲掉。理由见 `AiConfigState`。
+    pub fn refresh_ai(&self, ai: AiConfigState) {
+        let weak = self.weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(panel) = weak.upgrade() {
+                apply_ai(&panel, &ai);
             }
         });
     }
@@ -420,6 +510,19 @@ fn build(state: &PanelState, events: Sender<UiEvent>) -> Result<Panel> {
         let tx = events.clone();
         ui.on_refresh_library(move || {
             let _ = tx.send(UiEvent::RefreshLibrary);
+        });
+    }
+
+    {
+        // 设置页的「保存」。面板只把四个值原样递出去 —— 校验、落盘、重建客户端都在壁纸侧。
+        let tx = events.clone();
+        ui.on_save_ai_config(move |base_url, model, api_key, thinking| {
+            let _ = tx.send(UiEvent::SaveAiConfig {
+                base_url: base_url.to_string(),
+                model: model.to_string(),
+                api_key: api_key.to_string(),
+                thinking: ThinkingChoice::from_index(thinking),
+            });
         });
     }
 
@@ -635,4 +738,13 @@ fn apply_state(ui: &Panel, state: &PanelState) {
 fn apply_library(ui: &Panel, library: Vec<LibraryItem>, current: String) {
     ui.set_library(slint::ModelRc::new(slint::VecModel::from(library)));
     ui.set_library_current(current.into());
+}
+
+/// 回填设置页的模型配置。
+fn apply_ai(ui: &Panel, ai: &AiConfigState) {
+    ui.set_ai_base_url(ai.base_url.clone().into());
+    ui.set_ai_model(ai.model.clone().into());
+    ui.set_ai_key(ai.api_key.clone().into());
+    ui.set_ai_thinking(ai.thinking.index());
+    ui.set_ai_env_override(ai.env_override);
 }

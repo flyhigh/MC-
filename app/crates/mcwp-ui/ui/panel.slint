@@ -785,6 +785,120 @@ component MessageRow inherits HorizontalLayout {
         }
     }
 }
+
+// 设置页里的一行:左边固定宽的标签 + 右边一个输入框。三行(接口地址 / 模型名 / Key)共用它,
+// 免得同一段样式抄三遍。
+component FieldRow inherits HorizontalLayout {
+    in property <string> label: "";
+    in property <string> placeholder: "";
+    in-out property <string> value: "";
+    in property <color> accent: #0A84FF;
+
+    height: 38px;
+    spacing: 10px;
+
+    Text {
+        text: root.label;
+        color: Glass.label-2;
+        font-size: 12px;
+        width: 68px;
+        vertical-alignment: center;
+    }
+
+    Rectangle {
+        horizontal-stretch: 1;
+        border-radius: 8px;
+        // 凹槽 + 发丝线,和会话输入框同一套语言
+        background: #0000003D;
+        border-width: 1px;
+        border-color: field.has-focus ? root.accent.with-alpha(0.65) : Glass.hairline-dim;
+        animate border-color { duration: 140ms; easing: ease-out; }
+
+        // 占位提示:Slint 的 TextInput 没有 placeholder 属性,自己补一层灰字。
+        // 声明在输入框**前面**:后声明的画在上面,反过来这层灰字会盖住输入框吃不到点击。
+        if root.value == "" : Text {
+            x: 10px;
+            width: parent.width - 20px;
+            height: 100%;
+            text: root.placeholder;
+            color: Glass.label-3;
+            font-size: 12px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        field := TextInput {
+            x: 10px;
+            width: parent.width - 20px;
+            height: 100%;
+            font-size: 12px;
+            color: Glass.label;
+            vertical-alignment: center;
+            single-line: true;
+            // 这里**不能用 `input-type: password`**:Slint 打码用的字符是 ●(U+25CF),
+            // 而内嵌子集字体里没有 ●(见 tools/subset-panel-font.py 的输出),缺字是静默不画 ——
+            // 结果就是"key 明明存着,输入框看着却是空的",比明文更容易让人以为没配。
+            // key 本来就以明文躺在 ai.json 里,索性就明文显示。
+            text <=> root.value;
+        }
+    }
+}
+
+// 设置页里三选一的一行(目前只有「深度思考」用)。
+//
+// 为什么不是开关:「请求体里不带这个字段」和「带一个 false」是两件不同的事 —— 不认 `thinking`
+// 的服务商必须走前者(传了可能直接 400),而智谱 4.7 系列又想显式把它关掉。两个状态表达不了
+// 三件事,所以做成一排小胶囊。
+component ChoiceRow inherits HorizontalLayout {
+    in property <string> label: "";
+    in property <[string]> options: [];
+    in-out property <int> current: 0;
+    in property <color> accent: #0A84FF;
+
+    height: 34px;
+    spacing: 8px;
+
+    Text {
+        text: root.label;
+        color: Glass.label-2;
+        font-size: 12px;
+        width: 68px;
+        vertical-alignment: center;
+    }
+
+    for option[index] in root.options : Rectangle {
+        width: 58px;
+        height: 24px;
+        border-radius: 12px;
+        border-width: 1px;
+        border-color: root.current == index ? root.accent.with-alpha(0.55) : Glass.hairline-dim;
+        background: root.current == index ? root.accent.with-alpha(0.22) : #0000003D;
+        animate background { duration: 140ms; easing: ease-out; }
+
+        Text {
+            text: option;
+            color: root.current == index ? Glass.label : Glass.label-2;
+            font-size: 11px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: 100%;
+            height: 100%;
+        }
+
+        TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.current = index; }
+        }
+    }
+
+    Text {
+        color: Glass.label-3;
+        font-size: 11px;
+        vertical-alignment: center;
+        overflow: elide;
+        horizontal-stretch: 1;
+    }
+}
 export component Panel inherits Window {
     // —— 会话视图:左栏历史 + 右栏消息 ——
     in property <[ConversationItem]> conversations;
@@ -798,6 +912,19 @@ export component Panel inherits Window {
     in property <int> message-revision: 0;
     // 输入框里还没发出去的字。纯界面状态,和输入框双向绑定。
     in-out property <string> draft: "";
+
+    // —— 设置页:模型配置(接生图那一环)——
+    // 这四个是 in-out,但**不放进 PanelState**:它们平时是用户在编辑,而 `refresh()`
+    // 会因为换壁纸、切会话随时整块回填 —— 那会把用户正在敲的字冲掉。所以只由 Rust 在
+    // 「打开面板」和「保存成功」两个时刻单独灌一次(见 mcwp_ui::PanelHandle::refresh_ai)。
+    in-out property <string> ai-base-url: "";
+    in-out property <string> ai-model: "";
+    in-out property <string> ai-key: "";
+    // 深度思考:0 = 不发这个字段(服务商默认)/ 1 = 发 enabled / 2 = 发 disabled。
+    // 三态不是偷懒 —— 面板把它原样交给 Rust,由 Rust 决定 `Stored::thinking` 落 None/true/false。
+    in-out property <int> ai-thinking: 0;
+    // 有 MCWP_AI_* 环境变量在生效 —— 界面上得说一句,不然用户在这儿改完发现没反应。
+    in property <bool> ai-env-override: false;
 
     // 右栏当前显示哪个视图:0 = 会话,1 = 壁纸参数,2 = 壁纸库,3 = 设置。纯界面状态,不进 Rust。
     in-out property <int> view: 0;
@@ -875,6 +1002,8 @@ export component Panel inherits Window {
     // 壁纸库:点了某一张 / 切进库页时想要一份最新的列表
     callback open-wallpaper(int);
     callback refresh-library();
+    // 设置页:保存模型配置(接口地址 / 模型名 / API Key / 深度思考那一档的下标)
+    callback save-ai-config(string, string, string, int);
 
     title: "MC 壁纸 · 控制面板";
     // 任务栏 / Alt-Tab 的窗口图标。`@image-url` 走的还是 build.rs 的 EmbedFiles,所以图标
@@ -1455,38 +1584,102 @@ export component Panel inherits Window {
                     }
                 }
 
-                // —— 视图 3:设置(占位)—— 
+                // —— 视图 3:设置 —— 
+                // 目前只有"模型"这一组(那是接生图那一环绕不开的东西);开机自启、省电策略后面再加。
                 if root.view == 3 : Rectangle {
                     vertical-stretch: 1;
                     border-radius: Glass.r-card;
                     background: Glass.fill;
 
                     VerticalLayout {
-                        alignment: center;
-                        spacing: 6px;
+                        padding: 18px;
+                        spacing: 10px;
 
                         Text {
-                            text: "设置";
+                            text: "模型";
                             color: Glass.label;
-                            font-size: 22px;
+                            font-size: 15px;
                             font-weight: 600;
-                            horizontal-alignment: center;
                         }
                         Text {
-                            text: "模型密钥 / 开机自启 / 省电策略 · 待接入";
+                            text: "填好点保存,写进 %APPDATA%\\MC壁纸\\ai.json;下次启动自动读回来。";
                             color: Glass.label-3;
-                            font-size: 12px;
-                            horizontal-alignment: center;
+                            font-size: 11px;
+                            overflow: elide;
                         }
+
+                        FieldRow {
+                            label: "接口地址";
+                            placeholder: "https://open.bigmodel.cn/api/paas/v4";
+                            value <=> root.ai-base-url;
+                            accent: root.accent;
+                        }
+                        FieldRow {
+                            label: "模型名";
+                            placeholder: "glm-4-flash-250414";
+                            value <=> root.ai-model;
+                            accent: root.accent;
+                        }
+                        FieldRow {
+                            label: "API Key";
+                            placeholder: "去服务商那边生成一个";
+                            value <=> root.ai-key;
+                            accent: root.accent;
+                        }
+                        ChoiceRow {
+                            label: "深度思考";
+                            options: ["不发", "开启", "关闭"];
+                            current <=> root.ai-thinking;
+                            accent: root.accent;
+                        }
+                        Text {
+                            text: "不发 = 请求体里不带这个字段。智谱 4.7 系列默认开思考(一句话要等十几秒),换过去就选「关闭」;4 代的 glm-4-flash 没有思考模式,选「不发」。";
+                            color: Glass.label-3;
+                            font-size: 10px;
+                            wrap: word-wrap;
+                        }
+
+                        if root.ai-env-override : Text {
+                            text: "注意:有 MCWP_AI_ 开头的环境变量在生效,这里改的会被它们盖掉";
+                            color: Glass.label-2;
+                            font-size: 11px;
+                            overflow: elide;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            // 胶囊按钮在横向布局里会贴着上沿,套一层竖直居中的布局才不歪
+                            VerticalLayout {
+                                alignment: center;
+                                Pill {
+                                    text: "保存";
+                                    primary: true;
+                                    accent: root.accent;
+                                    clicked => {
+                                        root.save-ai-config(
+                                            root.ai-base-url,
+                                            root.ai-model,
+                                            root.ai-key,
+                                            root.ai-thinking
+                                        );
+                                    }
+                                }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+
+                        Rectangle { vertical-stretch: 1; }
                     }
                 }
 
                 // —— 状态行(一次性的反馈都放这儿)—— 
+                // 注意 `height` 不能压到字体行盒以下:原来写 14px 配 11px 的字,软件渲染器会把
+                // 整行裁掉(**不是截断,是一个像素都不画**),状态文字于是静默消失 —— 实测踩过。
                 Text {
                     text: root.status;
                     color: Glass.label-3;
                     font-size: 11px;
-                    height: 14px;
+                    height: 20px;
                     vertical-alignment: center;
                     overflow: elide;
                 }
