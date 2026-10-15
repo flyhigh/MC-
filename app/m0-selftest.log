@@ -1,3 +1,0 @@
-2026-10-14T07:38:42.184476Z  WARN GENERAL [Loader Message (0x0)]
-	windows_read_data_files_in_registry: Registry lookup failed to get layer manifest files.
-2026-10-14T07:38:42.186674Z  WARN 	objects: (type: INSTANCE, hndl: 0x23dfac2e4b0, name: ?)

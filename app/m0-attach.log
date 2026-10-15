@@ -1,6 +1,0 @@
-2026-10-14T07:44:32.787983Z  INFO 已启用 Per-Monitor V2 DPI 感知
-2026-10-14T07:44:32.788766Z  INFO 启动参数:Args { seconds: Some(22.0), fps: 30, brightness: 1.0, standalone_window: false, attach_mode: Auto, stats_interval: 20s }
-2026-10-14T07:44:32.789119Z  INFO 主显示器:1920x1080 @ (0, 0)
-2026-10-14T07:44:32.797265Z  INFO 壁纸窗口挂载完成:模式=auto,目标=顶层 WorkerW 兄弟(可见), hwnd=HWND(0x3017a), visible=true
-2026-10-14T07:44:32.925466Z  INFO Found 6 cooperative matrix configurations supported by wgpu
-2026-10-14T07:44:33.092652Z  INFO 使用 GPU:AdapterInfo { name: "Intel(R) UHD Graphics", vendor: 32902, device: 42888, device_type: IntegratedGpu, device_pci_bus_id: "0000:00:02.0", driver: "32.0.101.6129", driver_info: "", backend: Dx12, subgroup_min_size: 16, subgroup_max_size: 16, transient_saves_memory: Some(false), limit_bucket: None }
