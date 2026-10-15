@@ -7,6 +7,9 @@
 //! - **一次调用,不搞"提示词智能体"**:参数空间已经被 4 个预设和取值范围锁死,"设计提示词"在这个
 //!   环节里等价于"填参数",再套一层只会把成本、延迟、失败点全翻倍。真需要两步(生成 → 自评 →
 //!   改提示词)是位图那条路的事,而且也得等 A 档跑通、发现效果不够之后再上。
+//! - **形状走样就地修,不靠重试**:小模型会把单元素数组写成裸字符串(实测 glm-4-flash 的
+//!   `"keywords": "雨夜城市"`),而"把错误丢回去让它重写"它照抄原样、白等 7 秒。所以解析前先按
+//!   已知的几种走样修一遍(`repair_shape`),一次往返省下来。
 //! - **绝不返回 Err 给用户**:`draft()` 要么给出模型的结果,要么给出本地降级(方案 3.4 的 L1),
 //!   调用方拿到的永远是一份能渲染的 spec。用户敲了字,桌面总得有反应,不能弹个错误框了事。
 //! - **超时 45 s**:方案里那句"LLM 超时默认 3 s"是给 T1 环境联动用的;这里是用户敲完字等结果的
@@ -353,13 +356,18 @@ impl Client {
         }
         let parsed: ChatResponse = serde_json::from_str(&raw)
             .with_context(|| format!("响应不是 OpenAI 格式:{}", truncate(&raw, 200)))?;
-        parsed
+        let content = parsed
             .choices
             .into_iter()
             .next()
             .map(|choice| choice.message.content)
             .filter(|content| !content.trim().is_empty())
-            .ok_or_else(|| anyhow!("模型返回了空内容"))
+            .ok_or_else(|| anyhow!("模型返回了空内容"))?;
+        // 模型原话留一份到 debug 日志。解析失败时这是**唯一**能看清"它到底写了什么"的地方,
+        // 而这一步的失败几乎全是形状问题(数组写成了字符串、数字写成了字符串)。平时不吵:
+        // 这条在 debug 级,`RUST_LOG=info,mcwp_ai=debug` 才出来。
+        tracing::debug!("模型原文:{content}");
+        Ok(content)
     }
 }
 
@@ -374,8 +382,14 @@ fn parse_reply(text: &str, request: &str) -> Result<Parsed> {
         .get("title")
         .and_then(|value| value.as_str())
         .is_some_and(|title| !title.trim().is_empty());
+    // 形状走样先修好再解析(见 `repair_shape`):实测这一条能把"重试也救不回来"的失败直接消化掉
+    let mut spec_value = answer.spec;
+    let repaired = repair_shape(&mut spec_value);
+    if !repaired.is_empty() {
+        tracing::info!("模型的 JSON 有形状走样,已就地修好:{}", repaired.join(" / "));
+    }
     let mut spec: WallpaperSpec =
-        serde_json::from_value(answer.spec).context("spec 字段不是一个合法的壁纸规格")?;
+        serde_json::from_value(spec_value).context("spec 字段不是一个合法的壁纸规格")?;
     // 出处是"对话",库那边另说(`save_to_library` 会归一成快照)
     spec.source = Source::Conversation;
     // 越界的数值、缺的参数、多出来的键,全在这里被拉回合法范围
@@ -404,6 +418,153 @@ struct Parsed {
     spec: WallpaperSpec,
     image_prompt: String,
     mode: Mode,
+}
+
+/// 把模型常见的**形状走样**就地修回契约要的样子,返回修了哪几处(空 = 一处没动)。
+///
+/// 为什么值得单独修一次形状:小模型会把**单元素数组写成裸字符串** —— 实测 glm-4-flash 给
+/// 整份 spec 只有 `"keywords": "雨夜城市"` 这一处不对,别的字段一字不差,但契约要的是数组,
+/// `from_value` 直接报 `invalid type: string, expected a sequence`。而**重试救不了它**:把错误原样
+/// 丢回去让它重写一遍,它照抄原来那份(实测两次一模一样),白等 7 秒。所以先修形状再解析 —— 这次
+/// 往返省下来,而且改法完全确定,不是"猜着修 JSON"。
+///
+/// 只认**已经踩过**的这几种走样,不做通用容错:类型对不上的地方越多,说明模型越离谱,那该让它
+/// 重写、或者干脆降级,而不是本地越修越歪,把它的胡话修成一份看着正常的壁纸。
+fn repair_shape(spec: &mut serde_json::Value) -> Vec<String> {
+    let mut fixed = Vec::new();
+    let Some(map) = spec.as_object_mut() else {
+        return fixed;
+    };
+
+    // ① 单元素数组写成裸字符串
+    for key in ["keywords", "palette"] {
+        let text = match map.get(key) {
+            Some(serde_json::Value::String(text)) => text.clone(),
+            _ => continue,
+        };
+        let items = split_items(&text)
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect();
+        map.insert(key.to_string(), serde_json::Value::Array(items));
+        fixed.push(format!("{key}:字符串→数组"));
+    }
+
+    // ② 单个元素对象写成裸对象(elements 只有一项时容易这样)
+    if map.get("elements").is_some_and(|value| value.is_object()) {
+        if let Some(one) = map.remove("elements") {
+            map.insert("elements".to_string(), serde_json::Value::Array(vec![one]));
+            fixed.push("elements:对象→数组".to_string());
+        }
+    }
+
+    // ③ 数字写成字符串
+    numberify(map, "seed", &mut fixed);
+    if let Some(child) = map.get_mut("mood").and_then(serde_json::Value::as_object_mut) {
+        for key in ["calm", "focus", "energy"] {
+            numberify(child, key, &mut fixed);
+        }
+    }
+    if let Some(child) = map.get_mut("motion").and_then(serde_json::Value::as_object_mut) {
+        for key in ["intensity", "speed"] {
+            numberify(child, key, &mut fixed);
+        }
+    }
+    if let Some(child) = map
+        .get_mut("lighting")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        numberify(child, "keyLight", &mut fixed);
+        boolify(child, "followDesktopBrightness", &mut fixed);
+    }
+    if let Some(child) = map
+        .get_mut("overlay")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        boolify(child, "clock", &mut fixed);
+    }
+    // scene.params 整张表都是数,一个字符串值都不该有
+    let params = map
+        .get_mut("scene")
+        .and_then(|scene| scene.get_mut("params"))
+        .and_then(serde_json::Value::as_object_mut);
+    if let Some(params) = params {
+        let mut count = 0;
+        for value in params.values_mut() {
+            if let serde_json::Value::String(text) = value {
+                if let Some(number) = number_value(text) {
+                    *value = number;
+                    count += 1;
+                }
+            }
+        }
+        if count > 0 {
+            fixed.push(format!("scene.params:{count} 个字符串→数字"));
+        }
+    }
+
+    fixed
+}
+
+/// `"雨夜城市"` → `["雨夜城市"]`;顺便把挤成一行的多项拆开 —— 关键词那栏偶尔会把 2~5 个词写成
+/// 一个字符串(`"雨、夜、冷蓝"`),调色板也可能被写成 `"#0B1020, #1B2A4A, …"`,拆开才算真修好。
+fn split_items(text: &str) -> Vec<String> {
+    text.split(|c: char| c.is_whitespace() || matches!(c, ',' | '，' | '、' | ';' | '；'))
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 把 `map[key]` 从字符串数字改成真数字(`"0.45"` → `0.45`);不是这回事就原样留着,交给后面的
+/// 报错路径去说。
+fn numberify(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    fixed: &mut Vec<String>,
+) {
+    let Some(serde_json::Value::String(text)) = map.get(key) else {
+        return;
+    };
+    let Some(value) = number_value(text) else {
+        return;
+    };
+    map.insert(key.to_string(), value);
+    fixed.push(format!("{key}:字符串→数字"));
+}
+
+/// `"0.45"` → `0.45`,`"20261014"` → `20261014`(**整数**)。
+///
+/// 整数必须落成整数:`seed` 是 `u32`,给它塞个 `20261014.0` 进去,serde 会报
+/// `invalid type: floating point, expected u32` —— 修形状反而修出个新错(单测逮到的)。
+fn number_value(text: &str) -> Option<serde_json::Value> {
+    let number = text.trim().parse::<f64>().ok()?;
+    if number.fract() == 0.0 && number.abs() <= i64::MAX as f64 {
+        return Some(serde_json::Value::Number(serde_json::Number::from(
+            number as i64,
+        )));
+    }
+    Some(serde_json::Value::Number(serde_json::Number::from_f64(
+        number,
+    )?))
+}
+
+/// 同上,管 `"true"` / `"false"` 这种写成字符串的布尔。
+fn boolify(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    fixed: &mut Vec<String>,
+) {
+    let Some(serde_json::Value::String(text)) = map.get(key) else {
+        return;
+    };
+    let value = match text.trim().to_ascii_lowercase().as_str() {
+        "true" => true,
+        "false" => false,
+        _ => return,
+    };
+    map.insert(key.to_string(), serde_json::Value::Bool(value));
+    fixed.push(format!("{key}:字符串→布尔"));
 }
 
 /// 从模型那段文本里抠出 JSON 对象。
@@ -593,11 +754,11 @@ fn system_prompt() -> String {
          \x20 \"spec\": {{ 壁纸规格,字段见下 }}\n\
          }}\n\
          \n\
-         spec 的字段:\n\
+         spec 的字段(凡是「一串东西」的字段都得写成**数组**,别写成一个字符串):\n\
          - title:中文短标题(6~12 字,别用书名号)\n\
-         - keywords:2~5 个中文关键词(如 雨 / 夜 / 冷蓝)\n\
+         - keywords:字符串数组,2~5 个中文关键词(如 [\"雨\", \"夜\", \"冷蓝\"])\n\
          - mood:calm / focus / energy 三个 0~1 的数\n\
-         - palette:恰好 5 个 #RRGGBB 颜色,从深到浅(第一个是底色;桌面壁纸常年在图标下面,\
+         - palette:字符串数组,恰好 5 个 #RRGGBB 颜色,从深到浅(第一个是底色;桌面壁纸常年在图标下面,\
          别用大面积纯白)\n\
          - scene.preset:只能取下面目录里的 id\n\
          - scene.params:只能填该预设声明的参数(key 必须一字不差),值必须落在给定范围内\n\
@@ -711,4 +872,54 @@ struct ModelReply {
     image_prompt: Option<String>,
     /// 先当 `Value` 收着再单独解析:这样"外层对、spec 不对"能报出更准的错,重试时也说得清
     spec: serde_json::Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 实测踩到的那一份:glm-4-flash 只有 `keywords` 写成了字符串,别处一字不差。
+    #[test]
+    fn 单元素数组写成字符串也能解析出规格() {
+        // 外层用 r## 包:里面全是 "#RRGGBB",`"#` 会把 r#"…"# 提前收掉
+        let text = r##"{
+            "reply": "已理解您的需求",
+            "mode": "tweak",
+            "image_prompt": "雨夜城市",
+            "spec": {
+                "title": "雨夜城市",
+                "keywords": "雨夜城市",
+                "palette": ["#0B1020", "#1B2A4A", "#4F7CFF", "#9BB8FF", "#E6ECFF"],
+                "scene": { "preset": "rainy_window_city", "params": { "blur": "0.35" } },
+                "motion": { "intensity": "0.45", "speed": 0.6 },
+                "seed": "20261014"
+            }
+        }"##;
+        let parsed = parse_reply(text, "你好?").expect("修完形状就该能解析");
+        assert_eq!(parsed.spec.keywords, vec!["雨夜城市"]);
+        assert_eq!(parsed.spec.motion.intensity, 0.45);
+        assert_eq!(parsed.spec.scene.params.get("blur"), Some(&0.35));
+        assert_eq!(parsed.spec.preset(), Preset::RainyWindowCity);
+    }
+
+    /// 挤成一行的多项要拆开,不然 `palette` 会变成"一个颜色"。
+    #[test]
+    fn 挤成一行的多项会拆开() {
+        let mut spec = serde_json::json!({
+            "keywords": "雨、夜、冷蓝",
+            "palette": "#0B1020, #1B2A4A, #4F7CFF, #9BB8FF, #E6ECFF"
+        });
+        let fixed = repair_shape(&mut spec);
+        assert_eq!(fixed.len(), 2);
+        assert_eq!(spec["keywords"], serde_json::json!(["雨", "夜", "冷蓝"]));
+        assert_eq!(spec["palette"].as_array().map(Vec::len), Some(5));
+    }
+
+    /// 没走样就一处都别动 —— 修得越少,"本地瞎改"的风险越小。
+    #[test]
+    fn 没走样就不动它() {
+        let mut spec = serde_json::json!({ "keywords": ["雨"], "seed": 7, "elements": [] });
+        assert!(repair_shape(&mut spec).is_empty());
+        assert_eq!(spec["seed"], serde_json::json!(7));
+    }
 }
