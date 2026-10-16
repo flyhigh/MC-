@@ -12,11 +12,15 @@
 //! `scene.wgsl` 一起退休了,**预设清零**指的就是这件事。
 //!
 //! 现在这一层只描述 [`Photo`]:图在哪、多宽多高、动效怎么走、调色板是哪几个色。
+//! 动效有两层:[`MotionRecipe`](细颗粒的旋钮,K 帧层的推拉呼吸)和
+//! [`MotionPlan`](元素级的"灯在闪、车在走",给图生视频和程序化动效层用)。
 //! 详情见 [`photo`] 模块。
 
 pub mod photo;
 
-pub use photo::{palette_from_rgba, MotionKind, MotionRecipe, Photo};
+pub use photo::{
+    palette_from_rgba, MotionElement, MotionKind, MotionPlan, MotionRecipe, Photo,
+};
 
 /// 调色板的槽位数。
 ///

@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use mcwp_image::Bitmap;
 use mcwp_spec::photo::PhotoKind;
+use mcwp_spec::MotionPlan;
 use mcwp_spec::Photo;
 
 /// 缩略图的尺寸上限(16:9)。面板那一格是 168 × 94,按 2 倍给,够清楚也不占地方;
@@ -193,6 +194,21 @@ fn write_thumb(thumb: &Path, bitmap: &Bitmap) {
         }
         Err(err) => tracing::warn!("缩略图编不出来({}):{err}", thumb.display()),
     }
+}
+
+/// 把动效方案写回**原图**那一份记录。
+///
+/// 方案说的本来就是"这张图该怎么动",它的主人是这张图,不是某一条成片:
+/// - 同一张图**重做一遍**时不用再看一遍图(省一次免费调用,更省得两次给的元素不一样);
+/// - `--video-fetch` 那种"照任务号把片子捡回来"的路,才找得到**当时**用的方案 ——
+///   否则捡回来的那条记录里方案是空的,"这张动效是怎么来的"就断了。
+///
+/// 它会**覆盖**旧值:重做时用了新方案,记录就该跟着新的走(视频那条各自留着自己的痕迹)。
+pub fn save_motion_plan(entry: &Entry, plan: &MotionPlan) -> Result<()> {
+    let mut photo = entry.photo.clone();
+    photo.motion_plan = plan.clone();
+    photo.normalize();
+    write_meta(&entry.meta, &photo)
 }
 
 /// 元数据走"临时文件 + 改名"(和会话 / 模型配置一个态度):半截 JSON 比没有 JSON 难查得多。

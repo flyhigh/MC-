@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use mcwp_spec::{MotionKind, MotionRecipe, Photo};
+use mcwp_spec::{MotionElement, MotionKind, MotionPlan, MotionRecipe, Photo};
 use serde::{Deserialize, Serialize};
 use ureq::tls::{TlsConfig, TlsProvider};
 
@@ -65,15 +65,35 @@ pub const DEFAULT_IMAGE_MODEL: &str = "cogview-3-flash";
 /// 拿到就当场下载,绝不只存地址。
 pub const DEFAULT_VIDEO_MODEL: &str = "cogvideox-3";
 
+/// 默认的**视觉模型**:动效分析那一步要"看"那张图(见 `plan_motion_vision`)。
+///
+/// 智谱的 `glm-4v-flash` 是**免费**档(官方定价页写的是"免费模型,支持图像理解"),
+/// 地址和 key 直接继承对话那一套,所以不用再多填一个输入框。
+///
+/// 为什么非要"看":在拿到图之前,这一步的输入只有标题和提示词 —— 一个看不到画面的模型,
+/// 只能写出"缓慢推近"这种万能句,而用户要的是"灯在闪、车在走、云在飘"这些**画面里才有的事**。
+pub const DEFAULT_VISION_MODEL: &str = "glm-4v-flash";
+
 /// 轮询那条异步接口的间隔。它一次要跑几十秒,查得太密没有意义,太疏又会让"好了"晚到几秒。
 const VIDEO_POLL_INTERVAL: Duration = Duration::from_secs(8);
 
-/// 一条视频最多等多久。实测 61 s,给到 6 分钟 —— 到点就报错,
-/// 而不是让面板上那颗「做成动态壁纸」永远转下去。
-const VIDEO_WAIT_TIMEOUT: Duration = Duration::from_secs(360);
+/// 一条视频最多等多久。
+///
+/// 实测差得极远:闲的时候 61 s 就出片,2026-10-16 那天同样一条 10 秒片**等了 7 分钟**
+/// 还在 PROCESSING(`--video-fetch` 亲自查到过)。所以给到 15 分钟 ——
+/// 到点还是报错,不让面板上那颗「做成动态壁纸」永远转下去;真超了也别慌,
+/// 任务号会跟着报错一起打出来,`--video-fetch <任务号> <库 id>` 能把它捡回来。
+const VIDEO_WAIT_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// 动效提示词最长多少字。图生视频那句**只描述"怎么动"**,不需要长;太长反而会被当成分镜。
 const MAX_MOTION_PROMPT_CHARS: usize = 200;
+
+/// 图生视频接口对 `prompt` 的硬上限:512 个字符(智谱 `videos/generations` 的文档写的)。
+///
+/// 和上面那个 200 是**两回事**:200 是"我们想要的克制"(一句运镜就够),
+/// 512 是"服务商允许的极限"。元素级方案会把几件事并排写进去,所以按 512 收口;
+/// 真超了就是 `truncate` 兜底 —— 宁可少一个元素,不能让整条请求被拒。
+const MAX_VIDEO_PROMPT_CHARS: usize = 512;
 
 /// 生图接口对尺寸的硬要求(智谱 CogView 实测):宽高都得是 **16 的整数倍**、各自落在
 /// 512~2880,且总像素不超过 2²¹。
@@ -131,6 +151,8 @@ pub struct Config {
     pub api_key: String,
     /// 「深度思考」开关。`None` = 请求体里不带这个字段(对不认它的服务商最安全)。
     pub thinking: Option<bool>,
+    /// 看图的模型。和对话**共用地址与 key**,只换模型名(见 `DEFAULT_VISION_MODEL`)。
+    pub vision_model: String,
 }
 
 /// 落盘的那份配置,也就是 `%APPDATA%\MC壁纸\ai.json` 的内容。
@@ -165,6 +187,9 @@ pub struct Stored {
     pub video_base_url: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub video_api_key: String,
+    /// 视觉模型(动效分析那一步看图用)。留空就跟对话那套共用地址和 key。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub vision_model: String,
 }
 
 impl Config {
@@ -182,6 +207,9 @@ impl Config {
         let model = env("MCWP_AI_MODEL")
             .or_else(|| non_empty(&raw.model))
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let vision_model = env("MCWP_VISION_MODEL")
+            .or_else(|| non_empty(&raw.vision_model))
+            .unwrap_or_else(|| DEFAULT_VISION_MODEL.to_string());
         let Some(api_key) = env("MCWP_AI_KEY").or_else(|| non_empty(&raw.api_key)) else {
             return Err(anyhow!("{}", Self::missing_key_hint()));
         };
@@ -199,6 +227,7 @@ impl Config {
             model,
             api_key,
             thinking,
+            vision_model,
         })
     }
 
@@ -219,6 +248,9 @@ impl Config {
         }
         if file.image_model.trim().is_empty() {
             file.image_model = DEFAULT_IMAGE_MODEL.to_string();
+        }
+        if file.vision_model.trim().is_empty() {
+            file.vision_model = DEFAULT_VISION_MODEL.to_string();
         }
         file
     }
@@ -251,6 +283,7 @@ impl Config {
             "MCWP_IMAGE_KEY",
             "MCWP_IMAGE_BASE_URL",
             "MCWP_IMAGE_MODEL",
+            "MCWP_VISION_MODEL",
         ]
         .iter()
         .any(|key| std::env::var(key).is_ok_and(|value| !value.trim().is_empty()))
@@ -586,10 +619,21 @@ impl Videos {
 
     /// 提交一条图生视频任务,拿回任务号。
     pub fn submit(&self, image_url: &str, prompt: &str) -> Result<String> {
+        self.submit_image(VideoImage::One(image_url), prompt)
+    }
+
+    /// 提交一条**首尾帧**任务:首帧和尾帧同一张图(见 `VideoImage`)。
+    pub fn submit_looped(&self, image_url: &str, prompt: &str) -> Result<String> {
+        self.submit_image(VideoImage::Pair([image_url, image_url]), prompt)
+    }
+
+    fn submit_image(&self, image_url: VideoImage<'_>, prompt: &str) -> Result<String> {
         let body = serde_json::to_string(&VideoRequest {
             model: self.cfg.model.as_str(),
             prompt,
             image_url,
+            duration: VIDEO_DURATION_SECS,
+            with_audio: false,
         })?;
         let mut response = self
             .agent
@@ -672,14 +716,55 @@ impl Videos {
 
     /// 整条路:提交 → 轮询到出片 → **当场下载**。
     pub fn animate(&self, image_url: &str, prompt: &str) -> Result<GeneratedVideo> {
-        let id = self.submit(image_url, prompt)?;
+        self.animate_with(image_url, prompt, false)
+    }
+
+    /// 同上,但**先按首尾帧提交**(首尾都给这张图 → 画面绕回起点,循环才接得上)。
+    ///
+    /// 为什么带降级:首尾帧是 `cogvideox-3` 的能力,换个模型(或者用户自己在设置里填了别家)
+    /// 可能不认这个形状,那时**退回单图重提一次**,而不是让整颗按钮失败 ——
+    /// 认不认首尾帧这件事,只有发出去才知道。
+    ///
+    /// 注意降级会**多花一次提交**:两轮里只要有一轮被受理,就只算一次出片。
+    /// 提交被拒(4xx)时服务商不会计费,所以这里亏的是几秒,不是钱。
+    pub fn animate_looped(&self, image_url: &str, prompt: &str) -> Result<GeneratedVideo> {
+        self.animate_with(image_url, prompt, true)
+    }
+
+    fn animate_with(
+        &self,
+        image_url: &str,
+        prompt: &str,
+        looped: bool,
+    ) -> Result<GeneratedVideo> {
+        let id = if looped {
+            match self.submit_looped(image_url, prompt) {
+                Ok(id) => id,
+                Err(err) => {
+                    tracing::warn!("首尾帧这条路没被受理({err:#}),退回单图重提一次");
+                    self.submit(image_url, prompt)?
+                }
+            }
+        } else {
+            self.submit(image_url, prompt)?
+        };
+        self.wait_and_download(&id)
+    }
+
+    /// 等一个**已经提交过**的任务出片,然后当场下载。
+    ///
+    /// 单独拎出来是因为它有两个入口:提交之后接着等(`animate_with`),
+    /// 以及照着任务号把**超时丢掉的那一条**捡回来(`fetch`)。
+    fn wait_and_download(&self, id: &str) -> Result<GeneratedVideo> {
         let started = std::time::Instant::now();
         loop {
-            match self.poll(&id)? {
+            match self.poll(id)? {
                 VideoProgress::Running => {
                     if started.elapsed() > VIDEO_WAIT_TIMEOUT {
                         return Err(anyhow!(
-                            "等了 {:.0} 分钟还没出片(任务 {id} 可能还在排队),先别管它,过会儿再试",
+                            "等了 {:.0} 分钟还没出片(任务 {id} 可能还在排队)。\
+                             它还在服务商那边跑、钱也已经花了,别重提 —— \
+                             过一会儿用 `--video-fetch {id} <库 id>` 把它取回来",
                             VIDEO_WAIT_TIMEOUT.as_secs_f32() / 60.0
                         ));
                     }
@@ -702,6 +787,15 @@ impl Videos {
                 }
             }
         }
+    }
+
+    /// 按**任务号**取回一条已经提交过的视频:不提交、不再花钱。
+    ///
+    /// 为什么需要它:被超时抛弃的那条任务,服务端**还在跑、而且已经计过费** ——
+    /// 重提一次就是又花 1 元买同一件事。任务号在日志和报错里都留着,照它捡回来就行。
+    pub fn fetch(&self, id: &str) -> Result<GeneratedVideo> {
+        tracing::info!("按任务号取回:{id}(不提新任务、不再计费)");
+        self.wait_and_download(id)
     }
 
     /// 把视频抓成字节。走同一个 agent(超时和 TLS 配置都现成)。
@@ -838,6 +932,11 @@ impl Client {
         format!("{host} · {}{thinking}", self.cfg.model)
     }
 
+    /// 看图用哪个模型(自检打印、设置页回显都要它)。
+    pub fn vision_model(&self) -> &str {
+        &self.cfg.vision_model
+    }
+
     /// `base_url` 后面补 `/chat/completions`。写成完整的 endpoint 也认(免得有人贴整条 URL 上来)。
     fn endpoint(&self) -> String {
         let base = self.cfg.base_url.trim_end_matches('/');
@@ -947,10 +1046,58 @@ impl Client {
         }
     }
 
+    /// **看图**写动效方案(元素级)。这条路才是"画面真的活起来"的那一步。
+    ///
+    /// 和 `plan_motion` 的分工:那个是"只有标题和提示词"时的**兜底**(看不到画面的模型
+    /// 只能写"缓慢推近"),这个是主路 —— 图就在手边(`entry.image` 的字节),没理由不给它看。
+    ///
+    /// 也**绝不返回 Err**:分析不出来就回空方案,调用方会退回 `fallback_motion_prompt`,
+    /// 用户点的那颗按钮总得有点动静。
+    pub fn plan_motion_vision(&self, photo: &Photo, image_bytes: &[u8]) -> MotionPlan {
+        let messages = vec![
+            Message::system(VISION_SYSTEM_PROMPT.to_string()),
+            Message::user_with_image(
+                motion_vision_request(photo),
+                image_data_url(image_bytes),
+            ),
+        ];
+        let raw = match self.chat_as(&self.cfg.vision_model, &messages) {
+            Ok(text) => text,
+            Err(err) => {
+                tracing::warn!("动效分析(看图)没跑成({err:#}),退回通用运镜");
+                return MotionPlan::default();
+            }
+        };
+        match serde_json::from_str::<MotionPlan>(extract_json(&raw).unwrap_or("{}")) {
+            Ok(mut plan) => {
+                plan.normalize();
+                if plan.is_empty() {
+                    tracing::warn!("动效分析没认出任何元素,退回通用运镜:{}", truncate(&raw, 200));
+                } else {
+                    tracing::info!("动效方案:镜头={} · {}个元素", plan.camera, plan.elements.len());
+                }
+                plan
+            }
+            Err(err) => {
+                // 这一步的失败几乎全是形状问题(数组写成字符串、字段名写错),原话留在日志里
+                tracing::warn!("动效分析的 JSON 读不懂({err}),退回通用运镜:{}", truncate(&raw, 200));
+                MotionPlan::default()
+            }
+        }
+    }
+
     /// 发一次 chat/completions,取回模型那段文本。
     fn chat(&self, messages: &[Message]) -> Result<String> {
+        self.chat_as(&self.cfg.model, messages)
+    }
+
+    /// 同上,但**换一个模型名**。看图那一步就是靠它:地址和 key 还是对话那套,模型换成视觉档。
+    ///
+    /// 模型名单独当参数,而不是临时改 `self.cfg.model`:那个字段是"这次要跟谁说话"的真相,
+    /// 改它会让并发的另一条路(比如同一轮里的生图降级)跟着串味。
+    fn chat_as(&self, model: &str, messages: &[Message]) -> Result<String> {
         let body = serde_json::to_string(&ChatRequest {
-            model: self.cfg.model.as_str(),
+            model,
             messages,
             temperature: 0.7,
             stream: false,
@@ -1148,6 +1295,117 @@ fn motion_request(photo: &Photo) -> String {
     )
 }
 
+/// 看图那一步给模型的话。
+///
+/// 标题和提示词**照样带上**,但只是"陪你看图"的旁白 —— 真正要说的是那句"请看图",
+/// 否则模型很可能顺着提示词复述一遍画面,而不是去看像素(它连画面里有没有车都不知道)。
+fn motion_vision_request(photo: &Photo) -> String {
+    format!(
+        "这张壁纸叫「{}」,生成它时那句提示词是:{}\n\
+         请**看这张图**,写下它会怎么动。",
+        photo.title, photo.prompt
+    )
+}
+
+/// 看图写方案的题目。**这里的每一句都是在修一个已经看到过的毛病**:
+/// - "只写图里看得到的东西":小模型爱自由发挥,给雪山湖加车流;
+/// - "九宫格"定位置:让它给像素框只会拿到编出来的数,而"左中"人和模型都说得准;
+/// - 每句限长:它习惯写小作文,一段话就把 512 字吃光了,还挤掉了别的元素;
+/// - 只输出 JSON:和生图那一步同一个态度(见文件头)。
+const VISION_SYSTEM_PROMPT: &str = "\
+你在为「动态壁纸」做动效分析。用户会给你**一张图**,你要写的是**它该怎么动**。\n\
+先看图:哪里是灯、哪里是路、天上是云还是星、有没有水面、有没有人和飞鸟。\n\
+然后**只输出一份 JSON**,不要解释、不要 markdown 代码块、不要多余的字:\n\
+{\"camera\":\"固定机位或缓慢推近或轻微环绕(挑一个)\",\
+\"elements\":[{\"kind\":\"元素名\",\"area\":\"九宫格位置\",\"action\":\"它怎么动\"}]}\n\
+规则:\n\
+1. **只写图里看得见的东西**。图里没有车就别写车流 —— 编出来的动作会让生成的视频里凭空出现东西。\n\
+2. `area` 只能是这十个之一:左上、上中、右上、左中、正中、右中、左下、下中、右下、全图。\n\
+3. `action` 要具体、要短(12 字以内),**而且不要重复元素名** —— 它是谓语,不是短语:\n\
+   写\"一明一暗地闪烁\",不要写\"灯光逐个亮灭闪烁\";写\"向右缓慢飘移\",不要写\"云向右缓慢飘移\"。\n\
+3b. 动作必须是**来回**的(闪烁、呼吸、荡漾、摇曳、飘来飘去):十秒结束时画面要能\n\
+   回到开头的样子。**不要写单向走到底的动作** —— \"逐个点亮\"\"越来越亮\"\"逐渐升起\"\n\
+   \"向右一直飘\"\"一路驶过\"都会让整段片子越走越远,循环回去就是一记明显的跳\n\
+   (实测:一句\"逐个亮灭\"让末帧整体比首帧亮了 10%,接缝差 14.2,比自然运动本身还大)。\n\
+   不知道怎么改就加\"来回\":云写\"缓缓飘来飘去\"不写\"向右一直飘\";车流写\"一辆接一辆驶过\"\n\
+   不写\"整队开走\";灯光写\"一明一暗地闪烁\"不写\"依次点亮\"。\n\
+4. 挑**最该动的 2~5 个**元素,按\"动了最出效果\"排前面。照着画面找:\n\
+   城市 / 街景 → 灯光、车流、招牌;天空 → 云、飞鸟;水面 → 波纹、倒影;\n\
+   植物 → 树叶、花海被风吹动;人物 → 衣摆、头发;室内 → 窗帘、烛火、烟雾。\n\
+   有就写,没有就**别编** —— 宁可只写两三个真的看得见的。\n\
+5. 动作要**缓慢、持续、可循环**(壁纸是长时间看的,剧烈运动会抢注意力);\n\
+   不要写镜头切换、不要写画面里出现新东西、不要写文字。\n\
+6. **只写会动的东西**。\"小木屋保持静止\"这种是凑数:它占了字数,而且视频模型可能反过来\
+   去动它。画面里只有两处会动,就只写两处。";
+
+/// 把元素级方案拼成**图生视频那句提示词**。
+///
+/// 削掉动作开头和元素名重合的那一段。
+///
+/// 模型经常把元素名也写进 `action`(提示词里交代过"别重复",它不一定听):
+/// `kind="灯光"` + `action="灯光逐个亮灭闪烁"`,还有更隐蔽的
+/// `kind="云朵"` + `action="云向右缓慢飘移"` —— 重合的只有"云"一个字。
+/// 拼成"左上云朵云向右缓慢飘移"读着还行,但视频模型看到两个"云"容易当成两处云。
+///
+/// 所以按**尽可能长的重合前缀**削掉,而且削完不能是空的:宁可留着重复,也不能把动作削没。
+fn trim_repeated_prefix<'a>(kind: &str, action: &'a str) -> &'a str {
+    let mut overlap = 0;
+    for (index, ch) in kind.char_indices() {
+        // 切点必须落在**字符边界**上:`char_indices` 给的是每个字符的起始字节,
+        // 结束位置得再加一个字长,不然会切进汉字中间(直接 panic)
+        let end = index + ch.len_utf8();
+        if action.starts_with(&kind[..end]) {
+            overlap = end;
+        }
+    }
+    if overlap > 0 && action.len() > overlap {
+        &action[overlap..]
+    } else {
+        action
+    }
+}
+///
+/// 为什么由本地拼、而不是直接把 JSON 丢给视频模型:视频模型不认识我们的数据结构,
+/// 它只吃一句自然语言;JSON 塞进去它会当成"要画这些东西"的清单。
+///
+/// 最后那句"结尾回到起始画面"是**给接缝用的**:我们要的是循环播放,
+/// 画面在末尾回到开头,接缝才看不清(见 §11.22 的"闭环")。
+pub fn video_prompt(plan: &MotionPlan) -> String {
+    if plan.is_empty() {
+        return fallback_motion_prompt().to_string();
+    }
+    let camera = if plan.camera.trim().is_empty() {
+        "固定机位"
+    } else {
+        plan.camera.trim()
+    };
+    let elements: Vec<String> = plan
+        .elements
+        .iter()
+        .map(|MotionElement { kind, area, action }| {
+            // 动作里那个重复的元素名要先削掉,不然会拼出"正中灯光灯光逐个亮灭闪烁"
+            let action = trim_repeated_prefix(kind, action);
+            format!("{area}{kind}{action}")
+        })
+        .collect();
+    // **先给收尾那句留出位置,再拿剩下的长度去装元素**。
+    //
+    // 原来是"整句拼完再截断",而截断砍掉的是**尾巴** —— 元素一多,被砍掉的那句恰好是
+    // "结尾回到起始画面"。那是循环能不能接上的一半(见 §11.22);少一个元素只是少动一处,
+    // 但闭环指令没了,十秒之后那一记跳就回来了。
+    //
+    // 收尾里那句"亮度、色彩和构图保持稳定"是**量出来的**:头一回出片末帧比首帧整体亮了
+    // 10%(93.3 → 103.2),接缝差 14.2,比画面自己的自然运动还大 —— 全是"逐个点亮"
+    // 这种单向动作攒出来的。动作来回是视觉模型那边教的,这句是给视频模型兜底的。
+    let head = format!("镜头{camera}。画面里:");
+    let tail = "。所有动作都是来回的,画面整体亮度、色彩和构图在整段里保持稳定,\
+                不要越来越亮或越来越暗;整体缓慢平稳,结尾回到起始画面,镜头与光线回到原位。";
+    // 再减 1:`truncate` 真切断的时候会补一个"…",那个字也占长度(实测超了 1 个字)
+    let budget =
+        MAX_VIDEO_PROMPT_CHARS.saturating_sub(head.chars().count() + tail.chars().count() + 1);
+    format!("{head}{}{tail}", truncate(&elements.join(";"), budget))
+}
+
 /// 模型没答上来时用的通用运镜。**必须是一句真能用的话**:这条路是兜底,
 /// 用户点完按钮总得有东西动起来,而不是弹一句"模型没接上"。
 /// 公开出去是因为调用方也可能直接用它:没配对话模型时,图生视频那条路照样要能跑。
@@ -1309,28 +1567,70 @@ impl Thinking {
 #[derive(Debug, Serialize)]
 struct Message {
     role: &'static str,
-    content: String,
+    content: Content,
+}
+
+/// 消息正文。OpenAI 那套里**同一个字段有两种形状**:
+/// - 纯文本:`"content": "…"`;
+/// - 带图:`"content": [{"type":"text",…},{"type":"image_url","image_url":{"url":"data:…"}}]`。
+///
+/// 做成 `untagged` 枚举,而不是"一律发数组":对话那条路一直在跑的是纯文本形状,而**不是每个模型
+/// 都吃数组**(硅基流动那类兼容实现里就有不收的)。多出来的那点复杂度只花在看图这一条路上。
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum Content {
+    Text(String),
+    Parts(Vec<Part>),
+}
+
+/// 多模态正文里的一小块。
+///
+/// `rename_all` 把 `ImageUrl` 写成 `image_url`(服务商要的就是这个字面量),
+/// **别照着 Rust 的命名习惯想当然** —— 写成 `imageUrl` 只会拿到一句"参数不对"。
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Part {
+    Text { text: String },
+    ImageUrl { image_url: UrlBox },
+}
+
+#[derive(Debug, Serialize)]
+struct UrlBox {
+    url: String,
 }
 
 impl Message {
     fn system(content: String) -> Self {
         Self {
             role: "system",
-            content,
+            content: Content::Text(content),
         }
     }
 
     fn user(content: String) -> Self {
         Self {
             role: "user",
-            content,
+            content: Content::Text(content),
         }
     }
 
     fn assistant(content: String) -> Self {
         Self {
             role: "assistant",
-            content,
+            content: Content::Text(content),
+        }
+    }
+
+    /// 一段话 + 一张图。图用 base64 内联(见 `image_data_url`)—— 本地图没有公网地址可给。
+    fn user_with_image(content: String, data_url: String) -> Self {
+        Self {
+            role: "user",
+            content: Content::Parts(vec![
+                Part::Text { text: content },
+                Part::ImageUrl {
+                    image_url: UrlBox { url: data_url },
+                },
+            ]),
         }
     }
 }
@@ -1352,16 +1652,37 @@ struct ResponseMessage {
     content: String,
 }
 
-/// 图生视频的请求体。**只有三个字段**,而且每个都是必需的:
-/// `image_url` 是那张图(base64 内联,见 `image_data_url`),`prompt` 是"它该怎么动"。
-/// 服务商那边还有尺寸 / 时长 / 音轨这些可选参数,但它们都由模型自己定 —— 壁纸不需要挑,
-/// 多写两个字段只会多两处会过期的假设。
+/// 图生视频的请求体。
+///
+/// `image_url` 是那张图(base64 内联,见 `image_data_url`),**也可以是两张**:智谱的
+/// `cogvideox-3` 支持"首尾帧"(`image_url: [首帧, 尾帧]`),而我们要的正是它 ——
+/// 首帧和尾帧都给**同一张图**,模型就得把画面绕回起点,循环播放才接得上。
+///
+/// `duration` / `with_audio` 是显式写出来的两个可选参数:
+/// - `duration: 10` —— 5 秒和 10 秒**同价**(1 元/次),而素材长一倍,头的抖动和尾的漂移都能丢;
+/// - `with_audio: false` —— 壁纸不放声音,带音轨只是白白胖一圈。
 #[derive(Debug, Serialize)]
 struct VideoRequest<'a> {
     model: &'a str,
     prompt: &'a str,
-    image_url: &'a str,
+    image_url: VideoImage<'a>,
+    duration: u32,
+    with_audio: bool,
 }
+
+/// `image_url` 的两种形状:一张图(字符串),或者首尾帧两张(数组)。
+///
+/// 用 `untagged` 而不是"永远发数组":单图那条路是**实测跑通的形状**(见
+/// `DEFAULT_VIDEO_MODEL` 的记录),没理由为了新功能去动它。
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum VideoImage<'a> {
+    One(&'a str),
+    Pair([&'a str; 2]),
+}
+
+/// 一条片子的时长(秒)。文档里**只支持 5 和 10**,而且两者同价 —— 那就没有理由选短的。
+const VIDEO_DURATION_SECS: u32 = 10;
 
 /// 任务状态。**提交和轮询返回的是同一个形状**(实测:提交回 `PROCESSING`,轮询回 `SUCCESS` +
 /// `video_result`),所以两边共用一份,不写两遍。
@@ -1560,5 +1881,191 @@ mod tests {
         let long = clean_motion_reply(&"推".repeat(500));
         assert!(long.ends_with('…'));
         assert!(long.chars().count() <= MAX_MOTION_PROMPT_CHARS + 1);
+    }
+
+    /// 视觉模型那份 JSON → 元素级提示词。
+    ///
+    /// 这条路的产物**直接就是发给图生视频那句话**,所以这里钉的是三件最容易写丢的事:
+    /// 每个元素都进得去、位置在元素前面(中文里"左中灯光在闪"才通顺)、末尾那句闭环要求还在。
+    #[test]
+    fn 元素级方案拼成一句提示词() {
+        let plan = MotionPlan {
+            camera: "固定机位".to_string(),
+            elements: vec![
+                MotionElement {
+                    kind: "灯光".to_string(),
+                    area: "左中".to_string(),
+                    action: "窗口逐个亮灭闪烁".to_string(),
+                },
+                MotionElement {
+                    kind: "车流".to_string(),
+                    area: "下中".to_string(),
+                    action: "沿道路从右往左流动".to_string(),
+                },
+            ],
+        };
+        let prompt = video_prompt(&plan);
+        assert!(prompt.contains("镜头固定机位"), "{prompt}");
+        assert!(prompt.contains("左中灯光窗口逐个亮灭闪烁"), "{prompt}");
+        assert!(prompt.contains("下中车流沿道路从右往左流动"), "{prompt}");
+        // 闭环要求**不能少**:循环播放能不能接上,一半靠这句(见 §11.22)
+        assert!(prompt.contains("结尾回到起始画面"), "{prompt}");
+    }
+
+    /// 方案是空的(看图失败 / 没配视觉模型)→ 必须退回那句通用运镜,而不是发一句空提示词。
+    /// 元素再多,收尾那几句也不能被截掉。
+    ///
+    /// 这条是**按实测补的**:截断砍的是尾巴,而元素一多、最先没的就是"结尾回到起始画面"。
+    /// 少一个元素只是少动一处;闭环那句没了,循环点上那一记跳就回来了(见 §11.22)。
+    #[test]
+    fn 元素再多也留得住闭环那句() {
+        let plan = MotionPlan {
+            camera: "固定机位".to_string(),
+            // 故意写超长:五条各 200 字,合起来远超 512 的上限,好把截断这一路逼出来
+            elements: (0..MotionPlan::MAX_ELEMENTS)
+                .map(|index| MotionElement {
+                    kind: format!("元素{index}"),
+                    area: "正中".to_string(),
+                    action: "缓慢地来回摆动".repeat(20),
+                })
+                .collect(),
+        };
+        let prompt = video_prompt(&plan);
+        assert!(
+            prompt.chars().count() <= MAX_VIDEO_PROMPT_CHARS,
+            "还是超了:{}",
+            prompt.chars().count()
+        );
+        assert!(prompt.contains("结尾回到起始画面"), "{prompt}");
+        assert!(prompt.ends_with("镜头与光线回到原位。"), "{prompt}");
+    }
+
+    /// 方案是空的(看图失败 / 没配视觉模型)→ 必须退回那句通用运镜,而不是发一句空提示词。
+    #[test]
+    fn 空方案退回通用运镜() {
+        assert_eq!(video_prompt(&MotionPlan::default()), fallback_motion_prompt());
+        // 只有镜头、没有元素也算空:视频模型需要的是"哪儿在动",不是"机位怎么走"
+        let camera_only = MotionPlan {
+            camera: "缓慢推近".to_string(),
+            elements: Vec::new(),
+        };
+        assert_eq!(video_prompt(&camera_only), fallback_motion_prompt());
+    }
+
+    /// 动作里又写了一遍元素名时不重复 —— 提示词里交代过"别重复",但模型不一定听。
+    /// 拼成"正中灯光灯光逐个亮灭闪烁"会让视频模型以为画面里有两处灯。
+    #[test]
+    fn 元素名和动作重复时只留一份() {
+        let plan = MotionPlan {
+            camera: "固定机位".to_string(),
+            elements: vec![
+                MotionElement {
+                    kind: "灯光".to_string(),
+                    area: "正中".to_string(),
+                    action: "灯光逐个亮灭闪烁".to_string(),
+                },
+                // 更隐蔽的那种:重合的只有"云"一个字
+                MotionElement {
+                    kind: "云朵".to_string(),
+                    area: "左上".to_string(),
+                    action: "云向右缓慢飘移".to_string(),
+                },
+            ],
+        };
+        let prompt = video_prompt(&plan);
+        assert!(prompt.contains("正中灯光逐个亮灭闪烁"), "{prompt}");
+        assert!(!prompt.contains("灯光灯光"), "{prompt}");
+        assert!(prompt.contains("左上云朵向右缓慢飘移"), "{prompt}");
+        assert!(!prompt.contains("云朵云"), "{prompt}");
+    }
+
+    /// 元素条数有上限、空字段要丢掉 —— 视觉模型的返法很随意(偶尔漏字段、偶尔多给一倍)。
+    #[test]
+    fn 元素清单会收口() {
+        let mut plan = MotionPlan {
+            camera: "  固定机位  ".to_string(),
+            elements: vec![
+                MotionElement {
+                    kind: " 云 ".to_string(),
+                    area: "上中".to_string(),
+                    action: " 向右缓慢飘移 ".to_string(),
+                },
+                // 没有 action 的:丢掉
+                MotionElement {
+                    kind: "车流".to_string(),
+                    area: "下中".to_string(),
+                    action: "   ".to_string(),
+                },
+                // 没有 kind 的:丢掉
+                MotionElement {
+                    kind: String::new(),
+                    area: "左上".to_string(),
+                    action: "闪烁".to_string(),
+                },
+            ],
+        };
+        plan.normalize();
+        assert_eq!(plan.camera, "固定机位");
+        assert_eq!(plan.elements.len(), 1);
+        assert_eq!(plan.elements[0].kind, "云");
+        assert_eq!(plan.elements[0].action, "向右缓慢飘移");
+
+        // 超量时只留前面几个(顺序就是"动了最出效果"的优先级,不能按别的规则砍)
+        let mut many = MotionPlan::default();
+        for index in 0..(MotionPlan::MAX_ELEMENTS + 3) {
+            many.elements.push(MotionElement {
+                kind: format!("元素{index}"),
+                area: "正中".to_string(),
+                action: "动".to_string(),
+            });
+        }
+        many.normalize();
+        assert_eq!(many.elements.len(), MotionPlan::MAX_ELEMENTS);
+        assert_eq!(many.elements[0].kind, "元素0");
+    }
+
+    /// 首尾帧那两种请求形状:**单图必须是字符串、首尾帧必须是两张的数组**。
+    /// 服务商认的是形状本身,写错就是一次白问(而且这条只有发出去才知道错了)。
+    #[test]
+    fn 图生视频请求的两种形状() {
+        let one = serde_json::to_value(&VideoRequest {
+            model: "cogvideox-3",
+            prompt: "镜头固定",
+            image_url: VideoImage::One("data:image/png;base64,AAA"),
+            duration: VIDEO_DURATION_SECS,
+            with_audio: false,
+        })
+        .unwrap();
+        assert!(one["image_url"].is_string(), "{one}");
+        assert_eq!(one["duration"], 10);
+        assert_eq!(one["with_audio"], false);
+
+        let pair = serde_json::to_value(&VideoRequest {
+            model: "cogvideox-3",
+            prompt: "镜头固定",
+            image_url: VideoImage::Pair(["data:image/png;base64,AAA", "data:image/png;base64,AAA"]),
+            duration: VIDEO_DURATION_SECS,
+            with_audio: false,
+        })
+        .unwrap();
+        let images = pair["image_url"].as_array().expect("首尾帧要发成数组");
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0], images[1], "首尾帧给的是同一张图");
+    }
+
+    /// 看图那条消息的形状:一段话 + 一张图,而且图的字段名必须是 `image_url`。
+    #[test]
+    fn 看图消息是文本加图片() {
+        let message = Message::user_with_image("看这张图".to_string(), "data:image/png;base64,AAA".to_string());
+        let value = serde_json::to_value(&message).unwrap();
+        assert_eq!(value["role"], "user");
+        let parts = value["content"].as_array().expect("带图时正文是数组");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,AAA");
+        // 纯文本那条路**不能**被改成数组形状:它一直在跑,不是每个模型都吃数组
+        let plain = serde_json::to_value(Message::user("你好".to_string())).unwrap();
+        assert!(plain["content"].is_string(), "{plain}");
     }
 }

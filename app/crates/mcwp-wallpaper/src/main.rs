@@ -127,6 +127,9 @@ struct ActivePhoto {
     /// **视频壁纸才有**的播放状态。挂在这里而不是另开一份全局状态:
     /// "现在屏幕上是什么"只有一个答案,分两处存就会出现"图换了、视频还在放"这种半拉状态。
     video: Option<VideoPlayback>,
+    /// 用户/桌面定下来的那个亮度(不含曝光校正)。每帧的 `params.brightness` 是它乘上
+    /// 视频当前的曝光增益算出来的 —— 单存一份"最终亮度"的话,校正一变就没法还原基准。
+    base_brightness: f32,
 }
 
 /// 正在放的视频。
@@ -138,11 +141,38 @@ struct VideoPlayback {
     player: mcwp_video::Player,
     /// 距离"该换下一帧"还差多久(秒)。每帧减去这一帧的真实耗时
     remaining: f32,
+    /// 这一轮**已经放到第几秒**(按真正贴出去的帧累加,重新循环时归零)。
+    /// 接缝那一小段全靠它认位置 —— 别拿 `remaining` 反推:那个值为了"落后就丢帧"被夹过。
+    elapsed: f32,
+    /// 这段多长(秒),来自解码器。
+    duration: f32,
+    /// **第一帧**的像素。循环点的"淡回第一帧"要淡到它身上(见 `LOOP_FADE_SECS`)。
+    first: Vec<u8>,
+    /// 混合用的缓冲。只在接缝那一小段用到 —— 复用同一个 `Vec`,
+    /// 别每帧再 `to_vec()` 一次(1080p 一帧 8 MB,一秒 30 次就是 250 MB/s 的无谓分配)。
+    scratch: Vec<u8>,
+    /// 这一段该校的**曝光增益**(1.0 = 不校)。入库时量好存进 `Photo`,这里只是拿来用。
+    seam_gain: f32,
 }
+
+/// 循环点前后多长一段用来"淡回第一帧"。
+///
+/// 为什么非要有这一段:模型给的头尾**不可能一模一样**(哪怕首尾帧都喂了同一张图 ——
+/// 它是"尽力绕回去",不是"保证绕回去"),而硬切回去就是那一下肉眼可见的跳。
+/// 有了它,循环点上那点差异被摊在 0.8 秒里抹平。
+///
+/// 为什么是 0.8 秒:短了盖不住,长了能看出"画面在往回并"(运动明显变慢)。
+/// 视频短于 3.2 秒时按 1/4 收窄(`tail_alpha` 里夹住)—— 整段都在淡等于整段都不对劲。
+const LOOP_FADE_SECS: f32 = 0.8;
 
 impl VideoPlayback {
     /// 打开一段视频并把第一帧贴上去。
-    fn open(renderer: &mut Renderer, path: &std::path::Path, screen: (u32, u32)) -> Result<Self> {
+    fn open(
+        renderer: &mut Renderer,
+        path: &std::path::Path,
+        screen: (u32, u32),
+        seam_gain: f32,
+    ) -> Result<Self> {
         let mut player = mcwp_video::Player::open(path, screen)
             .with_context(|| format!("打开视频失败:{}", path.display()))?;
         let info = player.info();
@@ -155,7 +185,25 @@ impl VideoPlayback {
         Ok(Self {
             player,
             remaining: 0.0,
+            elapsed: 0.0,
+            duration: info.duration.as_secs_f32(),
+            first,
+            scratch: Vec::new(),
+            seam_gain,
         })
+    }
+
+    /// 这一帧该乘的曝光增益:开头照原样(1.0),到末尾线性走到 `seam_gain`。
+    ///
+    /// 为什么摊在整段、而不是只在接缝那一小段:`seam_gain` 说的是"末帧比首帧亮多少"。
+    /// 只在最后 0.8 秒里补,那 0.8 秒就会变成一段明显的忽明忽暗;摊到十秒里,
+    /// 每帧只差千分之几,看不出在动,而接缝上两边正好对平。
+    fn exposure_gain(&self) -> f32 {
+        if self.duration <= 0.0 || !self.seam_gain.is_finite() {
+            return 1.0;
+        }
+        let progress = (self.elapsed / self.duration).clamp(0.0, 1.0);
+        1.0 + (self.seam_gain - 1.0) * progress
     }
 
     /// 走一帧的时钟;该换帧了就把新的一帧贴上去。
@@ -173,18 +221,87 @@ impl VideoPlayback {
         self.remaining = (self.remaining - step).min(step);
 
         let info = self.player.info();
-        if let Some(pixels) = self.player.next_frame()? {
-            renderer.set_video_frame(info.width, info.height, pixels)?;
-            return Ok(());
+        // 强度按**这一帧的时间**算,然后时间往后走一帧:刚开头那一帧的时间是 0(强度也是 0),
+        // 一循环完立刻归零,不会在接缝上多算一帧。
+        let alpha = loop_fade_alpha(self.elapsed, self.duration);
+        self.elapsed = (self.elapsed + step).min(self.duration);
+        // 借用要拆开:`next_frame` 会把 `player` 借走,而贴帧还要用 `first` / `scratch`。
+        let mut restarted = false;
+        let Self {
+            player,
+            first,
+            scratch,
+            ..
+        } = self;
+        match player.next_frame()? {
+            Some(pixels) => {
+                present_frame(renderer, info.width, info.height, pixels, alpha, first, scratch)?
+            }
+            // 放完了:**从头再来**。生图服务商给的只有十秒左右,循环播放才像一张壁纸;
+            // 停在最后一帧会让桌面看起来"死"了。最后那几帧已经淡回第一帧(见 `LOOP_FADE_SECS`),
+            // 所以这一次重头开始是**接得上**的 —— 原来这里是一记硬切,用户看到的就是那一下跳。
+            None => {
+                player.rewind()?;
+                restarted = true;
+                if let Some(pixels) = player.next_frame()? {
+                    // 新一轮的第一帧:强度恒为 0,别把第一帧和它自己混一遍
+                    present_frame(renderer, info.width, info.height, pixels, 0.0, first, scratch)?;
+                }
+            }
         }
-        // 放完了:**从头再来**。生图服务商给的只有五秒左右,循环播放才像一张壁纸;
-        // 停在最后一帧会让桌面看起来"死"了。
-        self.player.rewind()?;
-        if let Some(pixels) = self.player.next_frame()? {
-            renderer.set_video_frame(info.width, info.height, pixels)?;
+        if restarted {
+            self.elapsed = 0.0;
         }
         Ok(())
     }
+}
+
+/// 循环点的混合强度:0 = 照原样,1 = 完全是第一帧。
+///
+/// 写成纯函数是为了能单测 —— 这段的取值区间(什么时候开始淡、淡到多少)**肉眼看不出来**,
+/// 只能靠测试钉住两端的边界。
+fn loop_fade_alpha(elapsed: f32, duration: f32) -> f32 {
+    // 短片别整段都在淡:那等于整段都不对劲
+    let fade = LOOP_FADE_SECS.min(duration * 0.25);
+    if fade <= 0.0 || duration <= fade {
+        return 0.0;
+    }
+    let u = (elapsed - (duration - fade)) / fade;
+    if u <= 0.0 {
+        return 0.0;
+    }
+    // smoothstep:两端斜率为 0,"开始淡了"那一刻看不出来
+    let u = u.min(1.0);
+    u * u * (3.0 - 2.0 * u)
+}
+
+/// 贴一帧:接缝那一小段先和第一帧混一下,再上屏。
+fn present_frame(
+    renderer: &mut Renderer,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    alpha: f32,
+    first: &[u8],
+    scratch: &mut Vec<u8>,
+) -> Result<()> {
+    // 长度对不上就别混了(换分辨率 / 换解码器实现时可能出现),照原样贴更安全。
+    if alpha <= 0.0 || pixels.len() != first.len() {
+        renderer.set_video_frame(width, height, pixels)?;
+        return Ok(());
+    }
+    scratch.clear();
+    scratch.extend_from_slice(pixels);
+    // 只混 RGB —— alpha 通道这一路恒为 255,混它没意义
+    for (dst, src) in scratch.chunks_exact_mut(4).zip(first.chunks_exact(4)) {
+        for channel in 0..3 {
+            let value = dst[channel] as f32;
+            let target = src[channel] as f32;
+            dst[channel] = (value + (target - value) * alpha) as u8;
+        }
+    }
+    renderer.set_video_frame(width, height, scratch)?;
+    Ok(())
 }
 
 /// 一轮「做成动态壁纸」跑完的产物。
@@ -335,6 +452,7 @@ fn show_photo(
         photo,
         // 静图:上屏时把播放器丢掉 —— 它可能正是上一张动态壁纸留下来的
         video: None,
+        base_brightness: brightness,
     })
 }
 
@@ -346,12 +464,13 @@ fn show_video(
     screen: (u32, u32),
     brightness: f32,
 ) -> Result<ActivePhoto> {
-    let video = VideoPlayback::open(renderer, path, screen)?;
+    let video = VideoPlayback::open(renderer, path, screen, photo.seam_gain)?;
     Ok(ActivePhoto {
         // 参数用 `from_video`:关掉 Ken Burns 和效果层(见那里的说明)
         params: PhotoParams::from_video(&photo, screen.0, screen.1, brightness),
         photo,
         video: Some(video),
+        base_brightness: brightness,
     })
 }
 
@@ -396,18 +515,20 @@ fn start_video_run(
             .map_err(|err| format!("{err:#}"));
         let _ = sender.send(VideoOutcome { run: run_id, result });
     });
-    format!("正在把「{title}」做成动态壁纸(约一分钟,期间可以接着聊)")
+    // 别说"约一分钟":实测能从一分钟拉到十几分钟(排队),说短了用户会以为它卡死了
+    format!("正在把「{title}」做成动态壁纸(要几分钟,高峰会更久;期间可以接着聊)")
 }
 
 /// 把库里某一张(静图)做成动态壁纸。**在后台线程里跑**,产物从 `VideoOutcome` 回来。
 ///
-/// 三步:
-/// 1. 让**文本模型**写一句"它该怎么动"(`plan_motion`)。生图那句说的是"画面里有什么",
-///    这一句说的是"它该怎么动",后者没人写过 —— 这正是第二个智能体存在的理由。
-/// 2. **图生视频**(一分钟左右)。
-/// 3. 把 mp4 落成临时文件、解出第一帧当封面。
+/// 四步:
+/// 1. **看图**(免费视觉模型)写一份**元素级**方案:灯在哪儿怎么闪、车流朝哪边走(`plan_motion_vision`)。
+///    这一步是"画面真的活起来"和"整张图被推近"之间的分水岭 —— 看不到画面的模型只会写万能运镜。
+/// 2. 把方案拼成**图生视频那句提示词**(`video_prompt`);方案是空的就退回老路(文本模型 / 通用运镜)。
+/// 3. **图生视频**:首尾帧都给这张图(**闭环**)+ 10 秒(见 `mcwp_ai::animate_looped`)。
+/// 4. 把 mp4 落成临时文件、解出第一帧当封面。
 ///
-/// 第 3 步为什么要绕一下:解码器是从**文件**读的(Media Foundation 没有"从内存解一段视频"
+/// 第 4 步为什么要绕一下:解码器是从**文件**读的(Media Foundation 没有"从内存解一段视频"
 /// 的现成路径),而封面必须在主线程入库之前就拿到(入库要连着封面一起写)。所以这里落一份
 /// 临时文件,解完**立刻删掉** —— 正式的 mp4 由主线程写进壁纸库。
 fn animate_photo(
@@ -421,15 +542,54 @@ fn animate_photo(
     let image_bytes = std::fs::read(&entry.image)
         .with_context(|| format!("读不出这张图:{}", entry.image.display()))?;
     let image_url = mcwp_ai::image_data_url(&image_bytes);
-    // 没配对话模型也要能跑:动效提示词退化成一句通用的运镜(见 `fallback_motion_prompt`)
-    let motion = match chat {
-        Some(chat) => chat.plan_motion(&source),
-        None => mcwp_ai::fallback_motion_prompt().to_string(),
+    // 1 · 元素级方案。库里已经存过一份就**直接用** —— 同一张图重做一遍时不必再看第二眼,
+    //     两次分析给的元素也未必一样(见 `MotionPlan` 的说明)。
+    let plan = match chat {
+        Some(_) if !source.motion_plan.is_empty() => source.motion_plan.clone(),
+        Some(chat) => chat.plan_motion_vision(&source, &image_bytes),
+        None => mcwp_spec::MotionPlan::default(),
     };
-    let generated = videos.animate(&image_url, &motion)?;
+    // 2 · 拼提示词。
+    // 没配对话模型也要能跑:动效提示词退化成一句通用的运镜(见 `fallback_motion_prompt`)
+    let motion = if plan.is_empty() {
+        match chat {
+            Some(chat) => chat.plan_motion(&source),
+            None => mcwp_ai::fallback_motion_prompt().to_string(),
+        }
+    } else {
+        mcwp_ai::video_prompt(&plan)
+    };
+    tracing::info!(
+        "这一轮的动效提示词({}):{motion}",
+        if plan.is_empty() { "通用" } else { "元素级" }
+    );
+    // 方案**写回原图那一份**:它的主人是这张图(见 `photos::save_motion_plan`)。
+    // 只在这张图还没有方案时写 —— 库里已经有一份就说明是"拿来用"的那条路,不用重复写。
+    if !plan.is_empty() && source.motion_plan.is_empty() {
+        if let Err(err) = photos::save_motion_plan(entry, &plan) {
+            // 写不进去不该让整条链路失败:方案已经在内存里,片子照样能做
+            tracing::warn!("动效方案没写回库里那张({err:#})");
+        }
+    }
+    // 3 · **首尾帧**(首帧=尾帧=这张图)逼模型把画面绕回起点,循环才接得上;时长要 10 秒
+    //     (和 5 秒同价,素材翻倍 —— 头尾的抖动都能丢)。
+    let generated = videos.animate_looped(&image_url, &motion)?;
+    video_payload_from_bytes(&source, plan, generated.bytes, screen)
+}
 
+/// 把一段**已经拿到手的**成片收拾成入库载荷:解出第一帧当封面,取尺寸与时长。
+///
+/// 单独一个函数,是因为成片有**两个来源**:刚提交回来的那条(`animate_photo`),
+/// 以及照任务号捡回来的那条(`--video-fetch`)。超时丢掉的任务服务端还在跑、钱也已经花了,
+/// 捡回来这条必须走**同一套落地逻辑** —— 少一个封面,库里那张条目就是个死链。
+fn video_payload_from_bytes(
+    source: &Photo,
+    plan: mcwp_spec::MotionPlan,
+    bytes: Vec<u8>,
+    screen: (u32, u32),
+) -> Result<VideoPayload> {
     let temp = std::env::temp_dir().join(format!("mcwp-animate-{}.mp4", source.id));
-    std::fs::write(&temp, &generated.bytes)
+    std::fs::write(&temp, &bytes)
         .with_context(|| format!("写临时视频失败:{}", temp.display()))?;
     let decoded = mcwp_video::Player::open(&temp, screen).and_then(|mut player| {
         let info = player.info();
@@ -437,11 +597,18 @@ fn animate_photo(
             .next_frame()?
             .map(|frame| frame.to_vec())
             .ok_or_else(|| anyhow::anyhow!("这段视频一帧都解不出来"))?;
-        Ok((info, pixels))
+        // 顺手把**整段解一遍**,量出末尾比开头亮多少。它只在这里量一次,多花几秒,
+        // 而这一步本来就在等几分钟的出片;换来的播放侧每帧都能拿它把曝光拉回一致。
+        let first = pixels.clone();
+        let mut last = first.clone();
+        while let Some(frame) = player.next_frame()? {
+            last = frame.to_vec();
+        }
+        Ok((info, pixels, seam_gain_for(&first, &last)))
     });
     // 解完就删。失败也删 —— 中间产物留在盘上,下次"文件被占着"的怪事就说不清了。
     let _ = std::fs::remove_file(&temp);
-    let (info, pixels) = decoded.context("新视频解不出第一帧(这台机器的解码器没装上?)")?;
+    let (info, pixels, seam_gain) = decoded.context("新视频解不出第一帧(这台机器的解码器没装上?)")?;
 
     let cover = mcwp_image::Bitmap {
         width: info.width,
@@ -463,6 +630,10 @@ fn animate_photo(
         palette: mcwp_spec::palette_from_rgba(&cover.rgba, cover.width, cover.height),
         seed: (created & 0xffff_ffff) as u32,
         created,
+        // 方案**跟着视频一起入库**:下次想再做一遍(换个模型、或者只是重试)时,
+        // 不用再去看一遍图;而"这张动效是怎么来的"也留了个痕迹。
+        motion_plan: plan,
+        seam_gain,
         ..Photo::default()
     };
     // **id 必须重新生成**:接着用原图那个 id 的话,这条视频的封面(`<id>.png`)
@@ -470,7 +641,7 @@ fn animate_photo(
     photo.normalize();
     Ok(VideoPayload {
         photo,
-        mp4: generated.bytes,
+        mp4: bytes,
         cover,
     })
 }
@@ -1023,6 +1194,99 @@ fn run_plan_selftest(request: &str, current_id: Option<&str>) -> Result<()> {
     println!("动效:{}", plan.motion.summary());
     Ok(())
 }
+
+/// `--plan-motion <库 id>`:只跑**看图写动效**那一步,把元素级方案和最终那句提示词摊开。
+///
+/// 为什么必须有这个入口:这一步之后的**图生视频要花钱**(1 元/次,见 `mcwp_ai::Videos`),
+/// 而"画面怎么动"这件事得反复调 —— 元素选没选对、动作写得像不像话,看方案一眼就知道。
+/// 这一步自己(视觉模型)是免费的,所以调提示词可以随便跑。
+fn run_motion_selftest(id: &str) -> Result<()> {
+    let chat = mcwp_ai::Client::new(mcwp_ai::Config::load()?);
+    let entry = photos::load(id).with_context(|| format!("库里找不到这张:{id}"))?;
+    let bytes = std::fs::read(&entry.image)
+        .with_context(|| format!("读不出这张图:{}", entry.image.display()))?;
+    println!("对话:{}", chat.describe());
+    println!("看图:{}", chat.vision_model());
+    println!("这张:{}", entry.photo.title);
+    println!("生成它那句话:{}", entry.photo.prompt);
+
+    println!("\n---- 分析出的元素级方案 ----");
+    let started = Instant::now();
+    let plan = chat.plan_motion_vision(&entry.photo, &bytes);
+    println!("耗时:{:.1}s", started.elapsed().as_secs_f32());
+    println!("{}", serde_json::to_string_pretty(&plan)?);
+
+    let prompt = mcwp_ai::video_prompt(&plan);
+    println!("\n---- 这一步之后会发给图生视频的提示词({} 字)----", prompt.chars().count());
+    println!("{prompt}");
+    println!(
+        "\n(真要出片还得花 1 元/次:「{}」+ 首尾帧同一个文件 + 10 秒)",
+        mcwp_ai::DEFAULT_VIDEO_MODEL
+    );
+    Ok(())
+}
+
+/// `--animate-save <库 id>`:`--animate` 的**不打扰桌面**版 —— 跑完那条花钱的链路,
+/// 落进壁纸库,但**不上屏、不建窗口**。
+///
+/// 为什么值得单独留一个入口:出片一次 1 元、还要等几分钟,而验证它的时候最怕两件事 ——
+/// ① 验证本身把用户的桌面换掉;② 和正在跑的面板抢"单实例"那把锁(抢不到就什么都不做,
+/// 白等一场还看不出来为什么)。这条路在后台跑、产物进库,想换上去在面板里点一下就行。
+fn run_animate_save(id: &str, screen: (u32, u32)) -> Result<()> {
+    let chat = mcwp_ai::Client::new(mcwp_ai::Config::load()?);
+    let videos = mcwp_ai::Videos::new(mcwp_ai::VideosConfig::load()?);
+    let entry = photos::load(id).with_context(|| format!("库里找不到这张:{id}"))?;
+    println!("对话:{}", chat.describe());
+    println!("图生视频:{}", videos.describe());
+    println!("这张:{}", entry.photo.title);
+    let started = Instant::now();
+    let payload = animate_photo(Some(&chat), &videos, &entry, screen)?;
+    let saved = photos::save_video(&payload.photo, &payload.mp4, &payload.cover)?;
+    println!(
+        "出片并入库({:.0}s):「{}」{} 毫秒 · {:.1} MB",
+        started.elapsed().as_secs_f32(),
+        saved.photo.title,
+        saved.photo.duration_ms,
+        payload.mp4.len() as f32 / 1_048_576.0,
+    );
+    println!("落点:{}", saved.meta.display());
+    Ok(())
+}
+
+/// `--video-fetch <任务号> <库 id>`:把一条**已经提交过**的视频取回来入库。
+///
+/// 为什么要留这么一条路:出片那一步是花钱的(1 元/次),而服务商的排队能从 1 分钟
+/// 拉到十几分钟 —— 客户端不可能一直等着,只能超时收手,那 1 元就悬在半空:
+/// 服务端还在跑,结果没人取。任务号在日志和报错里都留着,这条路负责照号捡回来 ——
+/// **不提交、不再花钱**,只做"下载 + 落地"。
+fn run_video_fetch(task_id: &str, photo_id: &str, screen: (u32, u32)) -> Result<()> {
+    let videos = mcwp_ai::Videos::new(mcwp_ai::VideosConfig::load()?);
+    let entry = photos::load(photo_id).with_context(|| format!("库里找不到这张:{photo_id}"))?;
+    println!("图生视频:{}", videos.describe());
+    println!("源图:{}", entry.photo.title);
+    println!("任务号:{task_id}");
+    let started = Instant::now();
+    let generated = videos.fetch(task_id)?;
+    // 动效方案沿用库里存的那份(分析过就有,没有就是空方案):取回一条已经算好的视频,
+    // 不该再花掉一次看图 —— 何况这一次的成片早就生成了,再看图也改不了它。
+    let payload = video_payload_from_bytes(
+        &entry.photo,
+        entry.photo.motion_plan.clone(),
+        generated.bytes,
+        screen,
+    )?;
+    let saved = photos::save_video(&payload.photo, &payload.mp4, &payload.cover)?;
+    println!(
+        "取回并入库({:.0}s):「{}」{} 毫秒 · {:.1} MB",
+        started.elapsed().as_secs_f32(),
+        saved.photo.title,
+        saved.photo.duration_ms,
+        payload.mp4.len() as f32 / 1_048_576.0,
+    );
+    println!("落点:{}", saved.meta.display());
+    Ok(())
+}
+
 /// `--images-selftest`:把整条生图链路跑一遍,原样摊开。
 ///
 /// 和 `--plan` 是一对:那个看"提示词那一步",这个看"图有没有出来"。
@@ -1062,11 +1326,118 @@ fn run_images_selftest(request: &str, screen: (u32, u32)) -> Result<()> {
 }
 
 /// `--video-selftest <mp4>`:把一段 mp4 解一遍,原样摊开。
+/// 抽样均值:和"第 N 帧"那几行用同一个步长,读数能直接对着看。
+fn sample_mean(frame: &[u8]) -> f32 {
+    if frame.is_empty() {
+        return f32::NAN;
+    }
+    let sampled = frame.len() / 997 + 1;
+    let sum: u64 = frame.iter().step_by(997).map(|byte| *byte as u64).sum();
+    sum as f32 / sampled as f32
+}
+
+/// 首帧 / 末帧 → 播放到头时该乘的**曝光增益**(1.0 = 不用校)。
+///
+/// 只校**整体亮度**,因为这条路的证据就是这么说的:实测接缝那 13.5 里,有 4.5 是
+/// "整段一路变亮"(把亮度对齐之后只剩 9.5);剩下的两个画面本身就不一样,乘系数救不了 ——
+/// 那部分只能靠接缝那段淡回去盖,或者重出片(见 §11.22)。
+fn seam_gain_for(first: &[u8], last: &[u8]) -> f32 {
+    let (mean_first, mean_last) = (rgb_mean(first), rgb_mean(last));
+    if !mean_first.is_finite() || !mean_last.is_finite() || mean_last < 1.0 {
+        return 1.0;
+    }
+    // 夹在 0.75~1.35:真量出一个 2 倍的比值,那说明这不是"曝光在飘",而是解码或画面出了别的事,
+    // 硬按它乘只会把画面搞得忽明忽暗。
+    let gain = (mean_first / mean_last).clamp(0.75, 1.35);
+    if (gain - 1.0).abs() < 0.02 {
+        // 差得太小就别校:每帧都要多乘一次,换来的却是看不出的一点点
+        1.0
+    } else {
+        gain
+    }
+}
+
+/// 把"想让画面乘的增益"换算成着色器那个 `brightness` 参数。
+///
+/// 着色器里是 `color * (0.45 + 0.85 * brightness)`,**不是**直接乘 brightness ——
+/// 想给画面整体乘一个增益,得先把那个偏移解出来。不解的话校正会偏,而且偏得不多不少,
+/// 正好会让你以为"校了,但好像没什么用"。
+fn exposure_brightness(base: f32, gain: f32) -> f32 {
+    if !gain.is_finite() {
+        return base;
+    }
+    // 0.45 + 0.85 * b' = gain * (0.45 + 0.85 * b)
+    ((gain * (0.45 + 0.85 * base) - 0.45) / 0.85).clamp(0.2, 1.6)
+}
+
+/// RGB 三路的均值(不含 alpha)。
+fn rgb_mean(frame: &[u8]) -> f32 {
+    if frame.is_empty() || frame.len() % 4 != 0 {
+        return f32::NAN;
+    }
+    let mut sum = 0u64;
+    let mut count = 0u64;
+    for pixel in frame.chunks_exact(4) {
+        for channel in 0..3 {
+            sum += pixel[channel] as u64;
+            count += 1;
+        }
+    }
+    sum as f32 / count.max(1) as f32
+}
+
+/// 把 `b` 整体乘一个增益,让它和 `a` 的平均亮度对齐(所谓的 gain match)。
+///
+/// 为什么不在播放时就做这件事、而先在这里量:`gain match` 只有**曝光差占大头**时才有意义。
+/// 要是两帧的差主要是构图跑了,乘一个系数只是让画面变亮变暗,一点都帮不上忙 ——
+/// 先量出"对齐之后还剩多少",再决定要不要动播放那边。
+fn gain_matched(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let (mean_a, mean_b) = (rgb_mean(a), rgb_mean(b));
+    if a.len() != b.len() || !mean_a.is_finite() || !mean_b.is_finite() || mean_b < 1.0 {
+        return b.to_vec();
+    }
+    let gain = (mean_a / mean_b).clamp(0.5, 2.0);
+    // 一张 256 项的表,一次乘好;逐像素就只剩查表,7 MB 一帧也扛得住
+    let lut: Vec<u8> = (0..=255)
+        .map(|value| (value as f32 * gain).round().clamp(0.0, 255.0) as u8)
+        .collect();
+    let mut out = b.to_vec();
+    for pixel in out.chunks_exact_mut(4) {
+        for channel in 0..3 {
+            pixel[channel] = lut[pixel[channel] as usize];
+        }
+    }
+    out
+}
+
+/// 两帧的平均绝对差(0 = 一模一样)。
+///
+/// 只比 RGB 三路:第四路是恒定的 alpha(255),算进去只会把读数按比例稀释。
+/// 长度对不上就直接给 `NaN` —— 尺寸中途变了的话,这个数本来就没有意义。
+fn mean_abs_diff(a: &[u8], b: &[u8]) -> f32 {
+    if a.is_empty() || a.len() != b.len() || a.len() % 4 != 0 {
+        return f32::NAN;
+    }
+    let mut sum = 0u64;
+    let mut count = 0u64;
+    for (pixel_a, pixel_b) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        for channel in 0..3 {
+            sum += pixel_a[channel].abs_diff(pixel_b[channel]) as u64;
+            count += 1;
+        }
+    }
+    sum as f32 / count.max(1) as f32
+}
+
+/// `--video-selftest <mp4>`:把一段 mp4 解一遍,原样摊开。
 ///
 /// 为什么要它:视频这条路上最容易坏的恰恰是**解码这一段**(MF 的初始化、格式协商、
 /// 这台机器上装不装得上那个色彩转换器),而它坏掉的表现只有一句"画面是黑的" ——
 /// 那种时候从"库、渲染器、AI 客户端"里找是白费劲。所以这里只解一个文件:
 /// 不解库、不建窗口、不碰网络,把"解出来多少帧、每帧多大、像素大概什么样"直接打出来。
+///
+/// 顺带把**循环点**也量出来(首帧↔末帧 vs 首帧↔中点):"播放完这一下跳不跳"原本只能靠
+/// 盯着桌面等十秒,而现在它有数 —— 接不上是模型的锅还是播放的锅,一眼能分开。
 fn run_video_selftest(path: &str, screen: (u32, u32)) -> Result<()> {
     let started = Instant::now();
     let mut player = mcwp_video::Player::open(std::path::Path::new(path), screen)?;
@@ -1082,9 +1453,16 @@ fn run_video_selftest(path: &str, screen: (u32, u32)) -> Result<()> {
     let begin = Instant::now();
     let mut frames = 0usize;
     let mut frame_bytes = 0usize;
+    // 首帧和末帧各留一份:循环点接不接得上,是**比出来的**,不是盯出来的(见文末那几行)。
+    let mut first: Vec<u8> = Vec::new();
+    let mut last: Vec<u8> = Vec::new();
     while let Some(frame) = player.next_frame()? {
         frames += 1;
         frame_bytes = frame.len();
+        if frames == 1 {
+            first = frame.to_vec();
+        }
+        last = frame.to_vec();
         if frames <= 3 {
             // 抽样均值能一眼看出"是不是全黑"。另外第四字节恒为 255:要是均值贴着 255,
             // 说明读到的是 alpha 那一列 —— 那是 stride 用错了。
@@ -1103,6 +1481,50 @@ fn run_video_selftest(path: &str, screen: (u32, u32)) -> Result<()> {
         frame_bytes / 1024,
         frames as f64 / elapsed
     );
+    // 循环点:把**头尾那两帧差多少**量出来。
+    //
+    // 为什么要量:首尾帧闭环这件事从外部看只有一个信号 —— 播放完那一下跳不跳。
+    // 盯着桌面等十秒去判,既看不准又受当时画面影响;而"末帧离首帧有多远"是个数。
+    // 再拿"首帧到中点那帧"当基线,这个数才有尺度:两者相当 = 闭环根本没生效
+    // (模型没往起点绕,或者首尾帧那一路被退回成单图提交了)。
+    let halfway = {
+        player.rewind()?;
+        let target = frames / 2;
+        let mut frame_at = Vec::new();
+        for index in 0..target {
+            if let Some(frame) = player.next_frame()? {
+                if index + 1 == target {
+                    frame_at = frame.to_vec();
+                }
+            }
+        }
+        frame_at
+    };
+    let seam = mean_abs_diff(&first, &last);
+    let span = mean_abs_diff(&first, &halfway);
+    // 把末帧整体乘一个增益、跟首帧的亮度对齐再看一次:**剩下的才是构图上的差**。
+    // 这个数决定修法 —— 剩下不多,说明"整体曝光在爬"(播放时按帧校正增益就能压掉);
+    // 剩下还很多,说明画面真的跑走了(只能重出片,或者把片子反过来放)。
+    let corrected = mean_abs_diff(&first, &gain_matched(&first, &last));
+    // 亮度这一栏是为了分清两种"接不上":**整体变亮/变暗**(全局曝光在飘)和
+    // **画面真的跑走了**(构图变了)。前者能靠校正压下去,后者只能靠重出片或倒放。
+    println!(
+        "亮度(采样均值):首帧 {:.1} · 中点 {:.1} · 末帧 {:.1}",
+        sample_mean(&first),
+        sample_mean(&halfway),
+        sample_mean(&last)
+    );
+    println!("接缝:首帧↔末帧 平均差 {seam:.2}(基线:首帧↔中点那帧 {span:.2})");
+    println!("接缝(只把整体亮度对齐后){corrected:.2} —— 剩下的才是构图差");
+    if seam.is_nan() || span.is_nan() {
+        println!("  → 帧长度对不齐,这个数没意义(尺寸中途变了?)");
+    } else if seam <= span * 0.25 {
+        println!("  → 头尾基本绕回了起点,0.8 秒的淡回足以把这点差抹平");
+    } else if seam <= span * 0.6 {
+        println!("  → 头尾明显比半途近,但没到「绕回」:淡回能盖住跳变,看得出画面在往回并");
+    } else {
+        println!("  → 头尾和半途一样远:**闭环没生效**(模型没绕回起点,或首尾帧被退回成单图提交)");
+    }
     // 倒回开头再解一帧:循环播放全靠这一步,而它在 MF 上是最容易"静默不生效"的一处
     player.rewind()?;
     println!(
@@ -1359,6 +1781,14 @@ struct Args {
     plan: Option<String>,
     /// `--plan` 的伴生参数:带上"现在屏幕上那张"(库 id),复现面板里的上下文
     plan_current: Option<String>,
+    /// `--motion-plan <库 id>`:只跑**看图写动效**那一步,把元素级方案和最终那句提示词打印出来
+    motion_plan: Option<String>,
+    /// `--animate-save <库 id>`:跑完整条「做成动态壁纸」链路(**要花钱那一步**),
+    /// 产物进壁纸库,但**不上屏、不建窗口**
+    animate_save: Option<String>,
+    /// `--video-fetch <任务号> <库 id>`:照着任务号把**已经提交过**的那条视频取回来入库。
+    /// 不提交、不再花钱 —— 专门给"等超时丢掉的那 1 元"准备的回收口
+    video_fetch: Option<(String, String)>,
     /// 把库里某一张(静图)**做成动态壁纸**,跑完整条链路再上屏(不建面板)
     animate: Option<String>,
     /// 只解一段 mp4、打印几帧的统计就退出(不建窗口)—— 视频解码那条路唯一的自检入口。
@@ -1388,6 +1818,9 @@ impl Args {
             images_selftest: None,
             plan: None,
             plan_current: None,
+            motion_plan: None,
+            animate_save: None,
+            video_fetch: None,
             animate: None,
             video_selftest: None,
             stats_interval: Duration::from_secs(5),
@@ -1481,6 +1914,21 @@ impl Args {
                     args.animate = value.cloned();
                     i += 2;
                 }
+                "--plan-motion" => {
+                    args.motion_plan = value.cloned();
+                    i += 2;
+                }
+                "--animate-save" => {
+                    args.animate_save = value.cloned();
+                    i += 2;
+                }
+                "--video-fetch" => {
+                    // 两个值:任务号在前(要"取回"的就是它),库 id 在后(要挂到哪张图上)
+                    let task = value.cloned().unwrap_or_default();
+                    let photo = raw.get(i + 2).cloned().unwrap_or_default();
+                    args.video_fetch = Some((task, photo));
+                    i += 3;
+                }
                 "--video-selftest" => {
                     args.video_selftest = value.cloned();
                     i += 2;
@@ -1522,6 +1970,9 @@ fn main() -> Result<()> {
         || args.selftest
         || args.images_selftest.is_some()
         || args.plan.is_some()
+        || args.motion_plan.is_some()
+        || args.animate_save.is_some()
+        || args.video_fetch.is_some()
         || args.video_selftest.is_some();
     if !is_diagnostic_run && !claim_single_instance() {
         return Ok(());
@@ -1536,6 +1987,25 @@ fn main() -> Result<()> {
     // 「只看提示词那一步」:一次调用几秒钟,调提示词时不用等图、不用建窗口、不进库。
     if let Some(request) = args.plan.as_deref() {
         run_plan_selftest(request, args.plan_current.as_deref())?;
+        return Ok(());
+    }
+    // 「只看动效分析」:看图一次、免费,把元素级方案和最终那句提示词摊开 ——
+    // 出片那一步要花钱(1 元/次),所以**调提示词必须能只跑前半段**。
+    if let Some(id) = args.motion_plan.as_deref() {
+        run_motion_selftest(id)?;
+        return Ok(());
+    }
+    // 「出片但不上屏」:这一步真要花钱(1 元/次)也要等几分钟,所以它必须能**在后台验证** ——
+    // 不建窗口(也就不会跟正在跑的面板抢单实例那把锁),更不会把用户桌面换掉。
+    if let Some(id) = args.animate_save.as_deref() {
+        // 屏幕尺寸在这里只用来定"封面解到多大",还不知道真实屏幕,按 1080p 给
+        run_animate_save(id, (1920, 1080))?;
+        return Ok(());
+    }
+    // 「照任务号取回」:超时丢掉的那条任务**服务端还在跑、钱已经花了**,重提就是再花一次。
+    // 它同样不建窗口,只是把一个已经算好的结果下载下来入库。
+    if let Some((task, photo)) = args.video_fetch.as_ref() {
+        run_video_fetch(task, photo, (1920, 1080))?;
         return Ok(());
     }
     // 「只解一段视频」同理:不建窗口、不占桌面,接解码那条路时唯一需要的调试入口。
@@ -1668,7 +2138,7 @@ fn main() -> Result<()> {
         match photos::load(&id) {
             Ok(entry) => match videos.as_ref() {
                 Some(animator) => {
-                    tracing::info!("`--animate`:把「{}」做成动态壁纸(约一分钟)", entry.photo.title);
+                    tracing::info!("`--animate`:把「{}」做成动态壁纸(要几分钟)", entry.photo.title);
                     let payload =
                         animate_photo(ai.as_ref(), animator, &entry, screen).context("`--animate` 失败")?;
                     active = Some(adopt_video(
@@ -2469,6 +2939,13 @@ fn main() -> Result<()> {
                     tracing::warn!("视频放不下去了({err:?}),先停在当前这一帧");
                     photo.video = None;
                 }
+                // 曝光校正:AI 短片常常一路变亮(实测末帧比首帧亮 10%),按帧把它拉回一致,
+                // 接缝两边才对得平。静图没有播放器,增益恒为 1,这一行等于没做事。
+                let gain = photo
+                    .video
+                    .as_ref()
+                    .map_or(1.0, |video| video.exposure_gain());
+                photo.params.brightness = exposure_brightness(photo.base_brightness, gain);
                 renderer.render(&photo.params)?;
                 frames_in_window += 1;
                 rendered_total += 1;
@@ -2505,4 +2982,91 @@ fn main() -> Result<()> {
     // 收尾再落一次:自检时长到点、托盘退出这些路径都是从循环里直接跳出来的。
     sessions.flush();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 接缝混合的强度曲线。
+    ///
+    /// 这条曲线**肉眼看不出来**(它就是"最后 0.8 秒慢慢并回第一帧"),只能靠测试钉住两端:
+    /// 窗口之前必须是 0(否则整段都在往回并),末尾必须到 1(否则那一记硬切还在)。
+    #[test]
+    fn 接缝淡入两端是零和一() {
+        let duration = 10.0;
+        assert_eq!(loop_fade_alpha(0.0, duration), 0.0);
+        assert_eq!(loop_fade_alpha(9.0, duration), 0.0, "还没进窗口,不该淡");
+        assert_eq!(
+            loop_fade_alpha(duration - LOOP_FADE_SECS, duration),
+            0.0,
+            "窗口的第一帧是从 0 开始的,不能一上来就有强度"
+        );
+        let middle = loop_fade_alpha(9.6, duration);
+        assert!(middle > 0.0 && middle < 1.0, "窗口中间是半淡:{middle}");
+        assert!(
+            (loop_fade_alpha(duration, duration) - 1.0).abs() < 1e-6,
+            "末尾必须完全等于第一帧"
+        );
+    }
+
+    /// 强度只能往上走:中途回落会让画面"弹"一下,比硬切还难看。
+    #[test]
+    fn 接缝淡入是单调的() {
+        let duration = 10.0;
+        let mut previous = 0.0f32;
+        for step in 0..=200 {
+            let at = 9.2 + LOOP_FADE_SECS * (step as f32 / 200.0);
+            let value = loop_fade_alpha(at, duration);
+            assert!(value >= previous - 1e-6, "在 {at}s 处回落了:{value} < {previous}");
+            previous = value;
+        }
+    }
+
+    /// 曝光增益:末帧比首帧亮多少,就乘多少回来;差得太小、或者量出离谱的比值,一律不校。
+    #[test]
+    fn 曝光增益按首末帧的亮度算() {
+        // 末帧整体比首帧亮 10% → 播到头要把画面压掉约 9%
+        let first = vec![100u8, 100, 100, 255];
+        let last = vec![110u8, 110, 110, 255];
+        let gain = seam_gain_for(&first, &last);
+        assert!((gain - 0.909).abs() < 0.01, "算出来是 {gain}");
+        // 两帧一样亮 → 不校(1.0),别为看不出的事每帧多算一次
+        assert_eq!(seam_gain_for(&first, &first), 1.0);
+        // 坏输入:空帧、长度不一致,都不该让画面变黑
+        assert_eq!(seam_gain_for(&[], &last), 1.0);
+        assert_eq!(seam_gain_for(&first, &[]), 1.0);
+        assert_eq!(seam_gain_for(&first, &[200u8, 200]), 1.0);
+        // 比值离谱(这里是 10 倍)→ 夹到 1.35,而不是照乘
+        assert_eq!(seam_gain_for(&[200u8, 200, 200, 255], &[20u8, 20, 20, 255]), 1.35);
+    }
+
+    /// 亮度换算:着色器的 brightness 带着一个偏移,不能直接当增益乘。
+    #[test]
+    fn 亮度增益换算对得上着色器() {
+        // 增益 1 = 原样
+        for base in [0.4f32, 1.0, 1.4] {
+            assert!((exposure_brightness(base, 1.0) - base).abs() < 1e-5, "{base}");
+        }
+        // 换算完再套回着色器那条式子,得真的等于"原样乘增益"
+        let base = 1.0f32;
+        for gain in [0.9f32, 0.95, 1.05, 1.1] {
+            let shader = |b: f32| 0.45 + 0.85 * b;
+            let got = shader(exposure_brightness(base, gain));
+            let want = gain * shader(base);
+            assert!((got - want).abs() < 1e-4, "增益 {gain}:{got} vs {want}");
+        }
+    }
+
+    /// 短片别整段都在淡 —— 那等于整段都不对劲,所以窗口按片子长度的 1/4 收窄。
+    #[test]
+    fn 短片的淡入窗口会收窄() {
+        // 1 秒的片子:窗口是 0.25 秒(不是 0.8 秒),所以 0.5 秒处还没开始淡
+        assert_eq!(loop_fade_alpha(0.5, 1.0), 0.0);
+        assert!(loop_fade_alpha(0.9, 1.0) > 0.0);
+        assert!((loop_fade_alpha(1.0, 1.0) - 1.0).abs() < 1e-6);
+        // 时长为 0 / 解不出长度的坏输入:不淡,照原样放
+        assert_eq!(loop_fade_alpha(0.0, 0.0), 0.0);
+        assert_eq!(loop_fade_alpha(5.0, 0.0), 0.0);
+    }
 }

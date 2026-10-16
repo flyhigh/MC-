@@ -177,6 +177,71 @@ impl MotionRecipe {
     }
 }
 
+/// `seam_gain` 的缺省值:**1.0 = 不校**。
+///
+/// 单独写成函数是因为 serde 的 `default` 要一个函数路径,而 f32 的 `Default` 是 0.0 ——
+/// 那个值在这条路上意味着"整段画面乘 0",也就是全黑。
+pub fn default_seam_gain() -> f32 {
+    1.0
+}
+
+/// 画面里的**一个元素**,以及它该怎么动。
+///
+/// 为什么要有它:一张城市夜景要"活"起来,靠的是**灯在闪、车在走、云在飘**这些**分开的事**;
+/// 让整张图缓慢推近,看起来只是"照片被放大了" —— 用户的原话是"不能仅仅依靠放大整张图片"。
+///
+/// `area` 是九宫格里的位置,不是像素坐标:生产者是视觉模型,它给不出可靠的像素框,
+/// 硬要只会拿到一堆编出来的数;而"左上角那片灯"这种描述,人和模型都说得准。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct MotionElement {
+    /// 元素类型:灯光 / 车流 / 云 / 飞鸟 / 水面 / 衣摆 / 树叶 / 烟雾 / 人物…
+    pub kind: String,
+    /// 它在画面的哪儿:左上 / 上中 / 右上 / 左中 / 正中 / 右中 / 左下 / 下中 / 右下
+    pub area: String,
+    /// 它怎么动:亮灭闪烁 / 从左往右流动 / 缓慢飘移 / 被风吹起…
+    pub action: String,
+}
+
+/// 一张图"动起来"的方案:**整体镜头 + 逐个元素**。
+///
+/// 它有两个消费者,所以值得落盘成资产,而不是用完就扔:
+/// 1. 图生视频那句提示词(元素级动作由它拼出来);
+/// 2. 程序化动效层(见 §11.22):灯光在哪儿、车流朝哪边,都得从这里读 ——
+///    重看一遍图当然也能拿到,但那是又一次模型调用,而且两次结果未必一样。
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct MotionPlan {
+    /// 整体镜头:固定机位 / 缓慢推近 / 轻微环绕…
+    pub camera: String,
+    pub elements: Vec<MotionElement>,
+}
+
+impl MotionPlan {
+    /// 最多认几个元素。
+    ///
+    /// 上限是**给提示词留的**:图生视频那句最长 512 字(接口限制,见 `mcwp_ai::MAX_VIDEO_PROMPT_CHARS`),
+    /// 元素越多,每个分到的字越少,模型反而抓不住重点。四五个已经够"画面是活的"了。
+    pub const MAX_ELEMENTS: usize = 5;
+
+    /// 砍掉空字段、限制条数。视觉模型的返法很随意:偶尔漏字段、偶尔多写两倍的量。
+    pub fn normalize(&mut self) {
+        self.camera = self.camera.trim().to_string();
+        self.elements.retain(|element| {
+            !element.kind.trim().is_empty() && !element.action.trim().is_empty()
+        });
+        self.elements.truncate(Self::MAX_ELEMENTS);
+        for element in &mut self.elements {
+            element.kind = element.kind.trim().to_string();
+            element.area = element.area.trim().to_string();
+            element.action = element.action.trim().to_string();
+        }
+    }
+
+    /// 一个元素都没有 —— 该退回"通用运镜"那种写法。
+    pub fn is_empty(&self) -> bool {
+        self.elements.is_empty()
+    }
+}
+
 /// 这张壁纸是**一张静图**,还是**一段视频**(由某张图生成的动态壁纸)。
 ///
 /// 为什么要有这个字段,而不是"看目录里有没有 `.mp4` 就够了":
@@ -234,6 +299,22 @@ pub struct Photo {
     pub kind: PhotoKind,
     /// 视频多长(毫秒)。静图恒为 0 —— 面板上那一行"5.1 秒"就来自它。
     pub duration_ms: u32,
+    /// 循环点的**曝光校正**:播放到结尾时该给画面乘的增益(1.0 = 不用校)。
+    ///
+    /// 为什么会有这个数:图生视频给的片子常常**一路变亮或变暗**(实测同一条片子的末帧
+    /// 比首帧亮 10%),切回开头就是一次亮度跳。播放时按这个系数把整段的曝光慢慢拉回一致,
+    /// 那点差就摊在十秒里,而不是堆在接缝那一瞬间(见 §11.22)。
+    ///
+    /// 它是**量出来的**,不是猜的:入库时把整段解一遍,拿首帧与末帧的平均亮度算比值。
+    /// 老记录没有这个字段,缺省是 1.0(不校)—— 不能是 0.0,那会让整段画面全黑。
+    #[serde(default = "default_seam_gain")]
+    pub seam_gain: f32,
+    /// 这张图"该怎么动"的**元素级**方案(见 `MotionPlan`)。
+    ///
+    /// 空的就是没分析过:从桌面壁纸抬进来的、以及这份字段存在之前生成的,都是空的。
+    /// 落盘是为了让它当**资产**用 —— 图生视频那句提示词和程序化动效层都吃它,
+    /// 而且"重新做成动态壁纸"时不用再看一遍图(省一次调用,也省得两次结果不一样)。
+    pub motion_plan: MotionPlan,
 }
 
 impl Default for Photo {
@@ -251,6 +332,8 @@ impl Default for Photo {
             created: 0,
             kind: PhotoKind::Image,
             duration_ms: 0,
+            motion_plan: MotionPlan::default(),
+            seam_gain: default_seam_gain(),
         }
     }
 }
@@ -294,6 +377,12 @@ impl Photo {
         }
         self.palette = palette;
         self.motion.normalize();
+        self.motion_plan.normalize();
+        // 没量过 / 量出来是坏值 → 不校(1.0)。**别当成"不用管"**:0.0 会让画面全黑,
+        // 而它是 f32 的 `Default`,所以老记录、手写 JSON 都可能带一个 0 进来。
+        if !self.seam_gain.is_finite() || self.seam_gain <= 0.0 {
+            self.seam_gain = default_seam_gain();
+        }
         if self.width == 0 {
             self.width = 1920;
         }
