@@ -15,7 +15,7 @@
 //! 从当前壁纸的调色板推出来,窗口是无边框的,DWM 圆角与拖动在 `mcwp_platform::glass_window`。
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
@@ -108,6 +108,13 @@ pub enum UiEvent {
     MakeVideoFromCurrent,
     /// 「用当前壁纸」:把桌面上原来那张抬进来当作库里的新一张
     AdoptWallpaper,
+    /// 「导入图片」:开系统选文件框,把选中的那张收进库里。选文件与入库都在壁纸侧做 ——
+    /// 面板连"文件在哪"都不该知道(它不碰文件系统,这是它和其它几件事的共同规矩)。
+    ImportWallpaper,
+    /// 点了消息里那张预览图:把库里这张的**大图**打开(壁纸侧解码 → `PanelHandle::show_viewer`)
+    OpenPhoto(String),
+    /// 大图那一层关掉了:把那份像素放掉
+    ViewerClosed,
     /// 面板窗口被关掉了
     Closed,
 }
@@ -126,6 +133,8 @@ pub struct PanelState {
     pub library: Vec<LibraryEntryView>,
     /// 当前生效的壁纸在库里的 id;空串表示桌面上那张不在库里(比如刚抬进来的系统壁纸)
     pub library_current: String,
+    /// 当前生效的那张在 `library` 里的下标;-1 = 不在库里。库页那颗「删除」靠它。
+    pub library_current_index: i32,
 }
 
 /// 面板要显示的一条库记录(**能跨线程**的那份)。
@@ -360,12 +369,31 @@ impl PanelHandle {
         });
     }
 
-    /// 整块回填壁纸库(存了新壁纸、面板切到库页时用)。
-    pub fn refresh_library(&self, library: Vec<LibraryEntryView>, current: String) {
+    /// 打开「看大图」那一层。像素由壁纸侧现解现送(缩略图放大看是糊的)。
+    pub fn show_viewer(&self, title: String, pixels: (u32, u32, Vec<u8>)) {
+        let weak = self.weak.clone();
+        let (width, height, rgba) = pixels;
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(panel) = weak.upgrade() {
+                let buffer = slint::SharedPixelBuffer::clone_from_slice(&rgba, width, height);
+                panel.set_viewer(slint::Image::from_rgba8(buffer));
+                panel.set_viewer_title(title.into());
+                panel.set_viewing(true);
+            }
+        });
+    }
+
+    /// 关掉大图:**把那份像素换掉**。
+    ///
+    /// 一行 `set_viewing(false)` 只是不画它了,几 MB 到几十 MB 的 RGBA 会一直挂在窗口上
+    /// (面板是个常驻窗口,不是一次性进程)。所以这里连图一起换成空的。
+    pub fn clear_viewer(&self) {
         let weak = self.weak.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(panel) = weak.upgrade() {
-                apply_library(&panel, library, current);
+                panel.set_viewing(false);
+                panel.set_viewer(slint::Image::default());
+                panel.set_viewer_title(Default::default());
             }
         });
     }
@@ -544,6 +572,28 @@ fn build(state: &PanelState, events: Sender<UiEvent>) -> Result<Panel> {
         let tx = events.clone();
         ui.on_adopt_wallpaper(move || {
             let _ = tx.send(UiEvent::AdoptWallpaper);
+        });
+    }
+
+    {
+        let tx = events.clone();
+        ui.on_import_wallpaper(move || {
+            let _ = tx.send(UiEvent::ImportWallpaper);
+        });
+    }
+
+    {
+        // 预览图点开:只把 id 递出去。解多大、从哪儿解、解不开怎么办,都在壁纸侧。
+        let tx = events.clone();
+        ui.on_open_photo(move |id| {
+            let _ = tx.send(UiEvent::OpenPhoto(id.to_string()));
+        });
+    }
+
+    {
+        let tx = events.clone();
+        ui.on_viewer_closed(move || {
+            let _ = tx.send(UiEvent::ViewerClosed);
         });
     }
 
@@ -755,6 +805,18 @@ fn panel_hwnd(weak: &slint::Weak<Panel>, cell: &Rc<Cell<isize>>) -> Option<isize
     }
 }
 
+// 「库 id → 缩略图」的一张索引,只活在**面板线程**里。
+//
+// 会话消息里的配图要在 `apply_session` 里贴出来,而那个函数手上只有会话数据(壁纸库是
+// 另一次 `refresh_library` 回填进来的)。两个办法:把库一起塞进每次会话回填(于是每发一条
+// 消息都要重传几十张缩略图的裸像素),或者在这里留一份索引。选后者。
+//
+// 里面存的就是库页网格用的**同一个 `slint::Image` 句柄**:Slint 的 Image 是共享像素的引用
+// 语义,clone 一次不会多占一份内存,所以这份索引不增加新的峰值。
+thread_local! {
+    static THUMBS: RefCell<HashMap<String, slint::Image>> = RefCell::new(HashMap::new());
+}
+
 /// 把会话数据写进面板:左栏列表、右栏标题与消息。
 fn apply_session(ui: &Panel, session: &SessionState) {
     ui.set_conversations(slint::ModelRc::new(slint::VecModel::from(
@@ -762,9 +824,28 @@ fn apply_session(ui: &Panel, session: &SessionState) {
     )));
     ui.set_current_conversation(session.current as i32);
     ui.set_session_title(session.title.clone().into());
-    ui.set_messages(slint::ModelRc::new(slint::VecModel::from(
-        session.messages.clone(),
-    )));
+    // 消息里的配图在这一步和壁纸库的缩略图对上号(见 `library_thumbs`)。
+    let bubbles: Vec<ChatBubble> = session
+        .messages
+        .iter()
+        .map(|message| {
+            let id = message.photo.to_string();
+            let shot = if id.is_empty() {
+                None
+            } else {
+                THUMBS.with(|thumbs| thumbs.borrow().get(&id).cloned())
+            };
+            ChatBubble {
+                mine: message.mine,
+                text: message.text.clone(),
+                photo_id: message.photo.clone(),
+                shot: shot.clone().unwrap_or_default(),
+                has_shot: shot.is_some(),
+                photo_gone: !id.is_empty() && shot.is_none(),
+            }
+        })
+        .collect();
+    ui.set_messages(slint::ModelRc::new(slint::VecModel::from(bubbles)));
     ui.set_message_revision(session.revision);
 }
 
@@ -778,8 +859,15 @@ fn apply_state(ui: &Panel, state: &PanelState) {
     ui.set_accent(colors.accent());
 
     ui.set_wallpaper_title(state.title.clone().into());
+    // **先库后会话**:消息里的预览图是从库缩略图那份索引里取的(`THUMBS`),顺序反了的话
+    // 面板第一次打开时索引还是空的,历史消息里的配图会全变成"这张已经不在壁纸库里了"。
+    apply_library(
+        ui,
+        state.library.clone(),
+        state.library_current.clone(),
+        state.library_current_index,
+    );
     apply_session(ui, &state.session);
-    apply_library(ui, state.library.clone(), state.library_current.clone());
 }
 
 /// 把壁纸库写进面板:网格本身 + 当前生效的是哪一张(画成选中态)。
@@ -787,12 +875,29 @@ fn apply_state(ui: &Panel, state: &PanelState) {
 /// **缩略图在这一步才装成 `slint::Image`** —— 这个函数跑在面板线程里,而裸像素是
 /// 跨线程送过来的(见 `LibraryEntryView`)。装的时候要把像素复制一份给 Slint:
 /// `SharedPixelBuffer` 拿的是所有权。
-fn apply_library(ui: &Panel, library: Vec<LibraryEntryView>, current: String) {
+fn apply_library(ui: &Panel, library: Vec<LibraryEntryView>, current: String, current_index: i32) {
+    // 当前那张的标题要在把 items 交出去之前取出来(交出去之后就只剩 Slint 那边的模型了)
+    let current_title = if current_index >= 0 {
+        library
+            .get(current_index as usize)
+            .map(|entry| entry.title.clone())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
     let items: Vec<LibraryItem> = library
         .into_iter()
         .map(|entry| {
             let (width, height, ref pixels) = entry.thumb;
             let buffer = slint::SharedPixelBuffer::clone_from_slice(pixels, width, height);
+            let thumb = slint::Image::from_rgba8(buffer);
+            // 顺手进索引:消息里那条回复的配图靠它贴出来(见 `THUMBS` 的说明)
+            THUMBS.with(|thumbs| {
+                thumbs
+                    .borrow_mut()
+                    .insert(entry.id.to_string(), thumb.clone());
+            });
             LibraryItem {
                 id: entry.id.into(),
                 title: entry.title.into(),
@@ -800,12 +905,14 @@ fn apply_library(ui: &Panel, library: Vec<LibraryEntryView>, current: String) {
                 summary: entry.summary.into(),
                 accent: entry.accent,
                 video: entry.video,
-                thumb: slint::Image::from_rgba8(buffer),
+                thumb,
             }
         })
         .collect();
     ui.set_library(slint::ModelRc::new(slint::VecModel::from(items)));
     ui.set_library_current(current.into());
+    ui.set_library_current_index(current_index);
+    ui.set_library_current_title(current_title.into());
 }
 
 /// 回填设置页的模型配置。

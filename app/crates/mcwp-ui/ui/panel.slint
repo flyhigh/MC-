@@ -84,9 +84,31 @@ global Glass {
 
 // 参数视图里的一张预设卡片(原来是"壁纸"页的主内容)。
 // 一条消息。`mine` = 用户自己发的那条。
+//
+// `photo` 是这条回复对应那张壁纸在**壁纸库里的 id**(空串 = 这条消息没有配图)。
+// 存的是 id 而不是图片本身:这份结构是**落盘用的**(见 sessions.rs 的 StoredMessage),
+// 而图在库里本来就有一份,存路径/存 id 才不会把 sessions.json 撑成几百兆。
 export struct ChatMessage {
     mine: bool,
     text: string,
+    photo: string,
+}
+
+// 面板侧要画的一条消息:`ChatMessage` 是**存起来**的那份(只有 id),这里多带来已经装好的
+// 缩略图 —— 消息里的配图要和壁纸库的缩略图对上号,而那个"对号"只有面板线程做得到
+// (两边在 `apply_session` / `apply_library` 里各来一次,见 mcwp-ui 的说明)。
+//
+// `slint::Image` 不是 `Send`,所以它只能出现在这一层,不能跟着 `ChatMessage` 一起跨线程。
+export struct ChatBubble {
+    mine: bool,
+    text: string,
+    photo-id: string,
+    shot: image,
+    /// 这条消息有配图,而且图还在(缩略图拿到了)
+    has-shot: bool,
+    /// 有配图 id 但库里已经找不到那张了(用户把它删了)—— 界面上明说一句,
+    /// 比"图消失了但话还在"更好懂。
+    photo-gone: bool,
 }
 
 // 左栏里的一条历史对话。
@@ -118,17 +140,28 @@ component Pill inherits Rectangle {
     in property <string> text: "";
     in property <bool> primary: false;
     in property <color> accent: #0A84FF;
+    // 文字的色。默认跟着全局的 label 走;「删除」那种要显眼一点的就单独给一个色。
+    in property <color> ink: Glass.label;
+    // 宽度默认是"三四个字的胶囊",库页那颗「做成动态壁纸」要宽一些。
+    in property <length> box-width: 104px;
+    // 灰掉 = 这个动作此刻不成立(比如库里没有可删的那张)。灰掉之后不再收点击。
+    in property <bool> enabled: true;
 
     callback clicked();
 
     height: 34px;
-    width: 104px;
+    width: root.box-width;
+    opacity: root.enabled ? 1 : 0.4;
     border-radius: self.height / 2;
     border-width: 1px;
-    border-color: primary ? accent.with-alpha(0.55) : Glass.hairline;
+    border-color: primary
+        ? accent.with-alpha(0.55)
+        : (touch.has-hover && root.enabled ? Glass.hairline : Glass.hairline-dim);
     background: primary
         ? (touch.has-hover ? accent.brighter(0.12) : accent)
-        : (touch.pressed ? Glass.fill-strong : (touch.has-hover ? Glass.fill-hover : Glass.fill));
+        : (touch.pressed && root.enabled
+            ? Glass.fill-strong
+            : (touch.has-hover && root.enabled ? Glass.fill-hover : Glass.fill));
     animate background { duration: 140ms; easing: ease-out; }
 
     // 顶部高光:一条横向渐变的细线,让胶囊有玻璃厚度
@@ -144,7 +177,7 @@ component Pill inherits Rectangle {
 
     t := Text {
         text: root.text;
-        color: Glass.label;
+        color: root.ink;
         font-size: 13px;
         font-weight: root.primary ? 600 : 400;
         horizontal-alignment: center;
@@ -154,8 +187,8 @@ component Pill inherits Rectangle {
     }
 
     touch := TouchArea {
-        mouse-cursor: pointer;
-        clicked => { root.clicked(); }
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { if (root.enabled) { root.clicked(); } }
     }
 }
 
@@ -451,20 +484,23 @@ component ConversationMenu inherits Rectangle {
 
 // 壁纸库里的一格:一张**真缩略图** + 底下一行标题。
 //
-// 尺寸写死(168 × 116)而不是让布局撑出来:网格靠这两个数算行列(见 `CELL-W` / `CELL-H`
-// 那两个常量),而布局撑出来的尺寸面板读不到 —— 和右键菜单那两个数同一个道理,改记得一起改。
+// 尺寸由外面传进来(`cell-w` / `cell-h`),而不是自己撑出来:网格要靠"每行几格、每格多宽"
+// 算坐标,而布局撑出来的尺寸面板读不到(和右键菜单那两个数同一个道理)。格子跟着视口变宽,
+// 所以这里的画面部分用 `parent.width` 算,不写死像素。
 component LibraryCell inherits Rectangle {
     in property <image> thumb;
     in property <string> heading: "";
     in property <bool> selected: false;
     in property <bool> video: false;
     in property <color> accent: #0A84FF;
+    in property <length> cell-w: 168px;
+    in property <length> cell-h: 116px;
 
     callback picked();
     callback menu-requested(length, length);
 
-    width: 168px;
-    height: 116px;
+    width: root.cell-w;
+    height: root.cell-h;
     border-radius: Glass.r-card;
     border-width: 1px;
     border-color: root.selected ? root.accent.with-alpha(0.6) : Glass.hairline-dim;
@@ -477,7 +513,8 @@ component LibraryCell inherits Rectangle {
         x: 6px;
         y: 6px;
         width: parent.width - 12px;
-        height: 94px;
+        // 底下一行标题固定占 22px(6px 下边距 + 16px 字高)
+        height: parent.height - 28px;
         source: root.thumb;
         image-fit: cover;
     }
@@ -506,9 +543,9 @@ component LibraryCell inherits Rectangle {
 
     Text {
         x: 8px;
-        y: 100px;
+        y: parent.height - 22px;
         width: parent.width - 16px;
-        height: 14px;
+        height: 16px;
         text: root.heading;
         color: root.selected ? Glass.label : Glass.label-2;
         font-size: 11px;
@@ -706,6 +743,12 @@ component MessageRow inherits HorizontalLayout {
     in property <string> body: "";
     in property <bool> mine: false;
     in property <color> accent: #0A84FF;
+    // 这条回复生出来的那张壁纸(缩略图)。`has-shot` 为假时下面那条竖排里就只有一个气泡。
+    in property <image> shot;
+    in property <bool> has-shot: false;
+    in property <bool> photo-gone: false;
+
+    callback preview();
 
     // 靠边:用户消息靠右、回复靠左,两侧各留 6px 给圆角喘口气。
     //
@@ -730,11 +773,56 @@ component MessageRow inherits HorizontalLayout {
 
         VerticalLayout {
             padding: 10px;
+            spacing: 8px;
             Text {
                 text: root.body;
                 wrap: word-wrap;
                 color: Glass.label;
                 font-size: 13px;
+            }
+
+            // 生出来的那张图,直接贴在回复下面当预览。
+            //
+            // 为什么不是"点文字开大图":这条回复说的是"已换上「雪山湖晨光」",而**画面本身**
+            // 才是用户想确认的东西 —— 看不到就得切到库页去找。缩略图就在手上(和库页同一份),
+            // 贴出来几乎不花代价。
+            if root.has-shot : Rectangle {
+                width: 244px;
+                height: 148px;
+                border-radius: 10px;
+                // 圆角要裁图:Slint 的 Image 自己没有圆角,不裁就是一张方角图压在一个圆角底上
+                clip: true;
+                border-width: 1px;
+                border-color: shot-touch.has-hover
+                    ? root.accent.with-alpha(0.55)
+                    : Glass.hairline-dim;
+                background: Glass.fill;
+
+                Image {
+                    width: 100%;
+                    height: 100%;
+                    source: root.shot;
+                    image-fit: cover;
+                }
+
+                shot-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.preview(); }
+                }
+            }
+
+            if root.has-shot : Text {
+                text: "点一下看大图";
+                color: Glass.label-3;
+                font-size: 10px;
+                horizontal-alignment: left;
+            }
+
+            // 配图被删了:说明白,别让用户以为是加载失败
+            if root.photo-gone : Text {
+                text: "这张已经不在壁纸库里了";
+                color: Glass.label-3;
+                font-size: 11px;
             }
         }
     }
@@ -860,10 +948,29 @@ export component Panel inherits Window {
     in property <[ConversationItem]> conversations;
     in-out property <int> current-conversation: 0;
     in property <string> session-title: "";
-    in property <[ChatMessage]> messages;
+    // 面板画的是 `ChatBubble`(**带装好的缩略图**),不是落盘那份 `ChatMessage` ——
+    // 两者的换算在 `apply_session` 里做(见 mcwp-ui 的说明)。
+    in property <[ChatBubble]> messages;
     // 壁纸库:列表与「当前是哪张」都由 Rust 灌进来,面板不碰文件系统
     in property <[LibraryItem]> library;
     in property <string> library-current: "";
+    // 「当前那张」在 `library` 里的下标;-1 = 桌面上挂的那张不在库里(比如刚抬进来还没入库)。
+    // 库页那颗「删除」靠它知道删哪一个 —— 面板不去自己找下标(找法只有壁纸侧知道)。
+    in property <int> library-current-index: -1;
+    // 当前那张的标题:删除前要问一句"删的是哪张"。
+    in property <string> library-current-title: "";
+    // 「删除」的二次确认:开着的时候盖一层确认框。
+    in-out property <bool> confirm-delete: false;
+
+    // 看大图:点消息里的预览图会亮起这一层,盖住整个面板。
+    //
+    // 大图由 Rust 在点开时**现解**(缩略图只有 320×180,放大看是糊的),关掉时 Rust 会把
+    // 这份像素丢掉 —— 所以它是一个"用一下就还回去"的资源,不是常驻状态。
+    in property <image> viewer;
+    // in-out:关掉大图是**面板自己**就能做的决定(点一下),不用先绕一圈 Rust 再回来;
+    // 但像素由 Rust 持有,所以还要 `viewer-closed()` 通知它把那份内存放掉。
+    in-out property <bool> viewing: false;
+    in property <string> viewer-title: "";
     // 每来一条新消息 Rust 就 +1:消息列表靠它把自己钉到底部(内容长高时自动滚到底)
     in property <int> message-revision: 0;
     // 输入框里还没发出去的字。纯界面状态,和输入框双向绑定。
@@ -953,6 +1060,12 @@ export component Panel inherits Window {
     callback toggle-maximize-requested();
     // 生图界面:发消息 / 切会话 / 新建会话
     callback send-message(string);
+    // 点了消息里那张预览图:把壁纸库里那张的**大图**打开(壁纸侧现解 → `viewer`)
+    callback open-photo(string);
+    // 大图关掉了:让壁纸侧把那份像素放掉(它占的是几 MB 的 RGBA)
+    callback viewer-closed();
+    // 库页那颗「导入图片」:开系统的选文件框,把选中的图收进库里
+    callback import-wallpaper();
     callback select-conversation(int);
     callback new-conversation();
     // 对话进行中的暂停 / 继续
@@ -1464,7 +1577,11 @@ export component Panel inherits Window {
                             for msg[i] in root.messages : MessageRow {
                                 body: msg.text;
                                 mine: msg.mine;
+                                shot: msg.shot;
+                                has-shot: msg.has-shot;
+                                photo-gone: msg.photo-gone;
                                 accent: root.accent;
+                                preview => { root.open-photo(msg.photo-id); }
                             }
                         }
                     }
@@ -1475,6 +1592,23 @@ export component Panel inherits Window {
                     vertical-stretch: 1;
                     border-radius: Glass.r-card;
                     background: Glass.fill;
+
+                    // 每行几格:**跟着视口宽度走**,而不是写死 4 列。
+                    //
+                    // 原来写死 4 列 + 168px 的格子,面板拉到 1536 宽时右边空出一大片,
+                    // 而且窗口放大/还原之后格子还是那么小。现在按宽度分三档,再**把剩下的
+                    // 宽度平分给每格** —— 所以每一行永远是"正好铺满",不会留半格。
+                    //
+                    // 用三档而不是"按最小宽度算列数":后者要做浮点除法和取整,而 Slint 里
+                    // 长度和整数之间的转换最容易出隐式截断的坑(算错的表现是格子错位一格)。
+                    property <int> cols: flick-lib.width > 1420px
+                        ? 6
+                        : (flick-lib.width > 1150px ? 5 : 4);
+                    property <length> cell-gap: 12px;
+                    property <length> cell-w: (flick-lib.width - (cols - 1) * cell-gap) / cols;
+                    // 高宽比 10:16(Slint 里没有小数长度,所以写成"乘 62 再除 100"的整数运算),
+                    // 再加 26px 给底下的标题行留位置。
+                    property <length> cell-h: cell-w * 62 / 100 + 26px;
 
                     VerticalLayout {
                         padding: 14px;
@@ -1491,6 +1625,27 @@ export component Panel inherits Window {
                                 vertical-alignment: center;
                                 horizontal-stretch: 1;
                                 overflow: elide;
+                            }
+
+                            VerticalLayout {
+                                alignment: center;
+                                Pill {
+                                    text: "导入图片";
+                                    box-width: 92px;
+                                    clicked => { root.import-wallpaper(); }
+                                }
+                            }
+
+                            VerticalLayout {
+                                alignment: center;
+                                Pill {
+                                    text: "删除";
+                                    box-width: 68px;
+                                    ink: #FF6B60;
+                                    // 库里没有"当前这张"就没得删(比如桌面壁纸还没抬进来)
+                                    enabled: root.library-current-index >= 0;
+                                    clicked => { root.confirm-delete = true; }
+                                }
                             }
 
                             VerticalLayout {
@@ -1522,18 +1677,28 @@ export component Panel inherits Window {
                             viewport-width: self.width;
                             viewport-height: lib-grid.height;
 
-                            // 4 列一行,**自己算坐标**而不是用 GridLayout:Slint 的 GridLayout
-                            // 不支持 `for`(`'if' or 'for' expressions are not currently supported
-                            // in grid layouts`),而列数要在运行期按库里的张数折行。
+                            // **自己算坐标**而不是用 GridLayout:Slint 的 GridLayout 不支持 `for`
+                            // (`'if' or 'for' expressions are not currently supported in grid
+                            // layouts`),而列数要在运行期按库里的张数折行。
                             //
-                            // 格子尺寸(168 × 116)在 LibraryCell 里写死,这里的间距也得跟它对齐:
-                            // 横向 178 = 168 + 10,纵向 126 = 116 + 10。
+                            // 行号一律写 `Math.floor(i / cols)`,**不能直接拿 `i / cols` 当行号**:
+                            // Slint 的 `/` 永远是浮点除,两个 int 相除也先抬成 float —— 编译器里
+                            // 写死 `(false, false) => Type::Float32`(见 i-slint-compiler 的
+                            // passes/resolving.rs),所以 `i / cols` 出来是 0.25 / 0.5 / 0.75 而不是
+                            // 0。上一版就是直接拿它当行号,结果 4 张图全落在第 0 列、只差几十像素地
+                            // 摞在一起(而且行数算成 1.75 行),这就是"库页排版乱"的真凶。
+                            //
+                            // 这里用浮点是安全的:两个 int 相除只要除得尽,结果在二进制里一定精确
+                            // (1.0 / 2.0 这种),floor 不会少一;ceil 只用来把"最后一行不满"也算一行。
                             lib-grid := Rectangle {
                                 width: flick-lib.viewport-width;
-                                // 行数 = ⌈张数 / 4⌉;最后一行不满也按一行算,所以先 +3 再整除。
+                                // 行数 = ⌈张数 / cols⌉;最后一行不满也按一行算。
                                 // 再和视口高度取大:一张都没有时行数是 0(算出来是负的),而空态那句
                                 // 说明要占满整个视口才谈得上居中。
-                                height: max(flick-lib.height, ((root.library.length + 3) / 4) * 126px - 10px);
+                                height: max(
+                                    flick-lib.height,
+                                    Math.ceil(root.library.length / cols) * (cell-h + cell-gap) - cell-gap,
+                                );
 
                                 // 空态:一张都没有时,说清楚第一张从哪儿来
                                 if root.library.length == 0 : Text {
@@ -1541,7 +1706,7 @@ export component Panel inherits Window {
                                     y: 0;
                                     width: parent.width;
                                     height: parent.height;
-                                    text: "库还是空的 —— 在右边的对话里说一句想看到的样子,出图之后就会收到这里。";
+                                    text: "库还是空的 —— 在右边对话里说一句想看到的样子,或者点上面的「导入图片」把本机图片收进来。";
                                     color: Glass.label-3;
                                     font-size: 12px;
                                     wrap: word-wrap;
@@ -1550,8 +1715,12 @@ export component Panel inherits Window {
                                 }
 
                                 for item[i] in root.library : LibraryCell {
-                                    x: Math.mod(i, 4) * 178px;
-                                    y: (i / 4) * 126px;
+                                    // 行号 floor 出来,列号再用"序号 - 行首序号"减出来(就是上面说的
+                                    // 那个浮点除的坑);乘回长度之后是正常的 length。
+                                    x: (i - Math.floor(i / cols) * cols) * (cell-w + cell-gap);
+                                    y: Math.floor(i / cols) * (cell-h + cell-gap);
+                                    cell-w: cell-w;
+                                    cell-h: cell-h;
                                     thumb: item.thumb;
                                     heading: item.title;
                                     selected: item.id == root.library-current;
@@ -1880,6 +2049,113 @@ export component Panel inherits Window {
             delete-picked => {
                 root.delete-wallpaper(root.lib-menu-row);
                 root.close-lib-menu();
+            }
+        }
+    }
+
+    // 「删除」的二次确认。**只挡工具栏那颗钮**:右键菜单里点「删除这一张」,菜单本身就是
+    // 那一刻的意图表达(还得多点一次才叫确认就太啰嗦了)。
+    //
+    // 删壁纸是不可逆的(文件直接删掉,没有回收站那一步),所以这条路上问一句。
+    if root.confirm-delete : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+
+        // 点外面(不点按钮)当取消 —— 和系统弹窗一个习惯
+        back := TouchArea {
+            clicked => { root.confirm-delete = false; }
+        }
+
+        card := Rectangle {
+            width: 340px;
+            height: 168px;
+            // 水平居中:面板根是 Window,`parent.width` 就是窗口宽度
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: Glass.r-card;
+            border-width: 1px;
+            border-color: Glass.hairline;
+            background: root.caption-plate.brighter(0.06);
+
+            VerticalLayout {
+                padding: 18px;
+                spacing: 10px;
+
+                Text {
+                    text: "从壁纸库里删掉这张?";
+                    color: Glass.label;
+                    font-size: 14px;
+                    font-weight: 600;
+                }
+
+                Text {
+                    text: root.library-current-title + "\n删掉之后只能重新生成或导入,文件不会进回收站。";
+                    color: Glass.label-2;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                    vertical-stretch: 1;
+                }
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    Rectangle { horizontal-stretch: 1; }
+                    Pill {
+                        text: "取消";
+                        box-width: 88px;
+                        clicked => { root.confirm-delete = false; }
+                    }
+                    Pill {
+                        text: "删除";
+                        box-width: 88px;
+                        ink: #FF6B60;
+                        clicked => {
+                            root.confirm-delete = false;
+                            root.delete-wallpaper(root.library-current-index);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 看大图。**最后声明** = 盖在确认框和两个菜单之上(它是最"上面"的那一层)。
+    if root.viewing : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        // 半透明深色遮罩。窗口本身不是透明的(见文件头),所以这里是"盖住"而不是"透出桌面"。
+        background: root.caption-plate.darker(0.55).with-alpha(0.94);
+
+        Image {
+            x: 28px;
+            y: 24px;
+            width: parent.width - 56px;
+            height: parent.height - 84px;
+            source: root.viewer;
+            image-fit: contain;
+        }
+
+        Text {
+            x: 28px;
+            y: parent.height - 52px;
+            width: parent.width - 56px;
+            height: 24px;
+            text: root.viewer-title + " · 点任意处关闭";
+            color: Glass.label-2;
+            font-size: 12px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        // 遮罩本身当"关闭"的命中区。图片没有 TouchArea,所以点在图上也会落到这里。
+        dismiss-view := TouchArea {
+            mouse-cursor: pointer;
+            clicked => {
+                root.viewing = false;
+                root.viewer-closed();
             }
         }
     }

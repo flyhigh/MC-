@@ -686,6 +686,91 @@ fn adopt_desktop(
     )
 }
 
+/// 导入那一路的标题:文件名(去掉扩展名)。名字取不出来就给一句「导入的图片」。
+///
+/// 和「抬桌面壁纸」那份(`desktop_wallpaper_title`)的区别只在兜底:那条路的路径可能是
+/// 系统转码件(没有名字),这条路是用户自己挑的文件,基本总有名字。
+fn imported_title(path: &std::path::Path) -> String {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().trim().to_string())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| "导入的图片".to_string())
+}
+
+/// 把**用户从文件里挑的那张图**收进来:解码 → 入库 → 上屏。
+///
+/// 和「抬桌面壁纸」几乎一样,只差两点:
+/// - 路径是对话框给的,不是系统说"桌面现在挂着哪张";
+/// - id 复用了 `adopted_id`(按路径算),所以**同一张图反复导入只会有一条** ——
+///   用户在资源管理器里改完图再导一次,库里换掉的是同一条记录,不会堆出一串副本。
+///
+/// 落盘的仍是**文件原来的字节**(不重新编码,和生图那条路一个规矩)。
+fn import_photo(
+    renderer: &mut Renderer,
+    library: &mut Vec<LibraryEntry>,
+    path: &std::path::Path,
+    screen: (u32, u32),
+    brightness: f32,
+) -> Result<ActivePhoto> {
+    let bytes = std::fs::read(path).with_context(|| format!("读不到这个文件:{}", path.display()))?;
+    let bitmap = mcwp_image::Bitmap::decode(&bytes)
+        .with_context(|| format!("这张图解不开(只认 PNG / JPEG):{}", path.display()))?;
+
+    // 大过纹理上限的就地缩一份只用来上屏的(落盘的还是原图,元数据也记原尺寸)——
+    // 和抬桌面壁纸一样,4K 以上的图在这块核显上会直接建不出纹理。
+    let (original_width, original_height) = (bitmap.width, bitmap.height);
+    let limit = renderer.max_texture_size();
+    let bitmap = if original_width > limit || original_height > limit {
+        let small = bitmap.thumbnail(limit, limit);
+        tracing::info!(
+            "导入的图 {original_width}×{original_height} 超过 GPU 纹理上限 {limit},上屏前缩到 {}×{}",
+            small.width,
+            small.height
+        );
+        small
+    } else {
+        bitmap
+    };
+
+    let id = adopted_id(path);
+    if let Some(old) = library.iter().find(|entry| entry.source.photo.id == id) {
+        if let Err(err) = photos::remove(&old.source) {
+            tracing::warn!("替换旧的导入记录时删不掉旧文件:{err:?}");
+        }
+    }
+
+    let created = now_secs();
+    let mut photo = Photo {
+        id,
+        title: imported_title(path),
+        // 提示词留空:这张不是"画"出来的。空着比编一句假的好 —— 库里一眼能看出哪几张是
+        // 生成、哪几张是抬进来或导入的(和「抬桌面壁纸」同一个态度)。
+        width: original_width,
+        height: original_height,
+        // 静帧呼吸(推拉),不往上叠雪雨雾:用户自己的照片叠什么都可能不合适。
+        motion: mcwp_spec::MotionRecipe::default(),
+        palette: mcwp_spec::palette_from_rgba(&bitmap.rgba, bitmap.width, bitmap.height),
+        seed: (created & 0xffff_ffff) as u32,
+        created,
+        ..Photo::default()
+    };
+    photo.normalize();
+    adopt_photo(
+        renderer,
+        library,
+        PhotoPayload {
+            reply: String::new(),
+            photo,
+            bytes,
+            bitmap,
+            degraded: false,
+            calls: 0,
+        },
+        screen,
+        brightness,
+    )
+}
+
 /// 设置页要显示的模型配置:盘上那份(空字段已经用内置默认补上)+ 有没有环境变量在盖它。
 fn ai_config_state() -> mcwp_ui::AiConfigState {
     let stored = mcwp_ai::Config::stored();
@@ -998,6 +1083,7 @@ fn panel_state(
     library: &[LibraryEntry],
 ) -> mcwp_ui::PanelState {
     let current = CurrentWallpaper::of(photo);
+    let selection = library_selection(photo, library);
 
     mcwp_ui::PanelState {
         title: current.title,
@@ -1007,7 +1093,8 @@ fn panel_state(
         palette: current.palette,
         session: sessions.state(),
         library: library_items(library),
-        library_current: library_current(photo, library),
+        library_current: selection.id,
+        library_current_index: selection.index,
     }
 }
 
@@ -1115,19 +1202,36 @@ fn current_photo_index(active: &Option<ActivePhoto>, library: &[LibraryEntry]) -
         .unwrap_or_else(|| library.len().saturating_sub(1))
 }
 
-/// 当前生效的壁纸在库里的 id;不是库里的(比如还在程序化场景上)就是空串。
-fn library_current(photo: Option<&Photo>, library: &[LibraryEntry]) -> String {
+/// 面板画库页时要的那一小撮"当前是哪张":id(高亮用)、下标(那颗「删除」用)、标题(确认框用)。
+///
+/// 三样必须**一起**算出来。分开算的话,迟早出现"高亮的是这张、删掉的却是那张" ——
+/// 而它们的来源是同一个 `active` 和同一份 `library`,本来就没有分开的理由。
+struct LibrarySelection {
+    id: String,
+    index: i32,
+}
+
+/// 当前生效的壁纸在库里的位置。**不在库里**时 id 是空串、下标是 -1(比如刚抬进来、扫库还没跟上):
+/// 那种情况下既不该高亮某一格,也没有"这张"可删。
+fn library_selection(photo: Option<&Photo>, library: &[LibraryEntry]) -> LibrarySelection {
     let Some(photo) = photo else {
-        return String::new();
+        return LibrarySelection {
+            id: String::new(),
+            index: -1,
+        };
     };
-    // 只有"桌面上那张也在库里"才把 id 给面板去高亮 —— 刚抬进来、库还没跟上时它还不是库里的东西。
-    if library
+    match library
         .iter()
-        .any(|entry| entry.source.photo.id == photo.id)
+        .position(|entry| entry.source.photo.id == photo.id)
     {
-        photo.id.clone()
-    } else {
-        String::new()
+        Some(index) => LibrarySelection {
+            id: photo.id.clone(),
+            index: index as i32,
+        },
+        None => LibrarySelection {
+            id: String::new(),
+            index: -1,
+        },
     }
 }
 
@@ -1746,10 +1850,13 @@ fn main() -> Result<()> {
                             tracing::info!("已从壁纸库删除「{title}」");
                             library = scan_library();
                             if let Some(handle) = &panel {
-                                handle.refresh_library(
-                                    library_items(&library),
-                                    library_current(active.as_ref().map(|it| &it.photo), &library),
-                                );
+                                // 整块回填(不是只刷库页):删掉的那张可能正是某条历史消息的
+                                // 配图,消息那边也要跟着变成"这张已经不在壁纸库里了"。
+                                handle.refresh(panel_state(
+                                    active.as_ref().map(|it| &it.photo),
+                                    &sessions,
+                                    &library,
+                                ));
                                 handle.set_status(format!("已删除「{title}」"));
                             }
                         }
@@ -1760,6 +1867,80 @@ fn main() -> Result<()> {
                                 handle.set_status(format!("删不掉:{reason}"));
                             }
                         }
+                    }
+                }
+                // 库页工具栏「导入图片」:开系统的选文件框,把选中的图收进库里。
+                //
+                // 选文件这一步会**阻塞主循环**(`GetOpenFileNameW` 是个模态对话框,自己跑消息
+                // 循环),所以这几秒桌面壁纸是停在最后一帧的。可以接受:用户此刻正在挑文件。
+                mcwp_ui::UiEvent::ImportWallpaper => {
+                    match mcwp_platform::file_dialog::pick_image() {
+                        // 取消了。什么都不做,也不要报"失败" —— 用户自己按的取消。
+                        None => tracing::info!("导入:用户取消了选文件"),
+                        Some(path) => {
+                            match import_photo(&mut renderer, &mut library, &path, screen, brightness)
+                            {
+                                Ok(photo) => {
+                                    let title = photo.photo.title.clone();
+                                    tracing::info!("已导入并换上:{title}(来自 {})", path.display());
+                                    active = Some(photo);
+                                    if let Some(handle) = &panel {
+                                        handle.refresh(panel_state(
+                                            active.as_ref().map(|it| &it.photo),
+                                            &sessions,
+                                            &library,
+                                        ));
+                                        // 导入**顺手就换上**了(和"点一张就换上去"同一套动作),
+                                        // 状态栏就把这件事说全:只写"已导入"会让人以为桌面没变。
+                                        handle.set_status(format!("已导入并换上「{title}」"));
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!("导入 {} 失败:{err:?}", path.display());
+                                    if let Some(handle) = &panel {
+                                        let reason = brief(&format!("{err:#}"));
+                                        handle.set_status(format!("导入失败:{reason}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // 点了消息里那张预览图:把大图打开。
+                //
+                // 解码放主线程(和切壁纸那条路同一个态度):一张 1080p 的图约 200~400 ms,
+                // 换来的是"不用为一次点击引入一路后台任务 + 结果通道"。尺寸封顶 1800,
+                // 4K 原图进来看大图也一样清晰,但省掉一半像素的拷贝。
+                mcwp_ui::UiEvent::OpenPhoto(id) => match photos::load(&id) {
+                    Ok(entry) => {
+                        let title = entry.photo.title.clone();
+                        match entry.read_image() {
+                            Ok(bitmap) => {
+                                let big = bitmap.thumbnail(1800, 1800);
+                                if let Some(handle) = &panel {
+                                    handle.show_viewer(title, (big.width, big.height, big.rgba));
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!("打开「{title}」的大图失败:{err:?}");
+                                if let Some(handle) = &panel {
+                                    let reason = brief(&format!("{err:#}"));
+                                    handle.set_status(format!("这张打不开:{reason}"));
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!("看大图:库里找不到 {id}:{err:?}");
+                        if let Some(handle) = &panel {
+                            handle.set_status("这张已经不在壁纸库里了".to_string());
+                        }
+                    }
+                },
+                // 大图那一层关掉了:把那份像素放掉(它在面板线程里占着几 MB 的 RGBA)
+                mcwp_ui::UiEvent::ViewerClosed => {
+                    if let Some(handle) = &panel {
+                        handle.clear_viewer();
                     }
                 }
                 // 库页工具栏「用当前壁纸」:把桌面上那张抬进来(和 `--adopt` 同一条路)。
@@ -1797,10 +1978,12 @@ fn main() -> Result<()> {
                 mcwp_ui::UiEvent::RefreshLibrary => {
                     library = scan_library();
                     if let Some(handle) = &panel {
-                        handle.refresh_library(
-                            library_items(&library),
-                            library_current(active.as_ref().map(|it| &it.photo), &library),
-                        );
+                        // 库目录可能被外面动过,所以连会话一起回填:某条消息的配图可能刚被删了
+                        handle.refresh(panel_state(
+                            active.as_ref().map(|it| &it.photo),
+                            &sessions,
+                            &library,
+                        ));
                     }
                 }
                 // 点库里的某一张:现解一次图换上。和托盘"换一张"走同一个入口(`switch_to_photo`)。
@@ -1932,7 +2115,9 @@ fn main() -> Result<()> {
                 tracing::info!("这一轮的会话已经被删掉了,结果不再落地");
                 continue;
             }
-            let (reply, status) = match result {
+            // 第三个是"这条回复配的那张壁纸"在库里的 id:面板要在回复下面把图贴出来
+            // (点一下看大图)。没画出来 / 没上屏就是 `None`。
+            let (reply, status, photo_id) = match result {
                 Ok(payload) => {
                     let calls = payload.calls;
                     let degraded = payload.degraded;
@@ -1940,6 +2125,7 @@ fn main() -> Result<()> {
                     match adopt_photo(&mut renderer, &mut library, *payload, screen, brightness) {
                         Ok(photo) => {
                             let title = photo.photo.title.clone();
+                            let id = photo.photo.id.clone();
                             active = Some(photo);
                             tracing::info!(
                                 "已换上新壁纸:{title} | 提示词调用={calls} | 降级={degraded}"
@@ -1951,12 +2137,12 @@ fn main() -> Result<()> {
                             } else {
                                 format!("已换上「{title}」")
                             };
-                            (reply, status)
+                            (reply, status, Some(id))
                         }
                         Err(err) => {
                             tracing::error!("图出来了但上屏失败:{err:?}");
                             let reason = brief(&format!("{err:#}"));
-                            (reply, format!("图出来了但没能上屏:{reason}"))
+                            (reply, format!("图出来了但没能上屏:{reason}"), None)
                         }
                     }
                 }
@@ -1966,10 +2152,11 @@ fn main() -> Result<()> {
                     (
                         format!("这次没画出来({reason}),再试一次?"),
                         format!("生图失败:{reason}"),
+                        None,
                     )
                 }
             };
-            if !sessions.reply(session, &reply) {
+            if !sessions.reply_with_photo(session, &reply, photo_id.as_deref()) {
                 continue;
             }
             if let Some(handle) = &panel {

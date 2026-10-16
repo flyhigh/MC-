@@ -1,6 +1,8 @@
 /// 开机自启(注册表 `Run` 项)。
 pub mod autostart;
 pub mod desktop;
+/// 「导入一张图」用的系统文件选择框。
+pub mod file_dialog;
 /// 无边框面板窗口的 DWM 收尾(圆角、暗色边框)与拖动。仅供面板这类普通窗口使用。
 pub mod glass_window;
 /// 任务栏托盘图标与右键菜单。

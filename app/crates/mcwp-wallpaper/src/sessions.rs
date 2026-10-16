@@ -240,6 +240,8 @@ impl Sessions {
         session.messages.push(mcwp_ui::ChatMessage {
             mine: true,
             text: text.into(),
+            // 用户那句话本身不带图(图是回复那一轮画出来的)
+            photo: Default::default(),
         });
         // 自己刚说过话的会话不该挂着未读点
         session.unread = false;
@@ -250,6 +252,15 @@ impl Sessions {
     /// 往指定会话里补一条"对方说的"消息。找不到那个会话(等待期间被删了)就什么也不做,
     /// 返回 `false` —— 调用方拿它决定要不要顺手把壁纸也应用上去。
     pub fn reply(&mut self, id: u64, text: &str) -> bool {
+        self.reply_with_photo(id, text, None)
+    }
+
+    /// 同 `reply`,但这条回复**带着一张刚生成的壁纸**(`photo` 是它在库里的 id)。
+    ///
+    /// 为什么把 id 记在消息上:面板要在这一条回复下面把那张图贴出来当预览(点一下看大图)。
+    /// 只记 id、不记路径也不记图片本身 —— 图在库里本来就有,记路径等于把"库目录在哪儿"
+    /// 抄进会话文件(库搬个家,历史消息里的图就全断了)。
+    pub fn reply_with_photo(&mut self, id: u64, text: &str, photo: Option<&str>) -> bool {
         let active = self.active;
         let Some(session) = self.items.iter_mut().find(|session| session.id == id) else {
             tracing::info!("会话 {id} 已经不在了,这条回复丢掉");
@@ -258,6 +269,7 @@ impl Sessions {
         session.messages.push(mcwp_ui::ChatMessage {
             mine: false,
             text: text.into(),
+            photo: photo.unwrap_or_default().to_string().into(),
         });
         // 等回复的时候用户可能已经切走了:那就挂个未读点,别让人错过
         if id != active {
@@ -469,6 +481,11 @@ struct StoredMessage {
     role: String,
     #[serde(default)]
     text: String,
+    /// 这条回复生出来的那张壁纸(库里的 id)。`None` = 这条消息没有配图 ——
+    /// 老会话文件里没有这个字段,读回来正好是 `None`,所以**不用动 schema 版本**(加字段
+    /// 不算破坏性改动,见 `SCHEMA_VERSION` 的说明)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    photo: Option<String>,
 }
 
 /// 缺 `role` 的消息按回复算:真正要紧的是文本,最坏也就是左右显示反了。
@@ -489,6 +506,10 @@ impl StoredMessage {
         Self {
             role: role.to_string(),
             text: message.text.to_string(),
+            photo: match message.photo.to_string() {
+                id if id.is_empty() => None,
+                id => Some(id),
+            },
         }
     }
 
@@ -496,6 +517,7 @@ impl StoredMessage {
         mcwp_ui::ChatMessage {
             mine: self.role == ROLE_USER,
             text: self.text.into(),
+            photo: self.photo.unwrap_or_default().into(),
         }
     }
 }
