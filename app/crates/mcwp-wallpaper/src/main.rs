@@ -522,6 +522,39 @@ fn start_video_run(
     format!("正在把「{title}」做成动态壁纸(要几分钟,高峰会更久;期间可以接着聊)")
 }
 
+/// `start_video_run` 的第二半:真起跑了就**把面板上那一条切成"正在生成动图…"**。
+///
+/// 为什么非要有这一层:三个入口(库格子的右键菜单、库页工具栏那颗钮、会话里那条回复下面的
+/// 「生成动图」)都要做"起跑 + 点亮"这两件事,而且**两半的判据必须一致** —— 被拦下来时
+/// (库空 / 已经是视频 / 已经有一条在跑)面板上那颗钮要原样熄灭。散在三处抄三遍的话,
+/// 迟早有一个入口漏掉点亮(用户点完毫无反应,这次改动修的正是那个)或者漏掉熄灭
+/// (那条回复永远停在"正在生成")。
+///
+/// 判据就是 `run`:**只有 `start_video_run` 真的把它写上去了才是起跑了**。
+fn start_video_run_visible(
+    chat: &Option<mcwp_ai::Client>,
+    videos: &Option<mcwp_ai::Videos>,
+    library: &[LibraryEntry],
+    index: usize,
+    screen: (u32, u32),
+    tx: &Sender<VideoOutcome>,
+    run: &mut Option<u64>,
+    run_id: u64,
+    target: &mut Option<String>,
+    panel: Option<&mcwp_ui::PanelHandle>,
+) -> String {
+    let status = start_video_run(chat, videos, library, index, screen, tx, run, run_id);
+    if *run == Some(run_id) {
+        if let Some(id) = library.get(index).map(|entry| entry.source.photo.id.clone()) {
+            *target = Some(id.clone());
+            if let Some(panel) = panel {
+                panel.set_animating(id);
+            }
+        }
+    }
+    status
+}
+
 /// 把库里某一张(静图)做成动态壁纸。**在后台线程里跑**,产物从 `VideoOutcome` 回来。
 ///
 /// 四步:
@@ -622,6 +655,10 @@ fn video_payload_from_bytes(
     let mut photo = Photo {
         title: source.title.clone(),
         prompt: source.prompt.clone(),
+        // 这张片子**是从哪儿来的**:面板要靠它把"会话里那条回复配的静图"和"随后做出来的
+        // 这段片子"接起来(见 `Photo::origin_id`)。`--video-fetch` 那条路也走这个函数,
+        // 所以照任务号捡回来的那一条同样记得住出处。
+        origin_id: source.id.clone(),
         // 记**解码出来的**尺寸:画面按 cover 裁,而视频和原图的尺寸不一定一样
         width: info.width,
         height: info.height,
@@ -1675,6 +1712,8 @@ fn library_entry(source: photos::Entry) -> LibraryEntry {
         hint: mcwp_spec::photo::title_from_prompt(&photo.prompt),
         summary: photo_summary(photo),
         video: source.is_video(),
+        // 出处:面板靠它知道"会话里那张静图已经做成动图了"(见 `LibraryEntryView::origin_id`)
+        origin_id: photo.origin_id.clone(),
         // 卡片的主色用照片自己提出来的强调色 —— 面板玻璃也跟着它染色,
         // 所以切壁纸的时候整个面板的色调会一起变,而不是只有壁纸变了
         accent: mcwp_ui::glass_colors(&photo.palette).accent(),
@@ -2111,6 +2150,9 @@ fn main() -> Result<()> {
     // 它要一分钟、还要花钱,点两下就并排跑两条是纯粹的浪费。
     let mut video_run: Option<u64> = None;
     let mut video_id: u64 = 0;
+    // 正在做动图的那张图的 id。面板靠它把对应那一条回复切成"正在生成动图…" ——
+    // 空 = 没有在做的。**只有真起跑了才写它**(见 `start_video_run_visible`)。
+    let mut video_target: Option<String> = None;
 
     // —— 控制面板 ——
     // 面板跑在自己的线程和自己的 Slint 事件循环里;这里只保留一个事件队列,
@@ -2646,7 +2688,7 @@ fn main() -> Result<()> {
                 // 「做成动态壁纸」:库格子的右键菜单带下标,库页工具栏那颗钮认**当前那张**。
                 mcwp_ui::UiEvent::MakeVideo(index) => {
                     video_id += 1;
-                    let status = start_video_run(
+                    let status = start_video_run_visible(
                         &ai,
                         &videos,
                         &library,
@@ -2655,8 +2697,41 @@ fn main() -> Result<()> {
                         &video_tx,
                         &mut video_run,
                         video_id,
+                        &mut video_target,
+                        panel.as_ref(),
                     );
                     tracing::info!("做成动态壁纸(库第 {index} 张):{status}");
+                    if let Some(handle) = &panel {
+                        handle.set_status(status);
+                    }
+                }
+                // 会话里那条回复下面的「生成动图」:面板递的是**那张图的 id**。
+                // 在这儿才换成库下标 —— 面板不知道"这在库里是第几张",而"它还在不在库里"
+                // 也只有这边说了算(消息是历史,那张图可能已经被用户在库页里删掉了)。
+                mcwp_ui::UiEvent::MakeVideoFromMessage(id) => {
+                    let index = library
+                        .iter()
+                        .position(|entry| entry.source.photo.id == id);
+                    let status = match index {
+                        Some(index) => {
+                            video_id += 1;
+                            start_video_run_visible(
+                                &ai,
+                                &videos,
+                                &library,
+                                index,
+                                screen,
+                                &video_tx,
+                                &mut video_run,
+                                video_id,
+                                &mut video_target,
+                                panel.as_ref(),
+                            )
+                        }
+                        None => "这张已经不在壁纸库里了 —— 库页里点它一下,或者重新生成一张"
+                            .to_string(),
+                    };
+                    tracing::info!("做成动态壁纸(会话里那条 {id}):{status}");
                     if let Some(handle) = &panel {
                         handle.set_status(status);
                     }
@@ -2673,7 +2748,7 @@ fn main() -> Result<()> {
                     let status = match index {
                         Some(index) => {
                             video_id += 1;
-                            start_video_run(
+                            start_video_run_visible(
                                 &ai,
                                 &videos,
                                 &library,
@@ -2682,6 +2757,8 @@ fn main() -> Result<()> {
                                 &video_tx,
                                 &mut video_run,
                                 video_id,
+                                &mut video_target,
+                                panel.as_ref(),
                             )
                         }
                         None => "这一张还不在壁纸库里,先去库页点它一下再回来".to_string(),
@@ -2836,6 +2913,9 @@ fn main() -> Result<()> {
                 continue;
             }
             video_run = None;
+            // 那条回复下面的「生成动图」要回到原样:成功时它会变成"已是动图"(下面那次刷新
+            // 会带上新的库数据),失败时它得能再点一次 —— 两种落点都要求先把"正在做"清掉。
+            video_target = None;
             let status = match result {
                 Ok(payload) => {
                     let title = payload.photo.title.clone();
@@ -2863,6 +2943,7 @@ fn main() -> Result<()> {
                     &sessions,
                     &library,
                 ));
+                handle.set_animating("");
                 handle.set_status(status);
             }
         }

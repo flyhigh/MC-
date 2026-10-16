@@ -109,6 +109,11 @@ export struct ChatBubble {
     /// 有配图 id 但库里已经找不到那张了(用户把它删了)—— 界面上明说一句,
     /// 比"图消失了但话还在"更好懂。
     photo-gone: bool,
+    /// 这张**已经做成动图了**(库里那一条被就地改成了视频)。
+    ///
+    /// 靠这个字段,那条回复下面就不会再画「生成动图」:再点一次是**再花一次钱**买同一张图的
+    /// 另一段片子,而用户看到的画面几乎没变 —— 这种事得让界面挡住,不能只靠提示语。
+    video: bool,
 }
 
 // 左栏里的一条历史对话。
@@ -144,12 +149,17 @@ component Pill inherits Rectangle {
     in property <color> ink: Glass.label;
     // 宽度默认是"三四个字的胶囊",库页那颗「做成动态壁纸」要宽一些。
     in property <length> box-width: 104px;
+    // 高度与字号也做成参数:会话里那张预览图下面要挂一颗**小一号**的同款胶囊
+    // (「生成动图」),而卡片的字号是 10px 那一档 —— 用默认的 34px 会顶出一大块。
+    // 给默认值等于没改:全世界别处那颗胶囊还是原样。
+    in property <length> box-height: 34px;
+    in property <length> ink-size: 13px;
     // 灰掉 = 这个动作此刻不成立(比如库里没有可删的那张)。灰掉之后不再收点击。
     in property <bool> enabled: true;
 
     callback clicked();
 
-    height: 34px;
+    height: root.box-height;
     width: root.box-width;
     opacity: root.enabled ? 1 : 0.4;
     border-radius: self.height / 2;
@@ -178,7 +188,7 @@ component Pill inherits Rectangle {
     t := Text {
         text: root.text;
         color: root.ink;
-        font-size: 13px;
+        font-size: root.ink-size;
         font-weight: root.primary ? 600 : 400;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -781,9 +791,34 @@ component MessageRow inherits HorizontalLayout {
     in property <image> shot;
     in property <bool> has-shot: false;
     in property <bool> photo-gone: false;
+    // 这张已经是动图了 → 不画「生成动图」,画一句"已是动图"。
+    in property <bool> video: false;
+    // **正在给它做动图**。由根上那条 `animating-id` 命中的行点亮,这里只是个入参 ——
+    // 不做任何"我点过没有"的本地记忆:那种记忆和真实状态一定会漂(任务在壁纸侧跑)。
+    in property <bool> animating: false;
 
     callback preview();
     callback menu-requested(length, length);
+    // 「生成动图」:把这条回复配的那张(id)交给图生视频。递**id**不是行号 ——
+    // 行号在消息增删 / 切会话之后会指到别处,id 不会(和预览图那个右键菜单同一个道理)。
+    callback animate();
+
+    // 「正在生成动图」那几个点:每 400ms 走一格,0 → 1 → 2 → 3 → 0。
+    //
+    // 为什么要动:这一步要跑几分钟、还要花钱。**点完什么都不变**是这次改动的起点 ——
+    // 用户会以为没点上,然后连点几次(第二次只会被告知"正在做上一段")。
+    // 只有 `animating` 为真时那个 Timer 才跑,闲着不动 —— 软件渲染器下每次重绘都要钱。
+    private property <int> busy-phase: 0;
+    private property <string> busy-label: root.busy-phase == 0
+        ? "正在生成动图"
+        : (root.busy-phase == 1
+            ? "正在生成动图."
+            : (root.busy-phase == 2 ? "正在生成动图.." : "正在生成动图..."));
+    busy := Timer {
+        interval: 400ms;
+        running: root.animating;
+        triggered => { root.busy-phase = root.busy-phase == 3 ? 0 : root.busy-phase + 1; }
+    }
 
     // 靠边:用户消息靠右、回复靠左,两侧各留 6px 给圆角喘口气。
     //
@@ -859,11 +894,62 @@ component MessageRow inherits HorizontalLayout {
                 }
             }
 
-            if root.has-shot : Text {
-                text: "点一下看大图 · 右键可设为壁纸";
-                color: Glass.label-3;
-                font-size: 10px;
-                horizontal-alignment: left;
+            // 图片下面那一行:提示语 + 「生成动图」。
+            //
+            // 为什么要把它放在这儿而不是库页:用户刚看到的那张图**就在这条回复下面**,
+            // "把它做成动态壁纸"是盯着它的时候最想干的事 —— 让人跑一趟库页、在几十格里
+            // 找回同一张,是白白多出来的一步(而且库页那格对不对得上,用户还得自己认)
+            if root.has-shot : HorizontalLayout {
+                spacing: 8px;
+
+                Text {
+                    text: "点一下看大图 · 右键可设为壁纸";
+                    color: Glass.label-3;
+                    font-size: 10px;
+                    horizontal-alignment: left;
+                    vertical-alignment: center;
+                    // 让出宽度给右边那颗钮 / 那句"正在生成",自己不够就省略
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+
+                // 已经动过了:只留一句话,不留按钮(理由见 `ChatBubble.video`)
+                if root.video : Text {
+                    text: "已是动图";
+                    color: Glass.label-3;
+                    font-size: 10px;
+                    // 高度**钉死**成和胶囊一样(22px)。
+                    //
+                    // 这不是对齐洁癖,是真机上量出来的一个坑:胶囊一换成文字,这一行就从
+                    // 22px 缩到 14px,而消息列表是**贴着底滚动**的 —— 于是整页内容跟着跳
+                    // 8px,上面那张预览图就挪到了"刚才那颗钮"的位置上。后果是:用户点完
+                    // 生成动图、状态变成"已是动图"之后再点同一个地方,点中的是那张图,
+                    // 直接弹出大图预览。
+                    height: 22px;
+                    vertical-alignment: center;
+                }
+
+                // 正在做:一句话 + 会走的点。固定宽度,免得点一变长整行就跟着抖
+                if (!root.video && root.animating) : Text {
+                    text: root.busy-label;
+                    color: root.accent;
+                    font-size: 10px;
+                    width: 96px;
+                    // 同上:高度要钉住,否则"点完按钮变正在生成"这一下本身就是一次跳版
+                    height: 22px;
+                    vertical-alignment: center;
+                    horizontal-alignment: left;
+                }
+
+                if (!root.video && !root.animating) : Pill {
+                    text: "生成动图";
+                    box-width: 76px;
+                    box-height: 22px;
+                    ink-size: 10px;
+                    accent: root.accent;
+                    ink: Glass.label;
+                    clicked => { root.animate(); }
+                }
             }
 
             // 配图被删了:说明白,别让用户以为是加载失败
@@ -1027,6 +1113,14 @@ export component Panel inherits Window {
     // 由 Rust 在起跑、暂停、落地这三个时刻灌进来 —— 它不属于会话数据,面板自己算不出来。
     in property <int> run-state: 0;
 
+    // **正在被做成动图的那张图 id**(空串 = 没有在做的)。
+    //
+    // 和 `run-state` 一样是"当前动作"的投影、不属于会话数据,所以走单独一条通道
+    // (`PanelHandle::set_animating`),不塞进每次 `refresh` 的那份 `PanelState` ——
+    // 那条路要重传几十张缩略图的裸像素,为了一个 id 不值当。
+    // 会话里每一行拿它和 `msg.photo-id` 比,命中的那一行就把「生成动图」换成"正在生成动图…"。
+    in property <string> animating-id: "";
+
     // —— 设置页:模型配置(接生图那一环)——
     // 这四个是 in-out,但**不放进 PanelState**:它们平时是用户在编辑,而 `refresh()`
     // 会因为换壁纸、切会话随时整块回填 —— 那会把用户正在敲的字冲掉。所以只由 Rust 在
@@ -1147,6 +1241,8 @@ export component Panel inherits Window {
     callback delete-wallpaper(int);
     // 「做成动态壁纸」:把第 `index` 张静图交给图生视频(跑几十秒,结果回来再上屏)
     callback make-video(int);
+    // 同一件事,但来自**会话里那条回复下面**那颗钮:递的是那张图的 id(理由见 MessageRow)
+    callback animate-photo(string);
     // 同一件事,但对象是**当前挂着的那张**(库页工具栏上那颗钮;不用先去网格里找它)
     callback make-video-current();
     // 把「现在桌面上那张壁纸」抬进来当作一张新的(生图之前先有东西可看)
@@ -1654,9 +1750,14 @@ export component Panel inherits Window {
                                 shot: msg.shot;
                                 has-shot: msg.has-shot;
                                 photo-gone: msg.photo-gone;
+                                video: msg.video;
+                                // "这一行是不是正在做动图":比的是 id。壁纸侧每起一轮 / 收一轮
+                                // 都会把那个 id 灌进来(见 `PanelHandle::set_animating`)
+                                animating: msg.photo-id != "" && msg.photo-id == root.animating-id;
                                 accent: root.accent;
                                 preview => { root.open-photo(msg.photo-id); }
                                 menu-requested(x, y) => { root.open-shot-menu(i, x, y); }
+                                animate => { root.animate-photo(msg.photo-id); }
                             }
                         }
                     }

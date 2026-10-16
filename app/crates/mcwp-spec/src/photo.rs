@@ -326,6 +326,15 @@ pub struct Photo {
     /// 落盘是为了让它当**资产**用:图生视频那句提示词吃它,而且"重新做成动态壁纸"时
     /// 不用再看一遍图(省一次调用,也省得两次结果不一样)。
     pub motion_plan: MotionPlan,
+    /// 这条是**从哪一张做出来的**(只有图生视频的产物会填;静图、抬进来的、导入的那几条都是空串)。
+    ///
+    /// 为什么要落盘:会话里那条回复挂的是**当初那张静图**的 id,而做出来的片子是**另一条**
+    /// 库记录 —— 它的 id 必须重新生成,理由见 `video_payload_from_bytes` 里那句
+    /// "接着用原图那个 id 的话,封面(`<id>.png`)会把原图那张画面文件盖掉"。
+    /// 于是"这张图已经做成动图了"在界面上**无从判断**:道理要连的两头各是一个 id,对不上。
+    /// 这个字段就是那根线 —— 会话里那颗「生成动图」靠它变成"已是动图"
+    /// (见 `mcwp-ui` 里那份 `VIDEOS`)。不落盘的话,重启一次这个标记就没了。
+    pub origin_id: String,
 }
 
 impl Default for Photo {
@@ -344,6 +353,7 @@ impl Default for Photo {
             kind: PhotoKind::Image,
             duration_ms: 0,
             motion_plan: MotionPlan::default(),
+            origin_id: String::new(),
             seam_gain: default_seam_gain(),
         }
     }
@@ -701,6 +711,17 @@ mod tests {
     fn 未知动效名回退到默认而不是报错() {
         let photo = Photo::parse(r#"{ "prompt": "x", "motion": { "kind": "地震" } }"#).unwrap();
         assert_eq!(photo.motion.kind, MotionKind::Still);
+    }
+
+    /// 老记录(这个字段存在之前入库的那一批)里没有 `origin_id`,读出来必须是空串。
+    ///
+    /// 空串在这儿是个**有意义的值**:"不知道这张是从哪儿来的"(静图、抬进来的、导入的、
+    /// 以及改动之前生成的视频都算)。所以不能反过来靠"字段不存在就报错"来发现 ——
+    /// 那会让**整个库**打不开(扫库是一条条读的,一条读了报错就断在半路)。
+    #[test]
+    fn 老记录里没有出处字段读成空串() {
+        let photo = Photo::parse(r#"{ "id": "6ad1d17f953432f9", "prompt": "雪山湖" }"#).unwrap();
+        assert_eq!(photo.origin_id, "");
     }
 
     #[test]

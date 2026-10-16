@@ -109,6 +109,11 @@ pub enum UiEvent {
     /// 和别的库操作一样,面板只递下标:那张是不是静图、够不够额度、结果往哪儿放,
     /// 全是壁纸侧的事。
     MakeVideo(usize),
+    /// 会话里那条回复下面的「生成动图」:把**那张图的 id**交给图生视频。
+    ///
+    /// 为什么这一个走 id 而不是库下标:消息是历史,库列表会因为生成 / 删除 / 换个排序而变 ——
+    /// 用户点的那一下和他看到的那张图之间隔着若干次刷新,下标是唯一会漂的那种 key。
+    MakeVideoFromMessage(String),
     /// 同一件事,对象是**当前挂着的那张**(库页工具栏那颗钮)。
     MakeVideoFromCurrent,
     /// 「用当前壁纸」:把桌面上原来那张抬进来当作库里的新一张
@@ -156,6 +161,12 @@ pub struct PanelState {
 pub struct LibraryEntryView {
     /// 照片 id(= 库目录里的文件夹名),面板靠它和「当前是哪张」比对
     pub id: String,
+    /// 这条视频**是从哪张图做出来的**(静图恒为空串)。
+    ///
+    /// 面板拿它把"会话里那条回复配的静图"和"做出来的那段片子"接上:两者的 id 天生不同
+    /// (见 `mcwp_spec::photo::Photo::origin_id`),不靠这个字段的话,只剩"看标题像不像"
+    /// 那种一撞就错的猜法。网格本身不画它,用它的只有 `apply_library` 里那份 `VIDEOS`。
+    pub origin_id: String,
     pub title: String,
     /// 卡片上那行小字(提示词掐短)
     pub hint: String,
@@ -513,6 +524,21 @@ impl PanelHandle {
         });
     }
 
+    /// 告诉面板"现在正在把哪一张做成动图"(空串 = 没有在做的)。
+    ///
+    /// 和 `set_run_state` 同一个道理:会话里那条「生成动图」的样子完全由它决定,所以
+    /// **起跑和落地两处都要调** —— 只调起跑的话,那条回复会永远停在"正在生成"上,
+    /// 而底下那条状态行早就说完"已换上动态壁纸"了。
+    pub fn set_animating(&self, photo_id: impl Into<String>) {
+        let weak = self.weak.clone();
+        let photo_id: String = photo_id.into();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(panel) = weak.upgrade() {
+                panel.set_animating_id(photo_id.into());
+            }
+        });
+    }
+
     /// 请求关闭面板(等价于用户点右上角)。
     pub fn request_close(&self) {
         let _ = slint::invoke_from_event_loop(|| {
@@ -723,6 +749,10 @@ fn build(state: &PanelState, events: Sender<UiEvent>) -> Result<Panel> {
         ui.on_make_video_current(move || {
             let _ = tx.send(UiEvent::MakeVideoFromCurrent);
         });
+        let tx = events.clone();
+        ui.on_animate_photo(move |id| {
+            let _ = tx.send(UiEvent::MakeVideoFromMessage(id.to_string()));
+        });
     }
 
     {
@@ -915,6 +945,22 @@ thread_local! {
     static THUMBS: RefCell<HashMap<String, slint::Image>> = RefCell::new(HashMap::new());
 }
 
+// 「哪些 id 已经是视频了」的另一张小索引,同样只活在面板线程里。
+//
+// 和 `THUMBS` 一样是"两个数据源对号"的产物:会话里那条回复只知道配图的 id,而"这张是不是
+// 动图"在壁纸库那份数据里。`apply_library` 顺手灌进来(它本来就在逐条过库),
+// `apply_session` 里拿它决定那条回复下面画不画「生成动图」。
+//
+// 装的是**两种 id**:视频自己那条记录的 id,以及它的**出处**(那张静图的 id —— 两者不同,
+// 见 `LibraryEntryView::origin_id`)。会话里那条回复挂的是**静图**的 id,而片子是新 id 的
+// 另一条记录 —— 只装视频自己的 id 的话,那条回复下面的钮永远变不成"已是动图",
+// 用户再点一次就是**再花一次钱**买同一张图的另一段片子。
+//
+// **每次整份重建**(`apply_library` 开头先 clear):库里那张被删掉之后,索引里不该还留着它。
+thread_local! {
+    static VIDEOS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+}
+
 /// 把会话数据写进面板:左栏列表、右栏标题与消息。
 fn apply_session(ui: &Panel, session: &SessionState) {
     ui.set_conversations(slint::ModelRc::new(slint::VecModel::from(
@@ -933,6 +979,7 @@ fn apply_session(ui: &Panel, session: &SessionState) {
             } else {
                 THUMBS.with(|thumbs| thumbs.borrow().get(&id).cloned())
             };
+            let video = !id.is_empty() && VIDEOS.with(|videos| videos.borrow().contains(&id));
             ChatBubble {
                 mine: message.mine,
                 text: message.text.clone(),
@@ -940,6 +987,7 @@ fn apply_session(ui: &Panel, session: &SessionState) {
                 shot: shot.clone().unwrap_or_default(),
                 has_shot: shot.is_some(),
                 photo_gone: !id.is_empty() && shot.is_none(),
+                video,
             }
         })
         .collect();
@@ -974,6 +1022,9 @@ fn apply_state(ui: &Panel, state: &PanelState) {
 /// 跨线程送过来的(见 `LibraryEntryView`)。装的时候要把像素复制一份给 Slint:
 /// `SharedPixelBuffer` 拿的是所有权。
 fn apply_library(ui: &Panel, library: Vec<LibraryEntryView>, current: String, current_index: i32) {
+    // 这张小索引每次**整份重建**,所以先清空:库里那张被删掉之后,旧的"它是动图"的
+    // 身份不该留下来(见 `VIDEOS`)。
+    VIDEOS.with(|videos| videos.borrow_mut().clear());
     // 当前那张的标题要在把 items 交出去之前取出来(交出去之后就只剩 Slint 那边的模型了)
     let current_title = if current_index >= 0 {
         library
@@ -995,6 +1046,17 @@ fn apply_library(ui: &Panel, library: Vec<LibraryEntryView>, current: String, cu
                 thumbs
                     .borrow_mut()
                     .insert(entry.id.to_string(), thumb.clone());
+            });
+            // 另一张小索引:"这张是不是动图"(见 `VIDEOS`)。只有视频才进集合 ——
+            // 集合每次整份重建,所以"静图不在集合里"这件事是确定的,不会留着上一次的旧身份。
+            VIDEOS.with(|videos| {
+                if entry.video {
+                    videos.borrow_mut().insert(entry.id.to_string());
+                    // 顺带把出处也记上(理由见 `VIDEOS` 的说明)。
+                    if !entry.origin_id.is_empty() {
+                        videos.borrow_mut().insert(entry.origin_id.to_string());
+                    }
+                }
             });
             LibraryItem {
                 id: entry.id.into(),
