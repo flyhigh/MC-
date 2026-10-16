@@ -113,6 +113,8 @@ pub enum UiEvent {
     ImportWallpaper,
     /// 点了消息里那张预览图:把库里这张的**大图**打开(壁纸侧解码 → `PanelHandle::show_viewer`)
     OpenPhoto(String),
+    /// 预览图的右键菜单「设为壁纸」:把这张换到桌面上去(生图不再自动换,这是"用这张"的入口)
+    SetWallpaper(String),
     /// 大图那一层关掉了:把那份像素放掉
     ViewerClosed,
     /// 面板窗口被关掉了
@@ -594,6 +596,14 @@ fn build(state: &PanelState, events: Sender<UiEvent>) -> Result<Panel> {
         let tx = events.clone();
         ui.on_viewer_closed(move || {
             let _ = tx.send(UiEvent::ViewerClosed);
+        });
+    }
+
+    {
+        // 预览图右键「设为壁纸」。和 `OpenPhoto` 一样只递 id:换哪张、换不上怎么办,都在壁纸侧。
+        let tx = events.clone();
+        ui.on_set_as_wallpaper(move |id| {
+            let _ = tx.send(UiEvent::SetWallpaper(id.to_string()));
         });
     }
 

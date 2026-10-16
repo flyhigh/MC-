@@ -623,6 +623,40 @@ component LibraryMenu inherits Rectangle {
     }
 }
 
+// 一条回复下面那张预览图的右键菜单:看大图 / 设为壁纸。
+//
+// 为什么要有它:生图**不再自动换壁纸**了(画完只进库),于是"想用这一张"必须有个当场的入口 ——
+// 让用户切到库页、在一堆缩略图里把刚画出来的那张找出来,正是这一轮要消掉的麻烦。
+//
+// 尺寸(176 × 82)在面板那侧也写着一份(`shot-menu-h`):菜单得知道自己多大,才能贴着窗口边收住
+// (布局撑出来的高度面板读不到)。高度按库菜单那套算:两行 30px + 上下各 6px 内边距 = 72,
+// 再和它一样多留 10px 余量。
+component ShotMenu inherits Rectangle {
+    in property <color> plate: #161B28;
+
+    callback view-picked();
+    callback apply-picked();
+
+    width: 176px;
+    height: 82px;
+    border-radius: 10px;
+    // 实色(不是玻璃):菜单要压住底下的预览图读字
+    background: plate;
+    border-width: 1px;
+    border-color: Glass.hairline;
+
+    VerticalLayout {
+        x: 6px;
+        y: 6px;
+        width: parent.width - 12px;
+        height: parent.height - 12px;
+        spacing: 0px;
+
+        MenuRow { text: "看大图"; picked => { root.view-picked(); } }
+        MenuRow { text: "设为壁纸"; picked => { root.apply-picked(); } }
+    }
+}
+
 // 左栏底部:切到「壁纸参数 / 壁纸库 / 设置」。再点一次回到会话。
 component NavRow inherits Rectangle {
     in property <string> text: "";
@@ -749,6 +783,7 @@ component MessageRow inherits HorizontalLayout {
     in property <bool> photo-gone: false;
 
     callback preview();
+    callback menu-requested(length, length);
 
     // 靠边:用户消息靠右、回复靠左,两侧各留 6px 给圆角喘口气。
     //
@@ -808,11 +843,24 @@ component MessageRow inherits HorizontalLayout {
                 shot-touch := TouchArea {
                     mouse-cursor: pointer;
                     clicked => { root.preview(); }
+                    // 右键:菜单弹在点下去的地方(和库格、会话行同一个写法)。
+                    // **配图已经不在了就不弹** —— 菜单里那两项(看大图 / 设为壁纸)都要去库里找它,
+                    // 弹出来只会让每一行点了都失败;那一行文字已经写着"这张已经不在壁纸库里了"。
+                    pointer-event(e) => {
+                        if (!root.photo-gone
+                            && e.kind == PointerEventKind.down
+                            && e.button == PointerEventButton.right) {
+                            root.menu-requested(
+                                self.absolute-position.x + self.mouse-x,
+                                self.absolute-position.y + self.mouse-y,
+                            );
+                        }
+                    }
                 }
             }
 
             if root.has-shot : Text {
-                text: "点一下看大图";
+                text: "点一下看大图 · 右键可设为壁纸";
                 color: Glass.label-3;
                 font-size: 10px;
                 horizontal-alignment: left;
@@ -1050,6 +1098,12 @@ export component Panel inherits Window {
     // Rust 侧不用管这个数,它只在窗口内收住菜单时用。
     private property <length> lib-menu-h: root.lib-menu-video ? 93px : 123px;
 
+    // —— 消息预览图那张的右键菜单:再一份状态 ——
+    // 存的是**那张图的 id**(不是消息行号):菜单开着的时候用户还能发新消息、删会话,
+    // 行号会指到别处去,id 不会。
+    private property <string> shot-menu-photo: "";
+    private property <length> shot-menu-h: 82px;
+
     callback close-requested();
     callback drag-start();
     callback drag-move();
@@ -1064,6 +1118,8 @@ export component Panel inherits Window {
     callback open-photo(string);
     // 大图关掉了:让壁纸侧把那份像素放掉(它占的是几 MB 的 RGBA)
     callback viewer-closed();
+    // 预览图右键菜单:把这张(id)换到桌面上去。生图不再自动换,这是"我想用这张"的入口。
+    callback set-as-wallpaper(string);
     // 库页那颗「导入图片」:开系统的选文件框,把选中的图收进库里
     callback import-wallpaper();
     callback select-conversation(int);
@@ -1135,6 +1191,16 @@ export component Panel inherits Window {
         root.lib-menu-video = root.library[row].video;
         root.menu-x = max(8px, min(at-x, root.width - root.menu-w - 8px));
         root.menu-y = max(8px, min(at-y, root.height - root.lib-menu-h - 8px));
+    }
+
+    // 消息预览图右键:只记 id 和落点(见 `shot-menu-photo` 的说明)
+    function close-shot-menu() {
+        root.shot-menu-photo = "";
+    }
+    function open-shot-menu(row: int, at-x: length, at-y: length) {
+        root.shot-menu-photo = root.messages[row].photo-id;
+        root.menu-x = max(8px, min(at-x, root.width - root.menu-w - 8px));
+        root.menu-y = max(8px, min(at-y, root.height - root.shot-menu-h - 8px));
     }
 
     // 收掉正在改名的那一行,不提交(改名只有回车算数)
@@ -1582,6 +1648,7 @@ export component Panel inherits Window {
                                 photo-gone: msg.photo-gone;
                                 accent: root.accent;
                                 preview => { root.open-photo(msg.photo-id); }
+                                menu-requested(x, y) => { root.open-shot-menu(i, x, y); }
                             }
                         }
                     }
@@ -2022,7 +2089,8 @@ export component Panel inherits Window {
     }
 
     // 壁纸库那一格的右键菜单浮层。和会话菜单同一个规矩:最后声明 = 盖在所有东西之上。
-    if root.lib-menu-row >= 0 : Rectangle {
+    // 两条都带 `view` 判断:菜单是根级浮层,不带上它就会在切页之后继续压在新页面上。
+    if root.lib-menu-row >= 0 && root.view == 1 : Rectangle {
         x: 0px;
         y: 0px;
         width: 100%;
@@ -2049,6 +2117,33 @@ export component Panel inherits Window {
             delete-picked => {
                 root.delete-wallpaper(root.lib-menu-row);
                 root.close-lib-menu();
+            }
+        }
+    }
+
+    // 消息预览图的右键菜单。规矩同上(最后声明 = 盖在最上面)。
+    if root.shot-menu-photo != "" && root.view == 0 : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+
+        dismiss-shot := TouchArea {
+            clicked => { root.close-shot-menu(); }
+        }
+
+        ShotMenu {
+            x: root.menu-x;
+            y: root.menu-y;
+            plate: root.caption-plate.brighter(0.06);
+
+            view-picked => {
+                root.open-photo(root.shot-menu-photo);
+                root.close-shot-menu();
+            }
+            apply-picked => {
+                root.set-as-wallpaper(root.shot-menu-photo);
+                root.close-shot-menu();
             }
         }
     }

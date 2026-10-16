@@ -567,6 +567,54 @@ fn adopt_photo(
     Ok(active)
 }
 
+/// `save_generated_photo` 的结果。
+struct SavedShot {
+    /// 这张在库里的 id(面板拿它去贴预览图)
+    id: String,
+    title: String,
+    /// 库没写进去、退回到「直接挂上」了吗(那时桌面已经换过了)
+    applied_as_fallback: bool,
+}
+
+/// 把刚画出来的那张**只入库、不上屏**。生图那条路的落地点。
+///
+/// 为什么不像 `adopt_photo` 那样顺手换上:「这回画出来的要不要用」是用户的决定,自动换掉桌面
+/// 等于替他做了决定,还会把他正看着的那张顶下去。用户的原话是:**"生成完不要自动设为壁纸,
+/// 需要放进壁纸库"** —— 想用哪张由他自己说:右键那条回复下面的预览图 →「设为壁纸」。
+///
+/// **入库失败是唯一的例外**:那一刻这张图只存在于内存里,什么都不做等于让用户白等十几秒,
+/// 所以退回老行为(照常挂上)并在状态栏说清楚。库写不进去(只读盘、盘满)本来就罕见,
+/// 真碰上时"图还在"比"库里干净"重要。
+fn save_generated_photo(
+    renderer: &mut Renderer,
+    library: &mut Vec<LibraryEntry>,
+    payload: PhotoPayload,
+    screen: (u32, u32),
+    brightness: f32,
+) -> Result<SavedShot> {
+    match photos::save(&payload.photo, &payload.bytes, &payload.bitmap) {
+        Ok(entry) => {
+            tracing::info!("新壁纸已入库(不自动换上):{}", entry.meta.display());
+            *library = scan_library();
+            Ok(SavedShot {
+                id: entry.photo.id.clone(),
+                title: entry.photo.title.clone(),
+                applied_as_fallback: false,
+            })
+        }
+        Err(err) => {
+            tracing::warn!("入库失败({err:?}),退回「直接挂上」—— 不然这张图就白画了");
+            let title = payload.photo.title.clone();
+            let stored = adopt_photo(renderer, library, payload, screen, brightness)?;
+            Ok(SavedShot {
+                id: stored.photo.id.clone(),
+                title,
+                applied_as_fallback: true,
+            })
+        }
+    }
+}
+
 /// 抬进来的壁纸在库里的 id:**按源文件路径**定,不按时间。
 ///
 /// 为什么:同一张"桌面壁纸"会被反复抬 —— 点两次「用当前壁纸」、`--adopt` 又跑一遍、
@@ -2007,6 +2055,47 @@ fn main() -> Result<()> {
                         handle.clear_viewer();
                     }
                 }
+                // 预览图右键「设为壁纸」:生图不再自动换壁纸之后,这就是"我想用这张"的入口。
+                // 走的还是库页点一张那条路(`switch_to_photo`):两件事本来就是同一件 ——
+                // "把库里第 N 张换到桌面上",只是这次的 N 不是用户点出来的,而是会话里那张图给的。
+                mcwp_ui::UiEvent::SetWallpaper(id) => {
+                    match library
+                        .iter()
+                        .position(|entry| entry.source.photo.id == id)
+                    {
+                        Some(index) => {
+                            match switch_to_photo(&mut renderer, &library, index, screen, brightness) {
+                                Ok(photo) => {
+                                    let title = photo.photo.title.clone();
+                                    tracing::info!("设为壁纸:{title}(会话里的预览图右键)");
+                                    active = Some(photo);
+                                    if let Some(handle) = &panel {
+                                        handle.refresh(panel_state(
+                                            active.as_ref().map(|it| &it.photo),
+                                            &sessions,
+                                            &library,
+                                        ));
+                                        handle.set_status(format!("已设为壁纸「{title}」"));
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!("设为壁纸失败:{err:?}");
+                                    if let Some(handle) = &panel {
+                                        let reason = brief(&format!("{err:#}"));
+                                        handle.set_status(format!("这张打不开:{reason}"));
+                                    }
+                                }
+                            }
+                        }
+                        // 菜单开着的时候图被删了(库里已经找不到)。说清楚,别静默吞掉。
+                        None => {
+                            tracing::warn!("设为壁纸:库里找不到 {id}");
+                            if let Some(handle) = &panel {
+                                handle.set_status("这张已经不在壁纸库里了".to_string());
+                            }
+                        }
+                    }
+                }
                 // 库页工具栏「用当前壁纸」:把桌面上那张抬进来(和 `--adopt` 同一条路)。
                 mcwp_ui::UiEvent::AdoptWallpaper => {
                     match adopt_desktop(&mut renderer, &mut library, screen, brightness) {
@@ -2157,8 +2246,8 @@ fn main() -> Result<()> {
         }
 
         // —— 生图的结果落地 —— 
-        // 只有会话还在才继续:用户可能在等的时候把这条删了,那就别把壁纸也换掉
-        // (删了还生效,比不生效更让人困惑)。
+        // 只有会话还在才继续:用户可能在等的时候把这条删了,那就别再往库里塞一张、也别在
+        // 那儿留一条回复(删了还冒出来,比不冒出来更让人困惑)。
         while let Ok(outcome) = ai_rx.try_recv() {
             let AiOutcome {
                 session,
@@ -2186,27 +2275,31 @@ fn main() -> Result<()> {
                     let calls = payload.calls;
                     let degraded = payload.degraded;
                     let reply = payload.reply.clone();
-                    match adopt_photo(&mut renderer, &mut library, *payload, screen, brightness) {
-                        Ok(photo) => {
-                            let title = photo.photo.title.clone();
-                            let id = photo.photo.id.clone();
-                            active = Some(photo);
+                    // **只入库,不自动换壁纸**(见 `save_generated_photo`)。所以 `active` 这里
+                    // 一个字都不动:桌面还是原来那张,什么时候换由用户在预览图的右键菜单里说。
+                    match save_generated_photo(&mut renderer, &mut library, *payload, screen, brightness)
+                    {
+                        Ok(saved) => {
+                            let title = saved.title;
                             tracing::info!(
-                                "已换上新壁纸:{title} | 提示词调用={calls} | 降级={degraded}"
+                                "本轮出图:{title} | 提示词调用={calls} | 降级={degraded} | 自动上屏={}",
+                                if saved.applied_as_fallback { "是(库写不进去)" } else { "否" }
                             );
-                            let status = if degraded {
-                                format!("模型没接上 · 用你的原话画了「{title}」")
+                            let status = if saved.applied_as_fallback {
+                                format!("已画好「{title}」· 库写不进去,先直接挂上了")
+                            } else if degraded {
+                                format!("模型没接上 · 用你的原话画了「{title}」,已放进壁纸库")
                             } else if calls > 1 {
-                                format!("已换上「{title}」(提示词重试过一次)")
+                                format!("已画好「{title}」放进壁纸库(提示词重试过一次) · 右键预览图可设为壁纸")
                             } else {
-                                format!("已换上「{title}」")
+                                format!("已画好「{title}」放进壁纸库 · 右键预览图可设为壁纸")
                             };
-                            (reply, status, Some(id))
+                            (reply, status, Some(saved.id))
                         }
                         Err(err) => {
-                            tracing::error!("图出来了但上屏失败:{err:?}");
+                            tracing::error!("图出来了但没能留住:{err:?}");
                             let reason = brief(&format!("{err:#}"));
-                            (reply, format!("图出来了但没能上屏:{reason}"), None)
+                            (reply, format!("图出来了但没能入库:{reason}"), None)
                         }
                     }
                 }
