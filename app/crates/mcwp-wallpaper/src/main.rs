@@ -85,6 +85,8 @@ struct PhotoPayload {
     bitmap: mcwp_image::Bitmap,
     /// 提示词那一步是不是走了本地降级
     degraded: bool,
+    /// 这张图**实际**带没带服务商那枚「AI生成」角标(兜底重发过就是带,见 `Images::generate`)
+    watermarked: bool,
     /// 提示词那一步发了几次请求
     calls: u32,
 }
@@ -431,6 +433,7 @@ fn generate_photo(
         bytes: generated.bytes,
         bitmap,
         degraded: plan.degraded,
+        watermarked: generated.watermarked,
         calls: plan.calls,
     })
 }
@@ -898,6 +901,7 @@ fn adopt_desktop(
             bitmap,
             // 这两项如实填:这条路**根本不需要模型**,不是"模型没接上"的降级
             degraded: false,
+            watermarked: false,
             calls: 0,
         },
         screen,
@@ -983,6 +987,7 @@ fn import_photo(
             bytes,
             bitmap,
             degraded: false,
+            watermarked: false,
             calls: 0,
         },
         screen,
@@ -1004,6 +1009,7 @@ fn ai_config_state() -> mcwp_ui::AiConfigState {
         image_model: stored.image_model,
         image_api_key: stored.image_api_key,
         image_quality: stored.image_quality,
+        image_watermark: stored.image_watermark.unwrap_or(mcwp_ai::DEFAULT_IMAGE_WATERMARK),
         // 同理原样给:空串 = 用内置默认(`cogvideox-3`)
         video_model: stored.video_model,
         thinking: mcwp_ui::ThinkingChoice::from_option(stored.thinking),
@@ -2692,6 +2698,7 @@ fn main() -> Result<()> {
                     image_model,
                     image_api_key,
                     image_quality,
+                    image_watermark,
                     video_model,
                 } => {
                     // **先从盘上现读一份**再覆盖回调带来的这几个字段:直接构造一个 `Stored` 会把盘上
@@ -2706,6 +2713,9 @@ fn main() -> Result<()> {
                     stored.image_model = image_model.trim().to_string();
                     stored.image_api_key = image_api_key.trim().to_string();
                     stored.image_quality = image_quality.trim().to_string();
+                    // 面板那颗胶囊永远是个明确的二选一,所以这里写 `Some` ——
+                    // 落盘成 `true` 就是"我就是要带水印",重开程序也还在。
+                    stored.image_watermark = Some(image_watermark);
                     stored.video_model = video_model.trim().to_string();
                     stored.thinking = thinking.to_option();
                     let status = save_ai_config(&stored, &mut ai, &mut images, &mut videos);
@@ -2747,6 +2757,7 @@ fn main() -> Result<()> {
                 Ok(payload) => {
                     let calls = payload.calls;
                     let degraded = payload.degraded;
+                    let payload_watermarked = payload.watermarked;
                     let reply = payload.reply.clone();
                     // **只入库,不自动换壁纸**(见 `save_generated_photo`)。所以 `active` 这里
                     // 一个字都不动:桌面还是原来那张,什么时候换由用户在预览图的右键菜单里说。
@@ -2760,6 +2771,13 @@ fn main() -> Result<()> {
                             );
                             let status = if saved.applied_as_fallback {
                                 format!("已画好「{title}」· 库写不进去,先直接挂上了")
+                            } else if payload_watermarked {
+                                // 兜底重发过:用户看到的是"明明关了水印怎么还有角标",
+                                // 所以这一句必须是状态行里最先看到的那句,并带上原因和出口。
+                                format!(
+                                    "已画好「{title}」放进壁纸库(这张带「AI生成」角标:账号还没签去水印声明)\
+                                     · 右键预览图可设为壁纸"
+                                )
                             } else if degraded {
                                 format!("模型没接上 · 用你的原话画了「{title}」,已放进壁纸库")
                             } else if calls > 1 {

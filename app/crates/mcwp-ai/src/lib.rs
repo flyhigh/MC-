@@ -47,9 +47,11 @@ pub const DEFAULT_MODEL: &str = "glm-4-flash-250414";
 /// 默认生图服务商。还是智谱、还是同一把 key —— 它的免费档 `cogview-3-flash` 实测能出图
 /// (9~16 s 一张,100~230 KB),所以我们不额外引入第二家。
 ///
-/// 免费档的代价是**右下角有"AI生成"水印**(约占宽 9% × 高 5%)。这不影响使用:
-/// 壁纸本来就按 cover 裁,把 UV 往左上挪一点点就把它推出画面了(见 `mcwp-render/src/photo.wgsl`)。
-/// 要彻底没水印就换一家(硅基流动的 Kolors / FLUX.1-schnell 也免费),所以这里必须是配置项。
+/// 免费档默认会在**右下角盖一枚"AI生成"角标**(约占宽 9% × 高 5%)。以前是靠构图那条
+/// cover 裁切顺手把它裁掉的 —— 屏比图宽时上下各裁 5% 左右,**碰巧**盖住它;屏比图窄时
+/// 就原样露在画面里(见 `mcwp-render/src/photo.wgsl` 的 `cover_uv`,它是居中等量裁,
+/// 不是"专门把水印推出画面")。现在改成正路:请求里直接要求别画(见 `DEFAULT_IMAGE_WATERMARK`)。
+/// 要完全绕开这家的水印也可以换一家(硅基流动的 Kolors / FLUX.1-schnell 也免费),所以地址这里是配置项。
 pub const DEFAULT_IMAGE_BASE_URL: &str = DEFAULT_BASE_URL;
 
 /// 默认生图模型。`cogview-3-flash` 是智谱的免费档 —— 想换 `cogview-3` / `cogview-4` 直接改配置。
@@ -64,6 +66,18 @@ pub const DEFAULT_IMAGE_MODEL: &str = "cogview-3-flash";
 ///
 /// 值只认这两个(`4k` 直接 400 Bad Request),所以这里不做"越大越好"的自动升级。
 pub const DEFAULT_IMAGE_QUALITY: &str = "hd";
+
+/// 默认要不要服务商那枚「AI生成」角标:**不要**(`false`)。
+///
+/// 生图请求里有个 `watermark_enabled`,不写就是 `true`(显式角标 + 隐式数字水印)。
+/// 官方给的关法是账号先签「去水印」免责声明(个人中心 → 安全管理 → 去水印管理),
+/// 那侧放开之后请求里传 `false` 才生效;**没签的账号会被服务商拒**,所以这里不是
+/// 一了百了的开关,`Images::generate` 里配了一条针对性的兜底:只在这种报错上
+/// 退回带水印重发一次(见 `is_watermark_refusal`)。
+///
+/// 实测(2026-10-16,同一句提示词、同样 1024×1024):`true` 那次右下角有「AI生成」,
+/// `false` 那次干干净净,两次都是 HTTP 200。
+pub const DEFAULT_IMAGE_WATERMARK: bool = false;
 
 /// 默认的「图生视频」模型。
 ///
@@ -192,6 +206,11 @@ pub struct Stored {
     /// `DEFAULT_IMAGE_QUALITY`),免得老配置文件升级上来反而变糊。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub image_quality: String,
+    /// 生图带不带「AI生成」角标。**留空是合法的**:空 = 用内置默认(`false`,见
+    /// `DEFAULT_IMAGE_WATERMARK`)。写 `Option<bool>` 而不是 `bool`,是为了区分
+    /// "用户明确要带水印"和"还没设过" —— 前者才落盘,后者连字段都不出现。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_watermark: Option<bool>,
     /// 「图生视频」那一套。它和生图**基本总是同一家**(同一把 key 的同一个接口域下),
     /// 所以这里只留一个模型名:地址和 key 都从生图 / 对话那两组继承下来(见 `VideosConfig::load`)。
     /// 真要用另一家,再补字段不迟 —— 现在多两个输入框只会让人不知道该填哪个。
@@ -341,7 +360,10 @@ fn missing_image_key_hint() -> String {
          生图默认**跟对话共用同一把 key**(智谱一把 key 管两个接口),想分开就再填 \
          image_base_url / image_model / image_api_key。\n\
          image_quality 只认 hd(默认,细节多)和 standard(服务商默认,明显更糊)。\n\
-         临时试一家也可以只设环境变量 MCWP_IMAGE_KEY / MCWP_IMAGE_BASE_URL / MCWP_IMAGE_MODEL / MCWP_IMAGE_QUALITY。"
+         image_watermark 是\"要不要服务商那枚「AI生成」角标\",默认 false(不带);\
+         关得掉的前提是账号先在「个人中心 → 安全管理 → 去水印管理」签过免责声明。\n\
+         临时试一家也可以只设环境变量 MCWP_IMAGE_KEY / MCWP_IMAGE_BASE_URL / MCWP_IMAGE_MODEL / \
+         MCWP_IMAGE_QUALITY / MCWP_IMAGE_WATERMARK。"
     )
 }
 
@@ -356,6 +378,8 @@ pub struct ImagesConfig {
     pub api_key: String,
     /// 画质:`hd` / `standard`。别的值服务商会 400,所以这里不做"猜你想说什么"。
     pub quality: String,
+    /// 带不带「AI生成」角标。见 `DEFAULT_IMAGE_WATERMARK` —— 关掉它需要账号先签名。
+    pub watermark: bool,
 }
 
 impl ImagesConfig {
@@ -376,6 +400,12 @@ impl ImagesConfig {
         let quality = env("MCWP_IMAGE_QUALITY")
             .or_else(|| non_empty(&raw.image_quality))
             .unwrap_or_else(|| DEFAULT_IMAGE_QUALITY.to_string());
+        // 认不出的写法**继续往下走**(`and_then` 会把 `None` 留在原地),最后落到内置默认 ——
+        // 见 `parse_bool`:用户写了个没见过的词时,拿它当 `false` 或者当 `true` 都是替人做决定。
+        let watermark = env("MCWP_IMAGE_WATERMARK")
+            .and_then(|value| parse_bool(&value))
+            .or(raw.image_watermark)
+            .unwrap_or(DEFAULT_IMAGE_WATERMARK);
         let Some(api_key) = env("MCWP_IMAGE_KEY")
             .or_else(|| non_empty(&raw.image_api_key))
             .or_else(|| env("MCWP_AI_KEY"))
@@ -388,6 +418,7 @@ impl ImagesConfig {
             model,
             api_key,
             quality,
+            watermark,
         })
     }
 }
@@ -414,6 +445,28 @@ pub struct Images {
 pub struct GeneratedImage {
     pub url: String,
     pub bytes: Vec<u8>,
+    /// 这张图**实际**带不带那枚「AI生成」角标。
+    ///
+    /// 它不是"配置里怎么写的",而是"这一张是怎么出来的":配置要的是不带,而账号没签
+    /// 去水印声明时兜底重发过一次 —— 那种情况下调用方得能告诉用户"这张是带水印的",
+    /// 不然用户只会看到一个角标,不知道是哪儿来的(见 `generate`)。
+    pub watermarked: bool,
+}
+
+/// 一次生图请求的原始回执:状态码 + 响应体文本。
+struct ImageReply {
+    status: u16,
+    body: String,
+}
+
+/// 这次报错说的是不是「你还不许去掉水印」。
+///
+/// **只在报错正文提到水印时才算**。理由:兜底重发是"用另一组参数再发一次",判断放宽了
+/// 就会把别的错误(参数不合法、欠费、模型下线)也重发一遍 —— 轻则白等一轮,重则在
+/// 按张计费的服务商那边多花一次钱。认不出来就只是不重发,报错原样往上抛。
+fn is_watermark_refusal(status: u16, body: &str) -> bool {
+    (400..500).contains(&status)
+        && (body.contains("watermark") || body.contains("水印"))
 }
 
 impl Images {
@@ -442,9 +495,15 @@ impl Images {
             .nth(1)
             .and_then(|rest| rest.split('/').next())
             .unwrap_or(&self.cfg.base_url);
-        // 画质也写进来:这行是 `--images-selftest` 唯一能自己交代"按哪一档出图"的地方,
-        // 而"为什么这么糊"那个问题,答案十有八九就在这几个字上(见 §11.24)。
-        format!("{host} · {} · {}", self.cfg.model, self.cfg.quality)
+        // 画质和水印都写进来:这行是 `--images-selftest` 唯一能自己交代"按哪一档、带不带角标
+        // 出图"的地方,而"为什么这么糊""怎么有个 AI 生成"这类问题,答案十有八九就在这几个字上
+        // (见 §11.24 / §11.25)。
+        format!(
+            "{host} · {} · {} · {}",
+            self.cfg.model,
+            self.cfg.quality,
+            if self.cfg.watermark { "带水印" } else { "无水印" }
+        )
     }
 
     /// `base_url` 后面补 `/images/generations`。写成完整 endpoint 也认。
@@ -463,28 +522,27 @@ impl Images {
     /// 而壁纸是要长期留着的。存 URL = 存一个七天后的死链。
     pub fn generate(&self, prompt: &str, width: u32, height: u32) -> Result<GeneratedImage> {
         let (width, height) = fit_size(width, height);
-        let body = serde_json::to_string(&ImageRequest {
-            model: self.cfg.model.as_str(),
-            prompt,
-            size: format!("{width}x{height}"),
-            quality: self.cfg.quality.as_str(),
-        })?;
-        let mut response = self
-            .agent
-            .post(&self.endpoint())
-            .header("Content-Type", "application/json")
-            .header("Authorization", &format!("Bearer {}", self.cfg.api_key))
-            .send(body.as_str())
-            .map_err(|err| anyhow!("请求生图失败:{err}"))?;
-        let status = response.status();
-        let raw = response.body_mut().read_to_string().context("读生图响应失败")?;
-        if !status.is_success() {
+        let size = format!("{width}x{height}");
+        // 按配置来;被拒了再退回带水印的(见 `is_watermark_refusal`)。
+        // `watermark` 这个局部量跟着**实际发出去的那个值**走,所以最后那行日志说的是真话。
+        let mut watermark = self.cfg.watermark;
+        let mut reply = self.post_image(prompt, &size, watermark)?;
+        if !watermark && is_watermark_refusal(reply.status, &reply.body) {
+            tracing::warn!(
+                "生图接口拒了「不带水印」这个要求,多半是这个账号还没签「去水印」免责声明\
+                 (个人中心 → 安全管理 → 去水印管理);这一张退回带水印重发"
+            );
+            watermark = true;
+            reply = self.post_image(prompt, &size, watermark)?;
+        }
+        if !(200..300).contains(&reply.status) {
             return Err(anyhow!(
                 "生图接口返回 {}:{}",
-                status.as_u16(),
-                truncate(&raw, 300)
+                reply.status,
+                truncate(&reply.body, 300)
             ));
         }
+        let raw = reply.body;
         let parsed: ImageResponse = serde_json::from_str(&raw)
             .with_context(|| format!("生图响应没有 data[].url:{}", truncate(&raw, 200)))?;
         let url = parsed
@@ -495,14 +553,46 @@ impl Images {
             .ok_or_else(|| anyhow!("生图接口说成功了,但没给图片地址"))?;
         let bytes = self.download(&url)?;
         tracing::info!(
-            "生图完成:{}×{} · {} · {} KB · {}",
+            "生图完成:{}×{} · {} · {} · {} KB · {}",
             width,
             height,
             self.cfg.quality,
+            if watermark { "带水印" } else { "无水印" },
             bytes.len() / 1024,
             truncate(prompt, 60)
         );
-        Ok(GeneratedImage { url, bytes })
+        Ok(GeneratedImage {
+            url,
+            bytes,
+            watermarked: watermark,
+        })
+    }
+
+    /// 发一次生图请求,把状态码和响应体原样拿回来。
+    ///
+    /// 拆出来是为了那条兜底重发:同一句提示词、同一个尺寸要发两次,而"发 + 读回 body"
+    /// 这段没有理由写两遍(写两遍就会有一遍漏掉超时/鉴权头的改动)。
+    fn post_image(&self, prompt: &str, size: &str, watermark: bool) -> Result<ImageReply> {
+        let body = serde_json::to_string(&ImageRequest {
+            model: self.cfg.model.as_str(),
+            prompt,
+            size: size.to_string(),
+            quality: self.cfg.quality.as_str(),
+            watermark_enabled: watermark,
+        })?;
+        let mut response = self
+            .agent
+            .post(&self.endpoint())
+            .header("Content-Type", "application/json")
+            .header("Authorization", &format!("Bearer {}", self.cfg.api_key))
+            .send(body.as_str())
+            .map_err(|err| anyhow!("请求生图失败:{err}"))?;
+        let status = response.status().as_u16();
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .context("读生图响应失败")?;
+        Ok(ImageReply { status, body })
     }
 
     /// 把图片 URL 抓成字节。走同一个 agent(超时和 TLS 配置都现成)。
@@ -1188,6 +1278,19 @@ fn non_empty(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// 环境变量里的布尔:`1` / `true` / `on` / `yes` 和 `0` / `false` / `off` / `no` 都认。
+///
+/// **认不出来就返回 `None`**(于是继续往下走 `ai.json`、再走内置默认),而不是替用户挑一个。
+/// 写成 `unwrap_or(false)` 是那种最烦人的错法:`MCWP_IMAGE_WATERMARK=0off` 这类手滑会
+/// 静默变成"关掉水印",而用户以为自己已经关上了。
+fn parse_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
 /// 截断到 `max` 个字符(按字符数,不按字节 —— 中文按字节截会切出半个字)。
 fn truncate(text: &str, max: usize) -> String {
     let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1747,6 +1850,8 @@ struct ImageRequest<'a> {
     /// `hd` / `standard`。**必须显式带上**:不写这个字段就是 standard,
     /// 而 standard 出图明显更糊(实测高频细节差 41%)。
     quality: &'a str,
+    /// 带不带「AI生成」角标。**同样显式带上**:不写就是 `true`。
+    watermark_enabled: bool,
 }
 
 /// 生图响应。只有一个字段真的有用:`data[0].url`。
@@ -1775,6 +1880,7 @@ mod tests {
             prompt: "雪山湖的清晨",
             size: "1920x1088".to_string(),
             quality: DEFAULT_IMAGE_QUALITY,
+            watermark_enabled: DEFAULT_IMAGE_WATERMARK,
         })
         .unwrap();
         assert!(
@@ -1783,6 +1889,68 @@ mod tests {
         );
         // 别的值服务商会 400,所以默认值只能是这两个中的一个
         assert!(matches!(DEFAULT_IMAGE_QUALITY, "hd" | "standard"));
+    }
+
+    /// 水印这个字段同样**不能漏**:不写就是 `true`,服务商会往右下角盖一枚「AI生成」。
+    /// 而且它必须是**显式的布尔**:`false` 和"没这个字段"在服务商那边是两件事。
+    #[test]
+    fn 生图请求体里明确写了要不要水印() {
+        let body = serde_json::to_string(&ImageRequest {
+            model: DEFAULT_IMAGE_MODEL,
+            prompt: "雪山湖的清晨",
+            size: "1920x1088".to_string(),
+            quality: DEFAULT_IMAGE_QUALITY,
+            watermark_enabled: DEFAULT_IMAGE_WATERMARK,
+        })
+        .unwrap();
+        assert!(
+            body.contains("\"watermark_enabled\":false"),
+            "默认这一档应该是「不带水印」,而请求体里是:{body}"
+        );
+        assert!(!DEFAULT_IMAGE_WATERMARK, "默认值变了,记得同步这条测试");
+
+        // 反过来也得写出来(用户显式要带水印时)
+        let body = serde_json::to_string(&ImageRequest {
+            model: DEFAULT_IMAGE_MODEL,
+            prompt: "雪山湖的清晨",
+            size: "1920x1088".to_string(),
+            quality: DEFAULT_IMAGE_QUALITY,
+            watermark_enabled: true,
+        })
+        .unwrap();
+        assert!(body.contains("\"watermark_enabled\":true"), "{body}");
+    }
+
+    /// 兜底重发的那道闸:只认"报错正文提到水印"的这一种,别把别的 4xx 也吞下去重发。
+    #[test]
+    fn 只在水印被拒时才兜底重发() {
+        // 认得出的:提到 watermark / 水印
+        assert!(is_watermark_refusal(
+            400,
+            r#"{"error":{"code":"1214","message":"watermark_enabled=false 需要先签署免责声明"}}"#
+        ));
+        assert!(is_watermark_refusal(403, "该账号未开通去水印权限"));
+        // 认不出的:别的 400(参数不合法 / 欠费 / 模型不存在)一律不重发
+        assert!(!is_watermark_refusal(400, r#"{"error":{"message":"size 不合法"}}"#));
+        assert!(!is_watermark_refusal(401, r#"{"error":{"message":"invalid api key"}}"#));
+        // 200 更不该被当成"被拒" —— 那会白画第二张
+        assert!(!is_watermark_refusal(200, "ok"));
+        // 5xx 也不重发:服务端自己出问题,重发只是再等一轮 45 秒
+        assert!(!is_watermark_refusal(500, "watermark service unavailable"));
+    }
+
+    /// 环境变量里的布尔只认常见写法,认不出的**往下走**而不是替用户挑一个。
+    #[test]
+    fn 环境变量那个布尔认不出就不猜() {
+        for raw in ["1", "true", "TRUE", "on", "Yes", " true "] {
+            assert_eq!(parse_bool(raw), Some(true), "{raw} 应该算真");
+        }
+        for raw in ["0", "false", "OFF", "no", "False"] {
+            assert_eq!(parse_bool(raw), Some(false), "{raw} 应该算假");
+        }
+        for raw in ["", "0off", "也许", "nope", "2"] {
+            assert_eq!(parse_bool(raw), None, "{raw} 不该被当成一个确定的值");
+        }
     }
 
     /// 尺寸这条规则是**实测出来的**,不是猜的:服务商要求宽高都是 16 的倍数、各自 512~2880、

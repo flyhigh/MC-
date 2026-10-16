@@ -90,6 +90,9 @@ pub enum UiEvent {
         image_api_key: String,
         /// 生图画质:`hd` / `standard`
         image_quality: String,
+        /// 生图带不带「AI生成」角标。面板给的是"加 / 不加"的意思,
+        /// 能不能真不加由服务商那边定(账号要先签去水印声明),见 `mcwp_ai::DEFAULT_IMAGE_WATERMARK`。
+        image_watermark: bool,
         /// 图生视频的模型名;留空 = 用内置默认
         video_model: String,
     },
@@ -183,6 +186,8 @@ pub struct AiConfigState {
     /// 生图画质(`hd` / `standard`)。界面是一排小胶囊(见 `QualityChoice`),
     /// 传下来的是落盘用的那个字符串 —— 面板不认识服务商的取值,只负责原样搬。
     pub image_quality: String,
+    /// 生图带不带服务商那枚「AI生成」角标(界面是「不加 / 加」两颗胶囊)。
+    pub image_watermark: bool,
     /// 图生视频的模型名。**留空是合法的**:空 = 用内置默认(`cogvideox-3`)。
     /// 地址和 Key 不在这儿 —— 图生视频和生图基本总是同一家,那两个跟着生图那组走。
     pub video_model: String,
@@ -293,6 +298,27 @@ impl QualityChoice {
         } else {
             Self::Hd
         }
+    }
+}
+
+/// 设置页里「生图水印」这一项:0 = 不加 / 1 = 加。
+///
+/// **默认不加**:右上角那枚「AI生成」是服务商盖的,官方给的关法是账号先签「去水印」
+/// 免责声明(个人中心 → 安全管理 → 去水印管理),那侧放开之后请求里传 `false` 才生效。
+/// 没签的账号那条请求会被拒 —— 所以壁纸侧配了一条针对性的兜底重发
+/// (见 `mcwp_ai::Images::generate`),这里的开关只表达"我就是要带水印"。
+///
+/// 认不出的下标按**不加**处理:这个开关的默认值就该是不加。
+fn watermark_from_index(index: i32) -> bool {
+    index == 1
+}
+
+/// 反过来:`ai.json` 里那个布尔 → 面板上的下标。
+fn watermark_index(watermark: bool) -> i32 {
+    if watermark {
+        1
+    } else {
+        0
     }
 }
 
@@ -666,7 +692,7 @@ fn build(state: &PanelState, events: Sender<UiEvent>) -> Result<Panel> {
     {
         // 设置页的「保存」。面板只把四个值原样递出去 —— 校验、落盘、重建客户端都在壁纸侧。
         let tx = events.clone();
-        ui.on_save_ai_config(move |base_url, model, api_key, thinking, image_base_url, image_model, image_api_key, image_quality, video_model| {
+        ui.on_save_ai_config(move |base_url, model, api_key, thinking, image_base_url, image_model, image_api_key, image_quality, image_watermark, video_model| {
             let _ = tx.send(UiEvent::SaveAiConfig {
                 base_url: base_url.to_string(),
                 model: model.to_string(),
@@ -676,6 +702,7 @@ fn build(state: &PanelState, events: Sender<UiEvent>) -> Result<Panel> {
                 image_model: image_model.to_string(),
                 image_api_key: image_api_key.to_string(),
                 image_quality: QualityChoice::from_index(image_quality).value(),
+                image_watermark: watermark_from_index(image_watermark),
                 video_model: video_model.to_string(),
             });
         });
@@ -991,6 +1018,7 @@ fn apply_ai(ui: &Panel, ai: &AiConfigState) {
     ui.set_ai_image_model(ai.image_model.clone().into());
     ui.set_ai_image_key(ai.image_api_key.clone().into());
     ui.set_ai_image_quality(QualityChoice::from_value(&ai.image_quality).index());
+    ui.set_ai_image_watermark(watermark_index(ai.image_watermark));
     ui.set_ai_video_model(ai.video_model.clone().into());
     ui.set_ai_thinking(ai.thinking.index());
     ui.set_ai_env_override(ai.env_override);

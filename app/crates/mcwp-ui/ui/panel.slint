@@ -1042,6 +1042,10 @@ export component Panel inherits Window {
     // hd / standard 两个字面值,面板原样交给 Rust 落盘(`QualityChoice`)。
     // 默认高清:standard 出来的图明显更糊(实测高频细节少 41%)。
     in-out property <int> ai-image-quality: 1;
+    // 生图水印:0 = 不加 / 1 = 加。**默认不加** —— 那枚「AI生成」是服务商盖的,
+    // 关掉它要账号先在「个人中心 → 安全管理 → 去水印管理」签过免责声明;
+    // 没签的账号请求会被拒,壁纸侧会退回带水印重发一张(见 `mcwp_ai::Images::generate`)。
+    in-out property <int> ai-image-watermark: 0;
     // 图生视频的模型名。地址和 key 都跟生图那组走(同一家服务商的同一个接口域),
     // 所以这里只留一个模型名 —— 多两个输入框只会让人不知道该填哪个(见 `VideosConfig::load`)。
     in-out property <string> ai-video-model: "";
@@ -1148,7 +1152,7 @@ export component Panel inherits Window {
     // 把「现在桌面上那张壁纸」抬进来当作一张新的(生图之前先有东西可看)
     callback adopt-wallpaper();
     // 设置页:保存模型配置(接口地址 / 模型名 / API Key / 深度思考那一档的下标)
-    callback save-ai-config(string, string, string, int, string, string, string, int, string);
+    callback save-ai-config(string, string, string, int, string, string, string, int, int, string);
 
     title: "MC 壁纸 · 控制面板";
     // 任务栏 / Alt-Tab 的窗口图标。`@image-url` 走的还是 build.rs 的 EmbedFiles,所以图标
@@ -1924,6 +1928,18 @@ export component Panel inherits Window {
                             font-size: 10px;
                             wrap: word-wrap;
                         }
+                        ChoiceRow {
+                            label: "生图水印";
+                            options: ["不加", "加"];
+                            current <=> root.ai-image-watermark;
+                            accent: root.accent;
+                        }
+                        Text {
+                            text: "「AI生成」那枚角标是服务商盖的,不是我们画的。想不加,先在智谱「个人中心 → 安全管理 → 去水印管理」签过免责声明;没签的账号这条请求会被拒,程序会自动退回带水印再画一张,并在状态栏说明。";
+                            color: Glass.label-3;
+                            font-size: 10px;
+                            wrap: word-wrap;
+                        }
                         FieldRow {
                             label: "视频模型名";
                             placeholder: "留空 = cogvideox-3";
@@ -1956,6 +1972,7 @@ export component Panel inherits Window {
                                             root.ai-image-model,
                                             root.ai-image-key,
                                             root.ai-image-quality,
+                                            root.ai-image-watermark,
                                             root.ai-video-model
                                         );
                                     }
