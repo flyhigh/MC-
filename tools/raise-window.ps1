@@ -6,6 +6,11 @@
 # `HWND_TOP` 才是这里想要的语义:"这一次排到 z 序最前",用户点别的窗口照样能盖住它。
 #
 # 开头那次 `HWND_NOTOPMOST` 是**清历史遗留**:老版本脚本钉上去的状态,由这个工具顺手解开。
+#
+# `SetForegroundWindow` 单独用是**不可靠的**:当前前台不是自己时,系统按"前台锁"直接拒掉它
+# (表现是脚本说 raised,截图里还是别的窗口盖着面板 —— 这也是老版本改用 TOPMOST 的真正原因)。
+# 标准绕法是 `AttachThreadInput`:把本线程挂到当前前台窗口的线程上,让系统认为两边共用一个
+# 输入队列,这时 `SetForegroundWindow` 才会被接受,而且**不碰窗口样式**。
 param(
     [Parameter(Mandatory=$true)][string]$ProcessName,
     [string]$MatchTitle
@@ -16,6 +21,11 @@ Add-Type -Namespace Mcwp -Name Win -MemberDefinition @"
 [DllImport("user32.dll", SetLastError=true)] public static extern bool SetForegroundWindow(IntPtr hWnd);
 [DllImport("user32.dll", SetLastError=true)] public static extern bool ShowWindow(IntPtr hWnd, int cmd);
 [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr GetWindowLongPtrW(IntPtr hWnd, int idx);
+[DllImport("user32.dll", SetLastError=true)] public static extern bool BringWindowToTop(IntPtr hWnd);
+[DllImport("user32.dll", SetLastError=true)] public static extern IntPtr GetForegroundWindow();
+[DllImport("user32.dll", SetLastError=true)] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr pid);
+[DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+[DllImport("user32.dll", SetLastError=true)] public static extern bool AttachThreadInput(uint attach, uint attachTo, bool fAttach);
 "@
 
 $HWND_TOP = [IntPtr]::Zero
@@ -43,5 +53,17 @@ if (([Mcwp.Win]::GetWindowLongPtrW($h, -20).ToInt64() -band $WS_EX_TOPMOST) -ne 
 }
 [Mcwp.Win]::SetWindowPos($h, $HWND_NOTOPMOST, 0, 0, 0, 0, ($SWP_NOMOVE -bor $SWP_NOSIZE -bor $SWP_SHOWWINDOW)) | Out-Null
 [Mcwp.Win]::SetWindowPos($h, $HWND_TOP, 0, 0, 0, 0, ($SWP_NOMOVE -bor $SWP_NOSIZE -bor $SWP_SHOWWINDOW)) | Out-Null
+
+# 把本线程挂到当前前台窗口的线程上,绕开前台锁,再提窗口;提完立刻解开挂接。
+$mine = [Mcwp.Win]::GetCurrentThreadId()
+$fg = [Mcwp.Win]::GetForegroundWindow()
+$fgThread = if ($fg -eq [IntPtr]::Zero) { 0 } else { [Mcwp.Win]::GetWindowThreadProcessId($fg, [IntPtr]::Zero) }
+$attached = $false
+if ($fgThread -ne 0 -and $fgThread -ne $mine) {
+    $attached = [Mcwp.Win]::AttachThreadInput($mine, $fgThread, $true)
+}
+[Mcwp.Win]::BringWindowToTop($h) | Out-Null
+[Mcwp.Win]::SetWindowPos($h, $HWND_TOP, 0, 0, 0, 0, ($SWP_NOMOVE -bor $SWP_NOSIZE -bor $SWP_SHOWWINDOW)) | Out-Null
 [Mcwp.Win]::SetForegroundWindow($h) | Out-Null
+if ($attached) { [Mcwp.Win]::AttachThreadInput($mine, $fgThread, $false) | Out-Null }
 "raised: pid=$($target.Id) title='$($target.MainWindowTitle)'"

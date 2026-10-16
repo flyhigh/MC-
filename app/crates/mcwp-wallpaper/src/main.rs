@@ -931,9 +931,53 @@ fn trace_chain(_hwnd: windows::Win32::Foundation::HWND, _label: &str) {
     mcwp_platform::diag::describe_chain(_hwnd, _label);
 }
 
+/// `--plan <一句话>`:只跑**提示词那一步**,把发给模型的请求、和模型给的计划原样打出来。
+///
+/// 为什么不直接用 `--images-selftest`:那个要跑完整条链路(等图十几秒、还要落一份预览文件),
+/// 而"画歪了"最常见的坏法恰恰是**提示词先歪了** —— 调提示词时这里一次调用只要几秒钟,
+/// 不建窗口、不出图、不进库。`--plan-current <库 id>` 能把"现在屏幕上那张"一并带上,
+/// 复现面板里的上下文(同一个提示词,带不带当前壁纸,给出来的东西可能完全不同)。
+fn run_plan_selftest(request: &str, current_id: Option<&str>) -> Result<()> {
+    let chat = mcwp_ai::Client::new(mcwp_ai::Config::load()?);
+    let current = match current_id {
+        Some(id) => Some(
+            photos::load(id)
+                .with_context(|| format!("库里找不到这张:{id}"))?
+                .photo,
+        ),
+        None => None,
+    };
+
+    println!("对话:{}", chat.describe());
+    println!("用户说:{request}");
+    println!(
+        "当前壁纸:{}",
+        current
+            .as_ref()
+            .map(|photo| photo.title.as_str())
+            .unwrap_or("(没有 · 和面板第一次打开时一样)")
+    );
+    println!("\n---- 发给模型的用户消息 ----");
+    println!("{}", mcwp_ai::photo_request(request, current.as_ref()));
+
+    println!("\n---- 模型给的计划 ----");
+    let started = Instant::now();
+    let plan = chat.plan_photo(request, current.as_ref());
+    println!(
+        "耗时:{:.1}s · 调用 {} 次 · 降级:{}",
+        started.elapsed().as_secs_f32(),
+        plan.calls,
+        if plan.degraded { "是(退化成拿原话去画)" } else { "否" }
+    );
+    println!("回复:{}", plan.reply);
+    println!("标题:{}", plan.title);
+    println!("提示词:{}", plan.image_prompt);
+    println!("动效:{}", plan.motion.summary());
+    Ok(())
+}
 /// `--images-selftest`:把整条生图链路跑一遍,原样摊开。
 ///
-/// 和 `--ai-selftest` 是一对:那个看"提示词那一步",这个看"图有没有出来"。
+/// 和 `--plan` 是一对:那个看"提示词那一步",这个看"图有没有出来"。
 /// 两层都打出来,是因为出图难看时你得先知道是提示词写歪了、还是模型画歪了。
 fn run_images_selftest(request: &str, screen: (u32, u32)) -> Result<()> {
     let chat = mcwp_ai::Client::new(mcwp_ai::Config::load()?);
@@ -1263,6 +1307,10 @@ struct Args {
     adopt: bool,
     /// 只跑一遍生图链路、打印结果就退出(不建窗口)
     images_selftest: Option<String>,
+    /// 只跑**提示词那一步**、把请求和模型给的计划打印出来就退出(不建窗口、不出图)
+    plan: Option<String>,
+    /// `--plan` 的伴生参数:带上"现在屏幕上那张"(库 id),复现面板里的上下文
+    plan_current: Option<String>,
     /// 把库里某一张(静图)**做成动态壁纸**,跑完整条链路再上屏(不建面板)
     animate: Option<String>,
     /// 只解一段 mp4、打印几帧的统计就退出(不建窗口)—— 视频解码那条路唯一的自检入口。
@@ -1290,6 +1338,8 @@ impl Args {
             photo_id: None,
             adopt: false,
             images_selftest: None,
+            plan: None,
+            plan_current: None,
             animate: None,
             video_selftest: None,
             stats_interval: Duration::from_secs(5),
@@ -1371,6 +1421,14 @@ impl Args {
                     args.images_selftest = value.cloned();
                     i += 2;
                 }
+                "--plan" => {
+                    args.plan = value.cloned();
+                    i += 2;
+                }
+                "--plan-current" => {
+                    args.plan_current = value.cloned();
+                    i += 2;
+                }
                 "--animate" => {
                     args.animate = value.cloned();
                     i += 2;
@@ -1415,6 +1473,7 @@ fn main() -> Result<()> {
         || args.gdi_only
         || args.selftest
         || args.images_selftest.is_some()
+        || args.plan.is_some()
         || args.video_selftest.is_some();
     if !is_diagnostic_run && !claim_single_instance() {
         return Ok(());
@@ -1424,6 +1483,11 @@ fn main() -> Result<()> {
     if let Some(request) = args.images_selftest.as_deref() {
         // 还不知道真实屏幕尺寸(窗口还没建),但生图尺寸只影响出图分辨率,不影响链路
         run_images_selftest(request, (1920, 1080))?;
+        return Ok(());
+    }
+    // 「只看提示词那一步」:一次调用几秒钟,调提示词时不用等图、不用建窗口、不进库。
+    if let Some(request) = args.plan.as_deref() {
+        run_plan_selftest(request, args.plan_current.as_deref())?;
         return Ok(());
     }
     // 「只解一段视频」同理:不建窗口、不占桌面,接解码那条路时唯一需要的调试入口。
