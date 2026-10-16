@@ -609,7 +609,9 @@ fn animate_photo(
     }
     // 3 · **首尾帧**(首帧=尾帧=这张图)逼模型把画面绕回起点,循环才接得上;时长要 10 秒
     //     (和 5 秒同价,素材翻倍 —— 头尾的抖动都能丢)。
-    let generated = videos.animate_looped(&image_url, &motion)?;
+    // 尺寸**必须自己报**(见 `mcwp_ai::VIDEO_SIZES`):留空让服务端按原图比例推,某些比例会推出
+    // 一个奇数长边然后 FAIL,而且一个字都不解释。报屏幕那一档还顺手对上"屏幕多大就要多大"。
+    let generated = videos.animate_looped(&image_url, &motion, screen)?;
     video_payload_from_bytes(&source, plan, generated.bytes, screen)
 }
 

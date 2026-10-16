@@ -24,8 +24,12 @@ r"""假的「图生视频」服务 —— 给会话里那颗「生成动图」�
 `--video <mp4>` 指定出片时给哪一段(默认拿本机壁纸库里的第一段 mp4)——
 走完之后主线程要解封面、入库,那条路只有给一段**真 mp4** 才能验到底。
 
-请求体(几兆的 base64 图)不解析,只读掉收工 —— 这里要验的是客户端的行为,不是它的 payload。
-收了多少字节、被叫了几次,都写进 `--log`(默认 fake-video.log),方便断言"到底打了几次"。
+请求体(几兆的 base64 图)不整个解析成 JSON,但会**用正则把 `size` 抠出来记一笔**:真花钱的
+那一步就在提交,而"没报 size"正是把片子做死的原因(见 `mcwp_ai::VIDEO_SIZES`)。少了这个字段
+就没人知道客户端到底报没报,所以**抠不到就大声告警**。
+
+收了多少字节、被叫了几次、`size` 是哪一档,都写进 `--log`(默认 fake-video.log),
+方便断言"到底打了几次 / 报了哪一档"。
 """
 
 import argparse
@@ -49,6 +53,19 @@ def library_sample():
     return found[0] if found else None
 
 
+# 请求体里字段的顺序是 model / prompt / image_url / size / ...(`VideoRequest` 的字段顺序),
+# 也就是说 `size` 排在那一大坨 base64 **后面** —— 想拿到它只能扫全文,没法只看开头。
+# 不用担心扫到 prompt 里"看起来像 size"的文字:JSON 字符串里的引号一定是转义的(`\"`),
+# 而 base64 的字母表里压根没有引号,所以第一个 `"size"` 就是那个真字段。
+SIZE_RE = re.compile(rb'"size"\s*:\s*"([^"]{1,16})"')
+
+
+def parse_size(blob):
+    """从请求体里抠出 `size`,抠不到回 None(调用方会告警)。"""
+    match = SIZE_RE.search(blob)
+    return match.group(1).decode("ascii", "replace") if match else None
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -69,17 +86,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
-        # 只读掉,不解析:请求体里是整张图的 base64,几兆,解析它没有意义
-        if length:
-            self.rfile.read(length)
+        # 不整个解析:请求体里是整张图的 base64,几兆,解析它没有意义。
+        # 但 `size` 得读出来 —— 它躲在一大坨 base64 后面,所以只能扫全文。
+        blob = self.rfile.read(length) if length else b""
         if not self.path.endswith("/videos/generations"):
             self._say(404, {"error": "no such endpoint"})
             return
+        size = parse_size(blob)
         with LOCK:
             ARGS.seq += 1
             task = "fake-%d" % ARGS.seq
             COUNTS[task] = 0
-        self._log("submit %s bytes=%d -> %s" % (self.path, length, task))
+        self._log("submit %s bytes=%d size=%s -> %s"
+                  % (self.path, length, size if size else "(没报!)", task))
+        if size is None:
+            # 别让它静静过去:这条断言就是"客户端必须显式报 size"这个决定本身
+            print("!! 提交里没有 size —— 真服务商会对某些比例直接 FAIL(见 mcwp_ai::VIDEO_SIZES)")
         self._say(200, {"id": task})
 
     def do_GET(self):

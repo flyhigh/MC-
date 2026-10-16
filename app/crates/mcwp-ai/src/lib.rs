@@ -782,20 +782,32 @@ impl Videos {
     }
 
     /// 提交一条图生视频任务,拿回任务号。
-    pub fn submit(&self, image_url: &str, prompt: &str) -> Result<String> {
-        self.submit_image(VideoImage::One(image_url), prompt)
+    pub fn submit(&self, image_url: &str, prompt: &str, screen: (u32, u32)) -> Result<String> {
+        self.submit_image(VideoImage::One(image_url), prompt, screen)
     }
 
     /// 提交一条**首尾帧**任务:首帧和尾帧同一张图(见 `VideoImage`)。
-    pub fn submit_looped(&self, image_url: &str, prompt: &str) -> Result<String> {
-        self.submit_image(VideoImage::Pair([image_url, image_url]), prompt)
+    pub fn submit_looped(
+        &self,
+        image_url: &str,
+        prompt: &str,
+        screen: (u32, u32),
+    ) -> Result<String> {
+        self.submit_image(VideoImage::Pair([image_url, image_url]), prompt, screen)
     }
 
-    fn submit_image(&self, image_url: VideoImage<'_>, prompt: &str) -> Result<String> {
+    fn submit_image(
+        &self,
+        image_url: VideoImage<'_>,
+        prompt: &str,
+        screen: (u32, u32),
+    ) -> Result<String> {
+        let size = size_field(video_size_for(screen));
         let body = serde_json::to_string(&VideoRequest {
             model: self.cfg.model.as_str(),
             prompt,
             image_url,
+            size: size.as_str(),
             duration: VIDEO_DURATION_SECS,
             with_audio: false,
         })?;
@@ -823,7 +835,8 @@ impl Videos {
         if task.id.trim().is_empty() {
             return Err(anyhow!("图生视频接口没给任务号:{}", truncate(&raw, 200)));
         }
-        tracing::info!("图生视频任务已提交:{}", task.id);
+        // 尺寸写进日志:出片尺寸和这里报的不是一回事时(服务商可能自己改),这一行是唯一线索
+        tracing::info!("图生视频任务已提交:{}(要 {size})", task.id);
         Ok(task.id)
     }
 
@@ -879,8 +892,13 @@ impl Videos {
     }
 
     /// 整条路:提交 → 轮询到出片 → **当场下载**。
-    pub fn animate(&self, image_url: &str, prompt: &str) -> Result<GeneratedVideo> {
-        self.animate_with(image_url, prompt, false)
+    pub fn animate(
+        &self,
+        image_url: &str,
+        prompt: &str,
+        screen: (u32, u32),
+    ) -> Result<GeneratedVideo> {
+        self.animate_with(image_url, prompt, false, screen)
     }
 
     /// 同上,但**先按首尾帧提交**(首尾都给这张图 → 画面绕回起点,循环才接得上)。
@@ -891,8 +909,13 @@ impl Videos {
     ///
     /// 注意降级会**多花一次提交**:两轮里只要有一轮被受理,就只算一次出片。
     /// 提交被拒(4xx)时服务商不会计费,所以这里亏的是几秒,不是钱。
-    pub fn animate_looped(&self, image_url: &str, prompt: &str) -> Result<GeneratedVideo> {
-        self.animate_with(image_url, prompt, true)
+    pub fn animate_looped(
+        &self,
+        image_url: &str,
+        prompt: &str,
+        screen: (u32, u32),
+    ) -> Result<GeneratedVideo> {
+        self.animate_with(image_url, prompt, true, screen)
     }
 
     fn animate_with(
@@ -900,9 +923,10 @@ impl Videos {
         image_url: &str,
         prompt: &str,
         looped: bool,
+        screen: (u32, u32),
     ) -> Result<GeneratedVideo> {
         let id = if looped {
-            match self.submit_looped(image_url, prompt) {
+            match self.submit_looped(image_url, prompt, screen) {
                 Ok(id) => {
                     // 这一行是**故意**留的:首尾帧那条路会静默降级成单图重提,而"库里这段片子
                     // 到底是不是按闭环提交的"事后只能靠日志分辨(降级会打那记 warn)。
@@ -911,11 +935,11 @@ impl Videos {
                 }
                 Err(err) => {
                     tracing::warn!("首尾帧这条路没被受理({err:#}),退回单图重提一次");
-                    self.submit(image_url, prompt)?
+                    self.submit(image_url, prompt, screen)?
                 }
             }
         } else {
-            self.submit(image_url, prompt)?
+            self.submit(image_url, prompt, screen)?
         };
         self.wait_and_download(&id)
     }
@@ -1944,6 +1968,9 @@ struct VideoRequest<'a> {
     model: &'a str,
     prompt: &'a str,
     image_url: VideoImage<'a>,
+    /// 要出多大的片子(清单里的一档,见 `VIDEO_SIZES`)。**不能空着** —— 服务端自己推的那条对
+    /// 某些比例是必死,理由写在 `VIDEO_SIZES` 上。
+    size: &'a str,
     duration: u32,
     with_audio: bool,
 }
@@ -1961,6 +1988,80 @@ enum VideoImage<'a> {
 
 /// 一条片子的时长(秒)。文档里**只支持 5 和 10**,而且两者同价 —— 那就没有理由选短的。
 const VIDEO_DURATION_SECS: u32 = 10;
+
+/// 图生视频接口**认的那几档尺寸** —— 这是服务商给的清单,不是我们算出来的。
+///
+/// 为什么必须**显式**报一档,不能空着让服务端自己推:
+///
+/// 2026-10-16 实测,两张 `1920×1088` 的图(前后相隔一小时、内容毫不相干:一张二次元少女、
+/// 一张森林小径)提交之后都是 `task_status: FAIL`,而正文只是一个**空的 assistant 消息**:
+/// `{"choices":[{"finish_reason":"stop","index":0,"message":{"role":"assistant"}}],...}` ——
+/// 服务商一个字都不解释。同一天 `1808×1136` 的图出片正常,结果 `1718×1080`,正好是
+/// "短边压到 1080、长边按原图比例推"那条默认路。
+///
+/// 差别就在那条推出来的长边上,而且**服务商是向下取整的**(这不是猜的:`1080×1808/1136`
+/// 是 1718.87,它给的成片就是 1718):
+///
+/// | 原图 | 推出来的长边 | 结果 |
+/// | --- | --- | --- |
+/// | 1808×1136 | 1718.87 → **1718** | 出片(偶数,编得出来) |
+/// | 1920×1088 | 1905.88 → **1905** | FAIL(**奇数**,H.264 编不出奇数宽度) |
+///
+/// 也就是说:`size` 空着这条路对**某些比例就是必死**,而且死得没有任何提示。报一档清单里的
+/// 尺寸既绕开这个坑,又正好对上"屏幕多大就要多大"(见 `video_size_for`)。
+const VIDEO_SIZES: [(u32, u32); 7] = [
+    (1280, 720),
+    (720, 1280),
+    (1024, 1024),
+    (1920, 1080),
+    (1080, 1920),
+    (2048, 1080),
+    (3840, 2160),
+];
+
+/// 从上面那七档里挑一档最贴这块屏幕的。
+///
+/// 规则就三条,顺序即优先级:
+/// 1. **屏幕本身就在清单里**(1920×1080 的屏、1080×1920 的竖屏、4K 屏)—— 直接用它,
+///    一个像素都不用放大,这也是"屏幕多大就要多大"最理想的那种落点;
+/// 2. 否则在**横竖方向一致**的档位里挑**比例最接近**的(比值的对数,2 倍和 0.5 倍算一样远);
+/// 3. 比例一样近时:优先"面积不超过屏幕"的,其中取**大的**(贴得近);一档都装不下屏幕时,
+///    取**小的**(放大得最少)。
+///
+/// 为什么第 2 步要先按横竖过滤:800×600 这种 4:3 的屏,`1280x720` 和 `720x1280` 的比例
+/// 距离是**相等**的 —— 不拦一下就会给一块横屏塞一档竖屏尺寸。
+pub fn video_size_for(screen: (u32, u32)) -> (u32, u32) {
+    let screen = (screen.0.max(1), screen.1.max(1));
+    if let Some(hit) = VIDEO_SIZES
+        .iter()
+        .find(|(width, height)| (*width, *height) == screen)
+    {
+        return *hit;
+    }
+    let want = (screen.0 as f32 / screen.1 as f32).ln();
+    let screen_area = screen.0 as i64 * screen.1 as i64;
+    // (比例距离取到千分之一:小的浮点差不会让两档"看起来一样近"却分出胜负)
+    let mut best: Option<((i64, u8, i64), (u32, u32))> = None;
+    for (width, height) in VIDEO_SIZES {
+        // 横屏的屏不塞竖屏尺寸(竖屏反之)
+        if (width >= height) != (screen.0 >= screen.1) {
+            continue;
+        }
+        let distance = (((width as f32 / height as f32).ln() - want).abs() * 1000.0).round() as i64;
+        let area = width as i64 * height as i64;
+        let fits = area <= screen_area;
+        let key = (distance, if fits { 0 } else { 1 }, if fits { -area } else { area });
+        if best.as_ref().map(|(current, _)| key < *current).unwrap_or(true) {
+            best = Some((key, (width, height)));
+        }
+    }
+    best.map(|(_, size)| size).unwrap_or(VIDEO_SIZES[3])
+}
+
+/// 清单里的一档 → 报给接口的那个字符串(`"1920x1080"`,小写 x,没有空格)。
+fn size_field(size: (u32, u32)) -> String {
+    format!("{}x{}", size.0, size.1)
+}
 
 /// 任务状态。**提交和轮询返回的是同一个形状**(实测:提交回 `PROCESSING`,轮询回 `SUCCESS` +
 /// `video_result`),所以两边共用一份,不写两遍。
@@ -2489,11 +2590,15 @@ mod tests {
             model: "cogvideox-3",
             prompt: "镜头固定",
             image_url: VideoImage::One("data:image/png;base64,AAA"),
+            size: "1920x1080",
             duration: VIDEO_DURATION_SECS,
             with_audio: false,
         })
         .unwrap();
         assert!(one["image_url"].is_string(), "{one}");
+        // `size` **必须**报出去:留空时服务端按原图比例推,某些比例会推出奇数长边然后 FAIL
+        // (见 `VIDEO_SIZES`)。这条钉住"它一直在请求体里",别再被谁当成可选项删掉。
+        assert_eq!(one["size"], "1920x1080");
         assert_eq!(one["duration"], 10);
         assert_eq!(one["with_audio"], false);
 
@@ -2501,6 +2606,7 @@ mod tests {
             model: "cogvideox-3",
             prompt: "镜头固定",
             image_url: VideoImage::Pair(["data:image/png;base64,AAA", "data:image/png;base64,AAA"]),
+            size: "1920x1080",
             duration: VIDEO_DURATION_SECS,
             with_audio: false,
         })
@@ -2524,5 +2630,47 @@ mod tests {
         // 纯文本那条路**不能**被改成数组形状:它一直在跑,不是每个模型都吃数组
         let plain = serde_json::to_value(Message::user("你好".to_string())).unwrap();
         assert!(plain["content"].is_string(), "{plain}");
+    }
+
+    /// 出片尺寸只从服务商那七档里挑,而且要贴屏幕。
+    #[test]
+    fn 出片尺寸从七档里挑最贴屏幕的() {
+        // 屏幕本身就在清单里 → 原样,一个像素都不用放大
+        assert_eq!(video_size_for((1920, 1080)), (1920, 1080));
+        assert_eq!(video_size_for((1080, 1920)), (1080, 1920));
+        assert_eq!(video_size_for((3840, 2160)), (3840, 2160));
+        // 16:10 的屏:清单里没有这一档 → 比例最近的 16:9 里,面积不超过屏幕的最大者
+        assert_eq!(video_size_for((2560, 1600)), (1920, 1080));
+        // 略小于 720p 的屏
+        assert_eq!(video_size_for((1366, 768)), (1280, 720));
+        // 32:9 的带鱼屏:2048×1080 的比例(1.896)比 16:9 更贴
+        assert_eq!(video_size_for((5120, 1440)), (2048, 1080));
+        // 4:3 的小屏:**两档的比例距离完全相等**,不能因此给横屏塞一档竖屏尺寸
+        let (width, height) = video_size_for((800, 600));
+        assert!(width > height, "横屏挑出来的是竖屏尺寸:{width}x{height}");
+    }
+
+    /// 挑出来的那一档**必须**在清单里,而且**每条边都是偶数** ——
+    /// 这条不是形式主义:改动之前正是"服务端自己推、推出奇数长边"把片子做死的(见 `VIDEO_SIZES`)。
+    #[test]
+    fn 出片尺寸永远是清单里的偶数档() {
+        for screen in [
+            (1280, 800),
+            (1920, 1080),
+            (2560, 1440),
+            (3440, 1440),
+            (5120, 1440),
+            (1024, 768),
+            (768, 1024),
+            (3840, 2160),
+            (1920, 1200),
+        ] {
+            let size = video_size_for(screen);
+            assert!(
+                VIDEO_SIZES.contains(&size),
+                "{screen:?} 挑出了清单外的 {size:?}"
+            );
+            assert_eq!(size.0 % 2 + size.1 % 2, 0, "{size:?} 有奇数边");
+        }
     }
 }
