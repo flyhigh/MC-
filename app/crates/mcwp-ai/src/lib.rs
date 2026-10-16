@@ -63,7 +63,7 @@ pub const DEFAULT_IMAGE_BASE_URL: &str = DEFAULT_BASE_URL;
 /// | 一张要多久 | 9~16 s | **37~84 s**(同一句提示词、1472×1088 两次:37.4 s / 72.4 s) |
 /// | 尺寸规则 | 16 的倍数 | **32 的倍数**(见 `SIZE_STEP`,换模型时尺寸规则跟着换了) |
 /// | 总像素上限 | 2²¹ | **2²²** |
-/// | 推荐尺寸 | 无 | **七档**(见 `RECOMMENDED_IMAGE_SIZES`,我们只用这七档) |
+/// | 尺寸怎么定 | 按屏幕算 | 还是按屏幕算(**不留推荐档的余地**,见 `fit_size`) |
 /// | `quality` | 认,而且实测有效 | 认(200),但**效果未验证** |
 /// | `watermark_enabled` | 认 | 认(实测 false 那张右下角是干净的) |
 ///
@@ -112,6 +112,18 @@ pub const DEFAULT_VIDEO_MODEL: &str = "cogvideox-3";
 /// 只能写出"缓慢推近"这种万能句,而用户要的是"灯在闪、车在走、云在飘"这些**画面里才有的事**。
 pub const DEFAULT_VISION_MODEL: &str = "glm-4v-flash";
 
+/// 一次下载最多吃多少字节。
+///
+/// 为什么必须显式给:`ureq` 的 `read_to_vec()` **默认卡在 10 MB**,而 10 秒 / 1080p 的成片
+/// 正好会越过它 —— 2026-10-16 实测那一条「都市夜景黄昏」(1718×1080、10 秒、灯光闪烁 + 云流动,
+/// 画面细节多、码率高)就撞在这上面:`读视频字节失败 / the response body is larger than
+/// request limit: 10485760`。**这条视频当时已经生成完了、钱也花了**,死在最后一步"取回来"上,
+/// 而且报错看着像网络问题,一点也看不出是本地那道闸。
+///
+/// 取 128 MB:10 秒的片子按 2 MB/s 算也就 20 MB,给到 128 MB 是留给"以后放更长 / 更高码率"的余量;
+/// 再大就不该全塞进内存了(那时候要改成边下边落盘)。
+const MAX_DOWNLOAD_BYTES: u64 = 128 << 20;
+
 /// 轮询那条异步接口的间隔。它一次要跑几十秒,查得太密没有意义,太疏又会让"好了"晚到几秒。
 const VIDEO_POLL_INTERVAL: Duration = Duration::from_secs(8);
 
@@ -140,30 +152,12 @@ const MAX_VIDEO_PROMPT_CHARS: usize = 512;
 /// 三条都可能踩:`1920×1080` 会被**直接拒绝**(1080 不是 32 的倍数)。
 /// **更坑的是换模型会换规则**:CogView 那阵子是"16 的倍数、2²¹",库里那批
 /// 1600×896 / 1808×1136 到 `glm-image` 这边**全不合法**(1808/32 = 56.5)。
-/// 所以尺寸不再"按屏幕算一个",而是从推荐尺寸里挑(见 `fit_size`)。
+/// 所以尺寸还是得按屏幕算一个,只是这回要**自己**把这四条压住(见 `fit_size`:
+/// 对齐 32 的倍数 → 长边不超 2880 → 总像素不超 2²² → 短边不低于 512,全程等比)。
 const SIZE_MIN: u32 = 512;
 const SIZE_MAX: u32 = 2880;
 const SIZE_STEP: u32 = 32;
 const SIZE_PIXEL_MAX: u64 = 1 << 22;
-
-/// 官方给的**推荐尺寸**:1:1 / 3:2 / 2:3 / 4:3 / 3:4 / 16:9 / 9:16 各一档。
-///
-/// 为什么不自己按屏幕算一个:自己算要同时压住"32 的倍数"和"总像素 ≤ 2²²"两条边
-/// (贴到上界时确实会超),而屏幕比例五花八门,算错一次就是 400 —— 生图失败不是降级,
-/// 是整轮白等一分钟。这七档天然满足上面三条规则(有条测试逐个验),挑一个最近的既稳又省事。
-///
-/// 代价得说清楚:**上屏要放大**。2560×1600 的屏离它最近的是 3:2 那档(1568×1056),
-/// 要撑到 1.63 倍;而接口其实允许 2560×1600(4.1M 像素,也满足 ×32)。
-/// 更大的请求是不是更清楚,这一条**还没验**(见 §11.26);在那之前按这七档来。
-pub const RECOMMENDED_IMAGE_SIZES: [(u32, u32); 7] = [
-    (1280, 1280),
-    (1568, 1056),
-    (1056, 1568),
-    (1472, 1088),
-    (1088, 1472),
-    (1728, 960),
-    (960, 1728),
-];
 
 /// 提示词最长多少字。太长的提示词对 `cogview` 那种小模型是负担,反而容易画糊。
 const MAX_IMAGE_PROMPT_CHARS: usize = 400;
@@ -560,8 +554,15 @@ impl Images {
     ///
     /// 为什么要立刻下载而不是把 URL 存起来慢慢取:智谱返回的图片 URL **7 天就失效**,
     /// 而壁纸是要长期留着的。存 URL = 存一个七天后的死链。
-    pub fn generate(&self, prompt: &str, width: u32, height: u32) -> Result<GeneratedImage> {
-        let (width, height) = fit_size(width, height);
+    /// `screen_width` / `screen_height` 是**屏幕分辨率**而不是"请求尺寸":要多大由 `fit_size`
+    /// 按接口那三条规则折出来(见那儿),调用方只管把屏报上来。
+    pub fn generate(
+        &self,
+        prompt: &str,
+        screen_width: u32,
+        screen_height: u32,
+    ) -> Result<GeneratedImage> {
+        let (width, height) = fit_size(screen_width, screen_height);
         let size = format!("{width}x{height}");
         // 按配置来;被拒了再退回带水印的(见 `is_watermark_refusal`)。
         // `watermark` 这个局部量跟着**实际发出去的那个值**走,所以最后那行日志说的是真话。
@@ -648,6 +649,8 @@ impl Images {
         }
         let bytes = response
             .body_mut()
+            .with_config()
+            .limit(MAX_DOWNLOAD_BYTES)
             .read_to_vec()
             .context("读图片字节失败")?;
         if bytes.is_empty() {
@@ -900,7 +903,12 @@ impl Videos {
     ) -> Result<GeneratedVideo> {
         let id = if looped {
             match self.submit_looped(image_url, prompt) {
-                Ok(id) => id,
+                Ok(id) => {
+                    // 这一行是**故意**留的:首尾帧那条路会静默降级成单图重提,而"库里这段片子
+                    // 到底是不是按闭环提交的"事后只能靠日志分辨(降级会打那记 warn)。
+                    tracing::info!("首尾帧被受理(首尾都给同一张图 → 画面绕回起点)");
+                    id
+                }
                 Err(err) => {
                     tracing::warn!("首尾帧这条路没被受理({err:#}),退回单图重提一次");
                     self.submit(image_url, prompt)?
@@ -944,7 +952,12 @@ impl Videos {
                     });
                 }
                 VideoProgress::Failed(reason) => {
-                    return Err(anyhow!("服务商说这条视频没生成出来:{reason}"));
+                    // 把任务号写进报错:实测(2026-10-16)`task_status: FAIL` 的正文里
+                    // **一个字的解释都没有**(只有一个空 message),想知道为什么挂、或者去要回
+                    // 那 1 元,手里只有这个号。原样贴的 `reason` 留在后面当"现场"。
+                    return Err(anyhow!(
+                        "服务商说这条视频没生成出来(任务 {id},他们没给原因):{reason}"
+                    ));
                 }
             }
         }
@@ -970,7 +983,12 @@ impl Videos {
         if !status.is_success() {
             return Err(anyhow!("下载视频返回 {}:{}", status.as_u16(), truncate(url, 120)));
         }
-        let bytes = response.body_mut().read_to_vec().context("读视频字节失败")?;
+        let bytes = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_DOWNLOAD_BYTES)
+            .read_to_vec()
+            .context("读视频字节失败")?;
         if bytes.is_empty() {
             return Err(anyhow!("下载到的视频是空的:{}", truncate(url, 120)));
         }
@@ -1027,9 +1045,9 @@ fn base64(data: &[u8]) -> String {
 
 /// 这个尺寸能不能原样发给服务商(三条规则见 `SIZE_MIN` 那段)。
 ///
-/// 单独抽出来是为了让它**有用武之地**:推荐尺寸那份清单是靠"这些数天然合法"立住的,
-/// 而清单是手写的 —— 以后有人往里加一档 1600×900,`fit_size` 会照发不误、
-/// 服务商回一句 400。`fit_size` 收尾那记 `debug_assert` 和一条测试都盯着这里。
+/// 单独抽出来是给 `fit_size` 当**收尾那道闸**:尺寸是算出来的,而算错一次不是降级,
+/// 是整轮白等一分钟(用户等完什么也没拿到),所以宁可让自检构建当场 panic。
+/// `debug_assert` 只活在 debug 里,同一条规则还有一整套测试盯着(见 `屏幕尺寸总能折成合法请求尺寸`)。
 fn size_is_legal(width: u32, height: u32) -> bool {
     width % SIZE_STEP == 0
         && height % SIZE_STEP == 0
@@ -1038,38 +1056,101 @@ fn size_is_legal(width: u32, height: u32) -> bool {
         && width as u64 * height as u64 <= SIZE_PIXEL_MAX
 }
 
-/// 把"屏幕分辨率"折成**推荐尺寸**里最合适的那一档(清单见 `RECOMMENDED_IMAGE_SIZES`)。
+/// 把"屏幕分辨率"折成一个**屏幕多大就要多大**的请求尺寸。
 ///
-/// 挑法:**比比例,不比像素**。16:9 的屏要 1728×960,不是"像素最多的 1280×1280" ——
-/// 比例差得远,画面会被 cover 裁掉一大块,构图就废了(裁切是居中等量的,见 `photo.wgsl`)。
-/// 距离取**比值的对数**:2 倍和 0.5 倍算一样远,不然竖屏会被"偏袒"成大尺寸那一头。
+/// 为什么不留推荐档的余地:推荐档那股风是当天临时刮的(§11.26 记了起因 —— 怕自己算错被 400 拒),
+/// 但它有一笔立刻能看见的代价:2560×1600 的屏离最近的一档(1568×1056)还差 **1.63 倍**,
+/// 而接口本来就允许 2560×1600。用户一句「屏幕多大就要多大」把这条摆平了:图按屏的原生像素出、
+/// 上屏 1:1,§11.24 末尾那 15% 的放大损失就不再是"必须付"的了。
 ///
-/// 同比例下取面积大的那个:一样合比例时,当然是分辨率高的更清楚。
+/// 四条规则**按顺序**过(顺序本身是结论,不是随手排的):
+/// 1. 就近对齐到 `SIZE_STEP`:1920×1080 → 1920×**1088**(和 16 倍数那版同一笔账,多补几行比裁掉好);
+/// 2. 长边超 `SIZE_MAX` 就**等比**缩 —— 单独夹一个维度会把 16:9 压成 1.32
+///    (3840×2176 夹成 2880×2176),比例毁了比小一圈更难看;
+/// 3. 总像素超 2²² 同样等比缩;
+/// 4. 短边小于 `SIZE_MIN` 等比放大(小屏 / 窄窗口才会走到,512 是接口自己的下限)。
+/// 最后一次性落地到 32 的倍数(四舍五入),舍上去万一顶破总像素天花板就再等比退一次。
 ///
-/// 返回值**保证合法** —— 七个候选都满足"512~2880、32 的倍数、总像素 ≤ 2²²",
-/// 所以这里不需要再夹一遍(而且是**不能**夹:把 1568 夹成 1568 没事,夹成 1584 就错了)。
-pub fn fit_size(width: u32, height: u32) -> (u32, u32) {
-    let screen = width.max(1) as f64 / height.max(1) as f64;
-    let mut best = RECOMMENDED_IMAGE_SIZES[0];
-    let mut best_gap = f64::INFINITY;
-    for (candidate_width, candidate_height) in RECOMMENDED_IMAGE_SIZES {
-        let gap = (candidate_width as f64 / candidate_height as f64 / screen)
-            .ln()
-            .abs();
-        let same_as_best = (gap - best_gap).abs() < 1e-9;
-        let bigger = candidate_width * candidate_height > best.0 * best.1;
-        if gap < best_gap - 1e-9 || (same_as_best && bigger) {
-            best = (candidate_width, candidate_height);
-            best_gap = gap;
+/// 三个能直接对照的数:`1920×1080 → 1920×1088`、`2560×1600 → 2560×1600`(**就是屏幕本身**)、
+/// `3840×2160 → 2720×1536`(两条天花板都撞上,只能等比缩,比例仍在 16:9 附近)。
+///
+/// 返回值**保证合法**,收尾那记 `debug_assert` 盯着的就是这句话。
+pub fn fit_size(screen_width: u32, screen_height: u32) -> (u32, u32) {
+    let mut width = snap_alignment(screen_width) as f64;
+    let mut height = snap_alignment(screen_height) as f64;
+
+    // ② 长边天花板。等比缩,不单独夹一个维度。
+    let longest = width.max(height);
+    if longest > SIZE_MAX as f64 {
+        let k = SIZE_MAX as f64 / longest;
+        width *= k;
+        height *= k;
+    }
+
+    // ③ 总像素天花板。
+    if width * height > SIZE_PIXEL_MAX as f64 {
+        let k = (SIZE_PIXEL_MAX as f64 / (width * height)).sqrt();
+        width *= k;
+        height *= k;
+    }
+
+    // ④ 下界:谁都不能小于 512。
+    let shortest = width.min(height);
+    if shortest < SIZE_MIN as f64 {
+        let k = SIZE_MIN as f64 / shortest;
+        width *= k;
+        height *= k;
+    }
+
+    // ⑤ 落地:四舍五入到 32 的倍数。
+    //
+    // 这里**不能**用 `floor`(第一版就是这么写的,当场翻车):3440×1440 经第 ② 步正好落到
+    // 2880×1200,而 1200/32 = 37.5 在浮点里是 37.500000000000004,`floor` 把它砍成 37 → 1184,
+    // 白丢 16 像素、比例也跟着歪。而 1200 本来就不是 32 的倍数,取整方向只能靠"哪个比例更正"定,
+    // 不靠某条舍入规则定 —— 所以这里就是普通的四舍五入,舍上去顶破天花板了再由下面那道等比退兜住。
+    let mut width = (width / SIZE_STEP as f64).round() as u64 * SIZE_STEP as u64;
+    let mut height = (height / SIZE_STEP as f64).round() as u64 * SIZE_STEP as u64;
+    // 舍上去可能把总像素顶过天花板(两边各加不到 16 像素,4.19M 那边约 +3%),
+    // 那就再等比退一次。这一处**可以**放心向下取整:宁小不大,退完必定在线内。
+    if width * height > SIZE_PIXEL_MAX {
+        let k = (SIZE_PIXEL_MAX as f64 / (width * height) as f64).sqrt();
+        width = ((width as f64 * k) / SIZE_STEP as f64 + 1e-9).floor() as u64 * SIZE_STEP as u64;
+        height = ((height as f64 * k) / SIZE_STEP as f64 + 1e-9).floor() as u64 * SIZE_STEP as u64;
+    }
+    // 最后那道闸:前面全是浮点算的,再离谱也不能让不合法的尺寸发出去(最多退一两次,不会转圈)。
+    while width * height > SIZE_PIXEL_MAX {
+        if width >= height {
+            width -= SIZE_STEP as u64;
+        } else {
+            height -= SIZE_STEP as u64;
         }
     }
+
+    let (width, height) = (width as u32, height as u32);
     debug_assert!(
-        size_is_legal(best.0, best.1),
-        "挑出了不合法的尺寸 {}×{}:规则见 SIZE_MIN 那段",
-        best.0,
-        best.1
+        size_is_legal(width, height),
+        "算出了不合法的尺寸 {}×{}:规则见 SIZE_MIN 那段",
+        width,
+        height
     );
-    best
+    (width, height)
+}
+
+/// 就近(不是只往上、也不是只往下)对齐到 `SIZE_STEP`。
+///
+/// 这里**只对齐、不夹**上下界 —— 上下界那两刀必须留给 `fit_size` 做**等比**的:
+/// `3840×2176` 夹长边成 `2880×2176` 会把 1.77 压成 1.32(`640×480` 抬短边成 `640×512`
+/// 同理),画面比例当场就毁了。`fit_size` 第 ②④ 步是等比缩 / 等比放,比例能保住。
+///
+/// 顺带说清两次取整为什么不一样:这里(第 ① 步)是**四舍五入**,要的是"最接近屏";
+/// `fit_size` 第 ⑤ 步是**向下取整**,要的是"别越线"。这不是漏改,是分工。
+///
+/// 那个 `1 << 16` 只是让"对齐 + 后面几刀"整段都待在 u32 里(屏幕不会真有这么大),
+/// 免得有人拿 `u32::MAX` 调进来把后面乘出溢出。
+fn snap_alignment(value: u32) -> u32 {
+    let step = SIZE_STEP as u64;
+    let value = (value.max(1) as u64).min(1 << 16);
+    (((value + step / 2) / step) * step).max(1) as u32
 }
 
 /// 会话用的客户端。`clone` 很便宜(Agent 内部是共享的),发请求时丢给后台线程就行。
@@ -2016,39 +2097,95 @@ mod tests {
         }
     }
 
-    /// 推荐尺寸**必须全部合法** —— 它们是我们真正会发出去的那七个。规则是从接口的 4xx
-    /// 正文抄下来的(见 `SIZE_MIN` 那段),不是猜的。
+    /// 规则本身是从接口的 4xx 正文抄下来的(见 `SIZE_MIN` 那段),不是猜的 —— 先把它钉住。
+    /// 下面那些"折出来的尺寸合法"的断言全靠这一条才有意义。
     #[test]
-    fn 推荐的七个尺寸全部合法() {
-        assert_eq!(RECOMMENDED_IMAGE_SIZES.len(), 7);
-        for (width, height) in RECOMMENDED_IMAGE_SIZES {
-            assert!(size_is_legal(width, height), "{width}×{height} 不合法");
-        }
-        // 反面例子得钉住,否则上面那条断言可能只是"恒真":1600×900 的 900 不是 32 的倍数
-        assert!(!size_is_legal(1600, 900));
+    fn 尺寸规则就是那三条() {
+        // 反面例子得钉住,否则正面断言可能只是"恒真":
+        assert!(!size_is_legal(1600, 900), "900 不是 32 的倍数");
         assert!(!size_is_legal(2048, 2112), "总像素超了 2²² 也算不合法");
+        assert!(!size_is_legal(4096, 1024), "4096 超过 2880 的上界");
+        assert!(!size_is_legal(480, 512), "480 低于 512 的下界");
+        // 正面:1920×1088 正是这台机器的屏折出来的那个,2560×1600 是"上一轮最亏"的那一个
+        assert!(size_is_legal(1920, 1088));
+        assert!(size_is_legal(2560, 1600));
         // 顺手钉一句:"16 的倍数"那套不能再回来。库里那批 1808×1136 就是这么算出来的,
         // 到 glm-image 这边 1808/32 = 56.5,会被 400 直接拒掉。
         assert_ne!(1808 % SIZE_STEP, 0);
     }
 
-    /// 挑尺寸:**先比比例,同比例再比面积**。
+    /// 挑尺寸:**屏幕多大就要多大**,只在接口不允许时才动手。
     #[test]
-    fn 按屏幕比例挑推荐尺寸() {
-        // 用户的 2560×1600(16:10):最近的是 3:2 那档,而不是 16:9 或 4:3
-        assert_eq!(fit_size(2560, 1600), (1568, 1056));
-        // 1920×1080(16:9):就是 16:9 那档
-        assert_eq!(fit_size(1920, 1080), (1728, 960));
-        // 1:1 与竖屏
+    fn 屏幕多大就要多大() {
+        // 这台机器的屏 1920×1080:1080 不是 32 的倍数,往**上**补到 1088(不是裁到 1056)
+        assert_eq!(fit_size(1920, 1080), (1920, 1088));
+        // 2560×1600 **原样发得出去**(2560/32 = 80、1600/32 = 50、4.096M ≤ 4.19M)。
+        // 这正是"从七档推荐里挑"最亏的那一条:那会儿只能要 1568×1056,上屏得放大 1.63 倍
+        assert_eq!(fit_size(2560, 1600), (2560, 1600));
+        // 竖屏 / 1:1 / 16:9 都走同一条路,没有谁被"就近取整"到某个推荐档
+        assert_eq!(fit_size(1080, 1920), (1088, 1920));
         assert_eq!(fit_size(1280, 1280), (1280, 1280));
-        assert_eq!(fit_size(1080, 1920), (960, 1728));
-        assert_eq!(fit_size(1600, 1200), (1472, 1088));
+        assert_eq!(fit_size(1280, 720), (1280, 736));
+        assert_eq!(fit_size(1600, 1200), (1600, 1216));
+    }
 
-        // 极端比例(21:9)也得给一个**合法**答案:挑最近的那档、宁可裁掉一点,
-        // 也不要自己算一个会被拒的尺寸
-        for (width, height) in [(3440u32, 1440u32), (3840, 2160), (800, 600), (1, 1)] {
-            let (fit_width, fit_height) = fit_size(width, height);
-            assert!(RECOMMENDED_IMAGE_SIZES.contains(&(fit_width, fit_height)));
+    /// 撞天花板时**只能等比缩**,不许夹单个维度(夹了就毁画面比例)。
+    #[test]
+    fn 撞天花板时等比缩而不是夹一个维度() {
+        // 4K:两条线一起撞。夹长边会得到 2880×2176(1.32 —— 16:9 被压成 4:3 的宽);
+        // 现在是 2720×1536,还留在 16:9 上,总像素也正好卡进 2²²
+        assert_eq!(fit_size(3840, 2160), (2720, 1536));
+        // 21:9 只撞长边那一条。高度这里值得看一眼:等比缩到长边 2880 时理想高度正好是 **1200**,
+        // 而 1200/32 = 37.5 —— 它压根不是 32 的倍数,只能落到 1184 或 1216。
+        // 取 1216 不是"四舍五入碰巧舍上去了":2880/1184 = 2.43(离 2.39 差 1.8%),
+        // 2880/1216 = 2.37(差 0.9%),1216 那一侧才是贴着原比例的那个。
+        assert_eq!(fit_size(3440, 1440), (2880, 1216));
+        // 5K 和 4K 是同一笔账(长边先缩到 2880,再压像素)
+        assert_eq!(fit_size(5120, 2880), (2720, 1536));
+    }
+
+    /// 无论屏长什么样,出来的一定**合法**、而且**比例没被弄歪**。
+    ///
+    /// 这条是 `fit_size` 收尾那记 `debug_assert` 的替身 —— release 构建里那记断言不编译,
+    /// 而尺寸算错的代价是"用户等一分钟、什么也没拿到"。
+    #[test]
+    fn 屏幕尺寸总能折成合法请求尺寸() {
+        let screens = [
+            (1920u32, 1080u32),
+            (2560, 1600),
+            (2560, 1440),
+            (3840, 2160),
+            (5120, 2880),
+            (3440, 1440),
+            (1680, 1050),
+            (1366, 768),
+            (1280, 720),
+            (800, 600),
+            (640, 480),
+            (1024, 1280),
+            (1080, 1920),
+            (3840, 1080),
+            (1080, 3840),
+            (300, 200),
+            (1, 1),
+        ];
+        for (screen_width, screen_height) in screens {
+            let (width, height) = fit_size(screen_width, screen_height);
+            assert!(
+                size_is_legal(width, height),
+                "{screen_width}×{screen_height} 折成了不合法的 {width}×{height}"
+            );
+            // 比例:32 的粒度决定了两边各会差半档,所以这里用**相对**判据 ——
+            // 比例漂移不许过 3%(实测最差的是 3840×1080 那种 32:9:2.67%,粒度到头了)。
+            // 夹单个维度会立刻炸:3840×1080 夹成 2880×1080 漂 24%。
+            let screen_ratio = screen_width as f64 / screen_height as f64;
+            let request_ratio = width as f64 / height as f64;
+            let drift = (request_ratio / screen_ratio).ln().abs();
+            assert!(
+                drift < 0.03,
+                "{screen_width}×{screen_height}({screen_ratio:.3})折成了 {width}×{height}({request_ratio:.3}),漂了 {:.1}%",
+                drift * 100.0
+            );
         }
     }
 
