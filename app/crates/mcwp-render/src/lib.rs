@@ -114,7 +114,19 @@ pub struct PhotoParams {
     pub grain: f32,
     /// 补齐到 16 字节对齐(WGSL uniform 要求)
     pub _pad: [f32; 2],
+    /// **元素级动效**:每格四项 `(画什么, 在哪儿, 往哪边, 快慢)`(见 `mcwp_spec::element_slots`)。
+    /// 第 0 项是 0,就表示这一格不画。
+    ///
+    /// 定长 5 不是随手写的:着色器里就是 `array<vec4<f32>, 5>`,两边差一格,
+    /// 后面所有字段整体错位(有测试钉着偏移)。
+    pub elements: [[f32; 4]; ELEMENT_SLOTS],
 }
+
+/// 元素层的槽位数:和 `MotionPlan::MAX_ELEMENTS` **必须相等**。
+///
+/// 引用而不是抄一个数字,是因为"提示词那边最多写五个"和"uniform 里最多装五个"
+/// 是同一件事的两面;抄成两个字面量,改一处就会有一边静默失效(多出来的元素直接被丢掉)。
+pub const ELEMENT_SLOTS: usize = mcwp_spec::MotionPlan::MAX_ELEMENTS;
 
 impl PhotoParams {
     /// `Photo` + 屏幕尺寸 → 着色器参数。
@@ -126,6 +138,12 @@ impl PhotoParams {
             }
         }
         let motion = photo.motion;
+        // 元素层:一份方案最多五个元素,压成五格数字交给着色器(见 `element_slots`)
+        let elements = mcwp_spec::element_slots(&photo.motion_plan);
+        // 有元素层就**把"整张图一个效果"那层关掉**:两层一起上会重复 ——
+        // 方案里写着"左上角有云",配方又叠一层全屏云影,画面立刻糊成一团。
+        // 元素层是按画面分析出来的,更准,所以留下的是它。
+        let has_elements = elements.iter().any(|slot| slot[0] > 0.0);
         Self {
             resolution: [width as f32, height as f32],
             time: 0.0,
@@ -134,8 +152,13 @@ impl PhotoParams {
             zoom: motion.zoom,
             pan: motion.pan,
             speed: motion.speed,
-            intensity: motion.intensity,
-            effect: effect_index(motion.kind) as f32,
+            // 有元素层就交给人家的元素层:两层一起上会互相重复
+            intensity: if has_elements { 0.0 } else { motion.intensity },
+            effect: if has_elements {
+                0.0
+            } else {
+                effect_index(motion.kind) as f32
+            },
             image_aspect: photo.aspect(),
             screen_aspect: width as f32 / height.max(1) as f32,
             seed: photo.seed as f32,
@@ -143,6 +166,7 @@ impl PhotoParams {
             vignette: 0.55,
             grain: 0.12,
             _pad: [0.0; 2],
+            elements,
         }
     }
 
@@ -158,6 +182,9 @@ impl PhotoParams {
         params.pan = 0.0;
         params.intensity = 0.0;
         params.effect = 0.0;
+        // 元素层也关掉:视频**自己就在动**,而且它那份 `motion_plan` 是**来历的痕迹**,
+        // 不是"还要再画一遍"的指令(见 `Photo::motion_plan` 的说明)
+        params.elements = [[0.0; 4]; ELEMENT_SLOTS];
         params
     }
 }
@@ -311,25 +338,11 @@ impl Renderer {
         config.desired_maximum_frame_latency = 1;
         surface.configure(&device, &config);
 
-        // group 0 的布局:一个 uniform(参数表)。只有一份 —— 照片那条路的
-        // `photo_bind` 就是按它建的,换图时重新建的只有 group 1(纹理)。
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("mcwp-params-layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let photo_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("mcwp-photo"),
-            source: wgpu::ShaderSource::Wgsl(PHOTO_SHADER.into()),
-        });
+        // 管线那一整块抽到 `build_photo_pipeline`:这样测试能在**没有窗口**的情况下把它建一遍。
+        // 理由很实在:WGSL 的语法错、bind 和着色器对不上,都只在"建管线"那一刻报,
+        // 而平时那条路要挂上桌面才走得到 —— 抽出来之后,这类错在 `cargo test` 里当场就炸。
+        let (photo_pipeline, layout, photo_texture_layout) =
+            build_photo_pipeline(&device, config.format);
         let photo_uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mcwp-photo-params"),
             size: std::mem::size_of::<PhotoParams>() as u64,
@@ -343,59 +356,6 @@ impl Renderer {
                 binding: 0,
                 resource: photo_uniform.as_entire_binding(),
             }],
-        });
-        // 纹理那一路的布局只在这里建一次,换图时重建的只有 bind group(便宜)。
-        let photo_texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("mcwp-photo-texture-layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let photo_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("mcwp-photo-pipeline-layout"),
-                bind_group_layouts: &[Some(&layout), Some(&photo_texture_layout)],
-                immediate_size: 0,
-            });
-        let photo_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("mcwp-photo-pipeline"),
-            layout: Some(&photo_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &photo_shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &photo_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
         });
         // 还没有照片时先挂一张 1×1 的占位纹理:这样 `render` 不需要处理
         // "纹理还没准备好"的分支 —— 它的正确用法是"先 set_photo 再每帧 render",
@@ -823,17 +783,106 @@ impl Renderer {
     }
 }
 
+/// 建「照片 + 动效」那条管线所要用到的一切:两个 bind group 布局(参数表 / 纹理)和管线本身。
+///
+/// 从 `Renderer::new` 里抽出来是**为了测** —— WGSL 的语法错、绑定编号和着色器对不上、
+/// 入口点名写错,全都只在 `create_*_pipeline` 这一刻报错,而平时这条路只有真挂上桌面
+/// 才走得到。抽成纯函数(只要一个 `Device` 和像素格式,不要窗口、不要 surface)之后,
+/// `cargo test` 就能在没有桌面的情况下把它建一遍:错了当场炸,而不是等到开机才发现壁纸黑屏。
+fn build_photo_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+) -> (
+    wgpu::RenderPipeline,
+    wgpu::BindGroupLayout,
+    wgpu::BindGroupLayout,
+) {
+    // group 0 的布局:一个 uniform(参数表)。只有一份 ——
+    // `photo_bind` 就是按它建的,换图时重新建的只有 group 1(纹理)。
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("mcwp-params-layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let photo_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("mcwp-photo"),
+        source: wgpu::ShaderSource::Wgsl(PHOTO_SHADER.into()),
+    });
+    // 纹理那一路的布局只在这里建一次,换图时重建的只有 bind group(便宜)。
+    let photo_texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("mcwp-photo-texture-layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let photo_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("mcwp-photo-pipeline-layout"),
+        bind_group_layouts: &[Some(&layout), Some(&photo_texture_layout)],
+        immediate_size: 0,
+    });
+    let photo_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("mcwp-photo-pipeline"),
+        layout: Some(&photo_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &photo_shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &photo_shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    (photo_pipeline, layout, photo_texture_layout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mcwp_spec::MotionRecipe;
+    use mcwp_spec::{ElementVisual, MotionRecipe};
 
     /// uniform 的字节布局是 Rust 和 WGSL 之间**唯一**没有编译器保护的约定:
     /// 这边挪一个字段、那边不改,画面不会报错,只会诡异地错位。所以在这里把偏移钉死。
     #[test]
     fn 照片参数的显存布局和着色器逐字段对齐() {
         use std::mem::{offset_of, size_of};
-        assert_eq!(size_of::<PhotoParams>(), 144);
+        assert_eq!(offset_of!(PhotoParams, elements), 144);
+        assert_eq!(size_of::<PhotoParams>(), 144 + ELEMENT_SLOTS * 16);
         assert_eq!(offset_of!(PhotoParams, resolution), 0);
         assert_eq!(offset_of!(PhotoParams, time), 8);
         assert_eq!(offset_of!(PhotoParams, brightness), 12);
@@ -849,6 +898,73 @@ mod tests {
         assert_eq!(offset_of!(PhotoParams, vignette), 128);
         assert_eq!(offset_of!(PhotoParams, grain), 132);
         assert_eq!(offset_of!(PhotoParams, _pad), 136);
+        // 元素层接在 `_pad` 后面(144 是 16 的倍数,数组元素也对齐)
+    }
+
+    /// 槽位数两边必须一样,而且着色器里真写了这么多:少一格,第五个元素就被静默丢掉。
+    #[test]
+    fn 元素槽位数和着色器一致() {
+        assert_eq!(ELEMENT_SLOTS, 5, "提示词那边最多写五个元素");
+        assert!(
+            PHOTO_SHADER.contains(&format!("array<vec4<f32>, {ELEMENT_SLOTS}>")),
+            "着色器里的元素数组长度和 Rust 这边对不上"
+        );
+    }
+
+    /// 每一种"画什么"都必须在着色器里有分支。
+    ///
+    /// 这条是**静默失效**的保险:分支少写一个,那种元素不会报错、不会崩,
+    /// 只是在画面里**什么都不做** —— 而用户看到的只是"这块没动",根本无从查起。
+    #[test]
+    fn 每种元素在着色器里都有分支() {
+        for visual in ElementVisual::ALL {
+            if visual == ElementVisual::None {
+                continue;
+            }
+            let needle = format!("visual == {}u", visual as u32);
+            assert!(PHOTO_SHADER.contains(&needle), "着色器里没有分支:{needle}");
+        }
+    }
+
+    /// 真建一遍管线。
+    ///
+    /// WGSL 的语法错、绑定编号和着色器对不上、入口点名写错,全都只在 `create_*_pipeline`
+    /// 这一刻报出来 —— 而那条路平时要**挂上桌面**才走得到,于是这类错的表现是
+    /// "开机后壁纸一片黑",查起来要重启桌面。用没有窗口的 instance 在这里走一遍,
+    /// 它就在 `cargo test` 里当场炸。这就是把管线那段从 `Renderer::new` 抽出来的原因。
+    #[test]
+    fn 没有窗口也能把管线建起来() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            flags: wgpu::InstanceFlags::default(),
+            memory_budget_thresholds: Default::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            display: None,
+        });
+        // 这台机器没显卡 / 没驱动不算代码错,标注一下跳过就行。
+        let Ok(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+                apply_limit_buckets: false,
+            }))
+        else {
+            eprintln!("没有可用的 DX12 适配器,跳过这条");
+            return;
+        };
+        let Ok((device, _queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("mcwp-test-device"),
+                ..Default::default()
+            }))
+        else {
+            eprintln!("创建测试设备失败,跳过这条");
+            return;
+        };
+        // 建出来就行:上面任何一处不合法,wgpu 的错误处理会直接把这条测试打挂。
+        let (_pipeline, _params_layout, _texture_layout) =
+            build_photo_pipeline(&device, PHOTO_FORMAT);
     }
 
     /// 动效编号 = `MotionKind::ALL` 的下标,而 `photo.wgsl` 里的 `if (effect == n)` 就是这个

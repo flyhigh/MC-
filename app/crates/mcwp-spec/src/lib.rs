@@ -20,6 +20,8 @@ pub mod photo;
 
 pub use photo::{
     palette_from_rgba, MotionElement, MotionKind, MotionPlan, MotionRecipe, Photo,
+    area_code, direction_code, element_slots, element_visual, ElementSlot, ElementVisual,
+    AREA_NAMES, DIRECTION_NONE,
 };
 
 /// 调色板的槽位数。

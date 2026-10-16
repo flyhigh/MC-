@@ -1791,6 +1791,28 @@ mod tests {
         }
     }
 
+    /// 看图提示词里那十个位置,必须和 `mcwp_spec::AREA_NAMES` **同序**。
+    ///
+    /// 这条是跨 crate 的约定:模型照着提示词列的清单回答("左上"),渲染器照着
+    /// `AREA_NAMES` 的下标去画。两边一错位,左上角的灯就被画到右下角 —— 而且
+    /// 画面看起来"确实在动",不会报错,只能靠这条测试盯着。
+    #[test]
+    fn 提示词里的位置清单和编号同序() {
+        let mut cursor = 0usize;
+        for (index, name) in mcwp_spec::AREA_NAMES.iter().enumerate() {
+            let at = VISION_SYSTEM_PROMPT[cursor..]
+                .find(name)
+                .unwrap_or_else(|| panic!("提示词里找不到位置「{name}」"));
+            let abs = cursor + at;
+            assert!(
+                abs >= cursor,
+                "位置「{name}」(编号 {index})在提示词里排在「{}」前面了",
+                mcwp_spec::AREA_NAMES[index - 1]
+            );
+            cursor = abs + name.len();
+        }
+    }
+
     /// 生图响应只认 `data[0].url`,但它真实的形状比这花哨得多,多一层嵌套不能把解析搞崩。
     #[test]
     fn 生图响应能挑出图片地址() {
