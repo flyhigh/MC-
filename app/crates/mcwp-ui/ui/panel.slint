@@ -1906,7 +1906,7 @@ export component Panel inherits Window {
                         }
                         FieldRow {
                             label: "生图模型名";
-                            placeholder: "cogview-3-flash";
+                            placeholder: "glm-image";
                             value <=> root.ai-image-model;
                             accent: root.accent;
                         }
@@ -1923,7 +1923,7 @@ export component Panel inherits Window {
                             accent: root.accent;
                         }
                         Text {
-                            text: "标准 = 服务商默认(快,但出图明显更糊);高清让模型多跑一遍细节,实测高频细节多 41%。";
+                            text: "标准 = 服务商默认(快,但出图明显更糊);高清让模型多跑一遍细节。实测是拿 cogview-3-flash 做的(高频细节多 41%);换成 glm-image 之后这个字段照发,但效果还没验。";
                             color: Glass.label-3;
                             font-size: 10px;
                             wrap: word-wrap;

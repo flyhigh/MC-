@@ -44,8 +44,8 @@ pub const DEFAULT_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
 /// 想换过去记得同时配 `"thinking": false`,不然一句话要等十几秒。
 pub const DEFAULT_MODEL: &str = "glm-4-flash-250414";
 
-/// 默认生图服务商。还是智谱、还是同一把 key —— 它的免费档 `cogview-3-flash` 实测能出图
-/// (9~16 s 一张,100~230 KB),所以我们不额外引入第二家。
+/// 默认生图服务商。还是智谱、还是同一把 key —— 生图和对话共用一个接口域,
+/// 所以我们不额外引入第二家(要换别家,把 `image_base_url` 填上就行)。
 ///
 /// 免费档默认会在**右下角盖一枚"AI生成"角标**(约占宽 9% × 高 5%)。以前是靠构图那条
 /// cover 裁切顺手把它裁掉的 —— 屏比图宽时上下各裁 5% 左右,**碰巧**盖住它;屏比图窄时
@@ -54,8 +54,22 @@ pub const DEFAULT_MODEL: &str = "glm-4-flash-250414";
 /// 要完全绕开这家的水印也可以换一家(硅基流动的 Kolors / FLUX.1-schnell 也免费),所以地址这里是配置项。
 pub const DEFAULT_IMAGE_BASE_URL: &str = DEFAULT_BASE_URL;
 
-/// 默认生图模型。`cogview-3-flash` 是智谱的免费档 —— 想换 `cogview-3` / `cogview-4` 直接改配置。
-pub const DEFAULT_IMAGE_MODEL: &str = "cogview-3-flash";
+/// 默认生图模型:**`glm-image`**。
+///
+/// 2026-10-16 从 `cogview-3-flash`(免费档)换过来的,是用户点的名。实测的账:
+///
+/// | | `cogview-3-flash` | `glm-image` |
+/// | --- | --- | --- |
+/// | 一张要多久 | 9~16 s | **37~84 s**(同一句提示词、1472×1088 两次:37.4 s / 72.4 s) |
+/// | 尺寸规则 | 16 的倍数 | **32 的倍数**(见 `SIZE_STEP`,换模型时尺寸规则跟着换了) |
+/// | 总像素上限 | 2²¹ | **2²²** |
+/// | 推荐尺寸 | 无 | **七档**(见 `RECOMMENDED_IMAGE_SIZES`,我们只用这七档) |
+/// | `quality` | 认,而且实测有效 | 认(200),但**效果未验证** |
+/// | `watermark_enabled` | 认 | 认(实测 false 那张右下角是干净的) |
+///
+/// 慢是真慢:`--images-selftest` 那种"等一张图"的体感从二十几秒变成一分钟出头,
+/// 所以生图那条路的超时也跟着抬到了 5 分钟(见 `Images::new`)。
+pub const DEFAULT_IMAGE_MODEL: &str = "glm-image";
 
 /// 默认生图**画质**:`hd`。
 ///
@@ -119,14 +133,37 @@ const MAX_MOTION_PROMPT_CHARS: usize = 200;
 /// 真超了就是 `truncate` 兜底 —— 宁可少一个元素,不能让整条请求被拒。
 const MAX_VIDEO_PROMPT_CHARS: usize = 512;
 
-/// 生图接口对尺寸的硬要求(智谱 CogView 实测):宽高都得是 **16 的整数倍**、各自落在
-/// 512~2880,且总像素不超过 2²¹。
+/// 生图接口对尺寸的硬要求。**这是接口自己发的 4xx 正文抄下来的**(2026-10-16,`glm-image`):
 ///
-/// 最容易踩的是第一条 —— `1920×1080` 会被**直接拒绝**,因为 1080/16 = 67.5。
-/// 1080p 屏得请求 `1920×1088` 再由渲染器按 cover 裁掉那 8 个像素。
+/// > size的长宽均需满足512px-2880px之间,且为32整数倍,并保证最大像素数不超过2^22px
+///
+/// 三条都可能踩:`1920×1080` 会被**直接拒绝**(1080 不是 32 的倍数)。
+/// **更坑的是换模型会换规则**:CogView 那阵子是"16 的倍数、2²¹",库里那批
+/// 1600×896 / 1808×1136 到 `glm-image` 这边**全不合法**(1808/32 = 56.5)。
+/// 所以尺寸不再"按屏幕算一个",而是从推荐尺寸里挑(见 `fit_size`)。
 const SIZE_MIN: u32 = 512;
 const SIZE_MAX: u32 = 2880;
-const SIZE_PIXEL_MAX: u64 = 1 << 21;
+const SIZE_STEP: u32 = 32;
+const SIZE_PIXEL_MAX: u64 = 1 << 22;
+
+/// 官方给的**推荐尺寸**:1:1 / 3:2 / 2:3 / 4:3 / 3:4 / 16:9 / 9:16 各一档。
+///
+/// 为什么不自己按屏幕算一个:自己算要同时压住"32 的倍数"和"总像素 ≤ 2²²"两条边
+/// (贴到上界时确实会超),而屏幕比例五花八门,算错一次就是 400 —— 生图失败不是降级,
+/// 是整轮白等一分钟。这七档天然满足上面三条规则(有条测试逐个验),挑一个最近的既稳又省事。
+///
+/// 代价得说清楚:**上屏要放大**。2560×1600 的屏离它最近的是 3:2 那档(1568×1056),
+/// 要撑到 1.63 倍;而接口其实允许 2560×1600(4.1M 像素,也满足 ×32)。
+/// 更大的请求是不是更清楚,这一条**还没验**(见 §11.26);在那之前按这七档来。
+pub const RECOMMENDED_IMAGE_SIZES: [(u32, u32); 7] = [
+    (1280, 1280),
+    (1568, 1056),
+    (1056, 1568),
+    (1472, 1088),
+    (1088, 1472),
+    (1728, 960),
+    (960, 1728),
+];
 
 /// 提示词最长多少字。太长的提示词对 `cogview` 那种小模型是负担,反而容易画糊。
 const MAX_IMAGE_PROMPT_CHARS: usize = 400;
@@ -472,8 +509,11 @@ fn is_watermark_refusal(status: u16, body: &str) -> bool {
 impl Images {
     pub fn new(cfg: ImagesConfig) -> Self {
         let agent: ureq::Agent = ureq::Agent::config_builder()
-            // 生图的等待时间比对话长得多(实测 9~16 s,高峰期更久),所以给到 3 分钟
-            .timeout_global(Some(Duration::from_secs(180)))
+            // 生图的等待时间比对话长得多,而且**换模型之后又长了一截**:
+            // `cogview-3-flash` 实测 9~16 s,`glm-image` 同一句提示词两次是 37.4 s / 72.4 s
+            // (尺寸越大越慢,2048² 那次 120 s 都没回来)。给到 5 分钟 —— 这一条超时的代价
+            // 不是"重试一下",是**那一张的钱已经花了、图却拿不到**,所以宁可等。
+            .timeout_global(Some(Duration::from_secs(300)))
             .http_status_as_error(false)
             // 理由同 `Client::new`:不显式挑 native-tls,ureq 会在 https 上直接 panic
             .tls_config(
@@ -985,28 +1025,51 @@ fn base64(data: &[u8]) -> String {
     out
 }
 
-/// 把"屏幕分辨率"折成服务商能接受的尺寸(规则见 `SIZE_MIN` 那段)。
+/// 这个尺寸能不能原样发给服务商(三条规则见 `SIZE_MIN` 那段)。
 ///
-/// 步骤:等比缩到总像素上限内 → 夹到 512~2880 → 四舍五入到 16 的倍数 → 再保一次总像素。
-/// 最后那一步不是多余:`2880×2880` = 829 万像素 > 2²¹,贴到上界时确实会超。
+/// 单独抽出来是为了让它**有用武之地**:推荐尺寸那份清单是靠"这些数天然合法"立住的,
+/// 而清单是手写的 —— 以后有人往里加一档 1600×900,`fit_size` 会照发不误、
+/// 服务商回一句 400。`fit_size` 收尾那记 `debug_assert` 和一条测试都盯着这里。
+fn size_is_legal(width: u32, height: u32) -> bool {
+    width % SIZE_STEP == 0
+        && height % SIZE_STEP == 0
+        && (SIZE_MIN..=SIZE_MAX).contains(&width)
+        && (SIZE_MIN..=SIZE_MAX).contains(&height)
+        && width as u64 * height as u64 <= SIZE_PIXEL_MAX
+}
+
+/// 把"屏幕分辨率"折成**推荐尺寸**里最合适的那一档(清单见 `RECOMMENDED_IMAGE_SIZES`)。
+///
+/// 挑法:**比比例,不比像素**。16:9 的屏要 1728×960,不是"像素最多的 1280×1280" ——
+/// 比例差得远,画面会被 cover 裁掉一大块,构图就废了(裁切是居中等量的,见 `photo.wgsl`)。
+/// 距离取**比值的对数**:2 倍和 0.5 倍算一样远,不然竖屏会被"偏袒"成大尺寸那一头。
+///
+/// 同比例下取面积大的那个:一样合比例时,当然是分辨率高的更清楚。
+///
+/// 返回值**保证合法** —— 七个候选都满足"512~2880、32 的倍数、总像素 ≤ 2²²",
+/// 所以这里不需要再夹一遍(而且是**不能**夹:把 1568 夹成 1568 没事,夹成 1584 就错了)。
 pub fn fit_size(width: u32, height: u32) -> (u32, u32) {
-    let mut width = width.max(1).min(SIZE_MAX);
-    let mut height = height.max(1).min(SIZE_MAX);
-    let pixels = width as u64 * height as u64;
-    if pixels > SIZE_PIXEL_MAX {
-        let scale = (SIZE_PIXEL_MAX as f64 / pixels as f64).sqrt();
-        width = ((width as f64 * scale) as u32).max(1);
-        height = ((height as f64 * scale) as u32).max(1);
+    let screen = width.max(1) as f64 / height.max(1) as f64;
+    let mut best = RECOMMENDED_IMAGE_SIZES[0];
+    let mut best_gap = f64::INFINITY;
+    for (candidate_width, candidate_height) in RECOMMENDED_IMAGE_SIZES {
+        let gap = (candidate_width as f64 / candidate_height as f64 / screen)
+            .ln()
+            .abs();
+        let same_as_best = (gap - best_gap).abs() < 1e-9;
+        let bigger = candidate_width * candidate_height > best.0 * best.1;
+        if gap < best_gap - 1e-9 || (same_as_best && bigger) {
+            best = (candidate_width, candidate_height);
+            best_gap = gap;
+        }
     }
-    // 四舍五入而不是向下取整:1080 → 1088(而不是 1072),少裁一点是一点
-    let snap = |value: u32| -> u32 { ((value + 8) / 16 * 16).clamp(SIZE_MIN, SIZE_MAX) };
-    width = snap(width);
-    height = snap(height);
-    while width as u64 * height as u64 > SIZE_PIXEL_MAX && width > SIZE_MIN {
-        width = snap(width - 16);
-        height = snap(height - 16);
-    }
-    (width, height)
+    debug_assert!(
+        size_is_legal(best.0, best.1),
+        "挑出了不合法的尺寸 {}×{}:规则见 SIZE_MIN 那段",
+        best.0,
+        best.1
+    );
+    best
 }
 
 /// 会话用的客户端。`clone` 很便宜(Agent 内部是共享的),发请求时丢给后台线程就行。
@@ -1878,7 +1941,7 @@ mod tests {
         let body = serde_json::to_string(&ImageRequest {
             model: DEFAULT_IMAGE_MODEL,
             prompt: "雪山湖的清晨",
-            size: "1920x1088".to_string(),
+            size: "1728x960".to_string(),
             quality: DEFAULT_IMAGE_QUALITY,
             watermark_enabled: DEFAULT_IMAGE_WATERMARK,
         })
@@ -1953,28 +2016,39 @@ mod tests {
         }
     }
 
-    /// 尺寸这条规则是**实测出来的**,不是猜的:服务商要求宽高都是 16 的倍数、各自 512~2880、
-    /// 总像素 ≤ 2²¹。`1920×1080` 会被直接拒绝(1080/16 = 67.5),这里钉住"折成合法的"。
+    /// 推荐尺寸**必须全部合法** —— 它们是我们真正会发出去的那七个。规则是从接口的 4xx
+    /// 正文抄下来的(见 `SIZE_MIN` 那段),不是猜的。
     #[test]
-    fn 生图尺寸总是十六的倍数且落在区间里() {
-        assert_eq!(fit_size(1920, 1080), (1920, 1088));
-        assert_eq!(fit_size(1600, 900), (1600, 896));
-        assert_eq!(fit_size(1024, 1024), (1024, 1024));
-        // 2560×1600 的屏:像素上限把长边压到 1808,所以那种屏上生图**必然**要放大上屏 ——
-        // 这条不是 bug,是服务商 2²¹ 的天花板(实测 2560×1440 直接 400)
-        assert_eq!(fit_size(2560, 1600), (1808, 1136));
+    fn 推荐的七个尺寸全部合法() {
+        assert_eq!(RECOMMENDED_IMAGE_SIZES.len(), 7);
+        for (width, height) in RECOMMENDED_IMAGE_SIZES {
+            assert!(size_is_legal(width, height), "{width}×{height} 不合法");
+        }
+        // 反面例子得钉住,否则上面那条断言可能只是"恒真":1600×900 的 900 不是 32 的倍数
+        assert!(!size_is_legal(1600, 900));
+        assert!(!size_is_legal(2048, 2112), "总像素超了 2²² 也算不合法");
+        // 顺手钉一句:"16 的倍数"那套不能再回来。库里那批 1808×1136 就是这么算出来的,
+        // 到 glm-image 这边 1808/32 = 56.5,会被 400 直接拒掉。
+        assert_ne!(1808 % SIZE_STEP, 0);
+    }
 
-        // 4K:两条上界(边长 2880、总像素 2²¹)都要被照顾到
-        for (width, height) in [(3840u32, 2160u32), (2560, 1440), (1280, 720), (800, 600)] {
-            let (width, height) = fit_size(width, height);
-            assert_eq!(width % 16, 0, "{width} 不是 16 的倍数");
-            assert_eq!(height % 16, 0, "{height} 不是 16 的倍数");
-            assert!((SIZE_MIN..=SIZE_MAX).contains(&width), "宽 {width} 越界");
-            assert!((SIZE_MIN..=SIZE_MAX).contains(&height), "高 {height} 越界");
-            assert!(
-                width as u64 * height as u64 <= SIZE_PIXEL_MAX,
-                "{width}×{height} 总像素超了"
-            );
+    /// 挑尺寸:**先比比例,同比例再比面积**。
+    #[test]
+    fn 按屏幕比例挑推荐尺寸() {
+        // 用户的 2560×1600(16:10):最近的是 3:2 那档,而不是 16:9 或 4:3
+        assert_eq!(fit_size(2560, 1600), (1568, 1056));
+        // 1920×1080(16:9):就是 16:9 那档
+        assert_eq!(fit_size(1920, 1080), (1728, 960));
+        // 1:1 与竖屏
+        assert_eq!(fit_size(1280, 1280), (1280, 1280));
+        assert_eq!(fit_size(1080, 1920), (960, 1728));
+        assert_eq!(fit_size(1600, 1200), (1472, 1088));
+
+        // 极端比例(21:9)也得给一个**合法**答案:挑最近的那档、宁可裁掉一点,
+        // 也不要自己算一个会被拒的尺寸
+        for (width, height) in [(3440u32, 1440u32), (3840, 2160), (800, 600), (1, 1)] {
+            let (fit_width, fit_height) = fit_size(width, height);
+            assert!(RECOMMENDED_IMAGE_SIZES.contains(&(fit_width, fit_height)));
         }
     }
 
