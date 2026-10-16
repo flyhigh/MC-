@@ -25,8 +25,6 @@ struct Params {
     vignette: f32,                // 128
     grain: f32,                   // 132
     _pad: vec2<f32>,              // 136
-    // 144 **元素级动效**:每格 (画什么, 在哪儿, 往哪边, 快慢),见 `mcwp_spec::element_slots`
-    elements: array<vec4<f32>, 5>,
 };
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -183,173 +181,6 @@ fn glow(uv: vec2<f32>, t: f32, density: f32, offset: vec2<f32>) -> f32 {
     return acc * density;
 }
 
-// ---------- 元素层:画面里**那块地方**上的**那个东西**在动 ----------
-//
-// 和上面那层的区别只有一个,但是关键:上面那层是"整张图套一个效果"(下雪 / 起雾),
-// 这层是"**左上角那片灯在闪**"。数据来自看图分析(`MotionPlan`),一格四项:
-// 画什么 / 在哪儿 / 往哪边 / 快慢(见 `mcwp_spec::element_slots`)。
-//
-// 为什么它**必然无缝**:它是时间的**连续函数**,根本没有"一段片子放完"这回事 ——
-// 灯用 sin 明灭、云用 sin 来回飘、车灯用 sin 往返、水波是相位不同的正弦。
-// 视频那条路上怎么也压不住的那个接缝,在这里压根不存在(对比见 §11.22)。
-
-/// 元素层的整体强度。**比效果层克制**:这一层是"画面里有东西在动",不是"往画面上加特效"。
-const ELEMENT_STRENGTH: f32 = 0.55;
-
-/// 元素画在哪儿:九宫格 0~8,9(或更大)= 全图。返回 `(中心.xy, 半径.xy)`。
-fn area_box(code: f32) -> vec4<f32> {
-    if (code > 8.5) {
-        return vec4<f32>(0.5, 0.5, 0.5, 0.5);
-    }
-    let cell = clamp(code, 0.0, 8.0);
-    let row = floor(cell / 3.0);
-    let column = cell - row * 3.0;
-    // 半径给 0.20 而不是 1/6:铺满整格会让人看出"有个方框在动"
-    return vec4<f32>((column + 0.5) / 3.0, (row + 0.5) / 3.0, 0.20, 0.20);
-}
-
-/// 一块柔和的遮罩:中心 1,边缘 0。方框的边必须看不出来 ——
-/// 一个矩形亮斑在画面里飘,比整张图不动还假。
-fn area_mask(uv: vec2<f32>, area: vec4<f32>) -> f32 {
-    let d = abs(uv - area.xy) / max(area.zw, vec2<f32>(0.001));
-    return smoothstep(1.0, 0.25, max(d.x, d.y));
-}
-
-/// 往哪边 → 横轴的符号(1 右 / 2 左);没写方向就是 0,由各元素自己决定怎么动。
-fn dir_x(direction: f32) -> f32 {
-    if (direction == 1.0) { return 1.0; }
-    if (direction == 2.0) { return -1.0; }
-    return 0.0;
-}
-
-/// 往哪边 → 竖轴的符号。注意 uv 的 y **向下**增长(y=0 是屏幕顶端),
-/// 所以"向上"是 -1 —— 这里写反了,云会往下沉、雪会往天上飞。
-fn dir_y(direction: f32) -> f32 {
-    if (direction == 3.0) { return -1.0; }
-    if (direction == 4.0) { return 1.0; }
-    return 0.0;
-}
-
-/// 元素层里"**改坐标**"的那两个 —— 和上面水波一个道理,**必须在采样之前**做。
-fn warp_element(e: vec4<f32>, uv: vec2<f32>, t: f32) -> vec2<f32> {
-    let visual = u32(e.x + 0.5);
-    if (visual == 0u) { return uv; }
-    let mask = area_mask(uv, area_box(e.y));
-    if (mask <= 0.0) { return uv; }
-    let rate = max(e.w, 0.1);
-    if (visual == 4u) {
-        // 水:两个相位不同的正弦把采样点挪一挪 —— 像隔着一层水看
-        let amp = 0.0055 * ELEMENT_STRENGTH * mask;
-        return uv + vec2<f32>(
-            sin(uv.y * 44.0 + t * 1.25 * rate) * amp,
-            cos(uv.x * 36.0 + t * 1.05 * rate) * amp * 0.7,
-        );
-    }
-    if (visual == 5u || visual == 6u) {
-        // 树 / 衣摆:横向轻轻摇。幅度很小 —— 大了整片画面会像在抽搐
-        let amp = 0.0022 * ELEMENT_STRENGTH * mask;
-        return uv + vec2<f32>(sin(t * 0.5 * rate + uv.y * 5.5) * amp, 0.0);
-    }
-    return uv;
-}
-
-/// 元素层里"**叠颜色**"的那几个 —— 采样之后做。
-fn apply_element(
-    e: vec4<f32>,
-    uv: vec2<f32>,
-    t: f32,
-    color_in: vec3<f32>,
-    offset: vec2<f32>,
-) -> vec3<f32> {
-    let visual = u32(e.x + 0.5);
-    if (visual == 0u) { return color_in; }
-    let area = area_box(e.y);
-    let mask = area_mask(uv, area);
-    if (mask <= 0.0) { return color_in; }
-    let rate = max(e.w, 0.1);
-    let strength = ELEMENT_STRENGTH * mask;
-    var color = color_in;
-
-    if (visual == 1u) {
-        // 灯:一片一片地明灭。
-        // **不要用格子**:`floor(uv * 18)` 那种切法里,同一格整块同亮同暗,边界立刻
-        // 变成看得见的方块(实测就是一层 18×18 的马赛克糊在画面上)。换成 fbm 当相位和
-        // 速率,空间上连续 —— 相邻像素只是相位差一点,于是看到的是"一片街区的灯在呼吸"。
-        // 再乘画面自己的亮度:只让本来就亮的地方闪,否则整片夜空会跟着一起亮。
-        let n1 = fbm(uv * 3.6, offset);
-        let n2 = fbm(uv * 7.5 + vec2<f32>(3.3, 8.1), offset + vec2<f32>(1.9, 4.2));
-        let phase = (n1 * 0.7 + n2 * 0.3) * 6.2832;
-        let blink = 0.5 + 0.5 * sin(t * (0.5 + 0.9 * n1) * rate + phase);
-        let luma = dot(color_in, vec3<f32>(0.299, 0.587, 0.114));
-        let on_light = smoothstep(0.18, 0.55, luma);
-        let amount = (0.25 + 0.75 * on_light) * (0.4 + 1.0 * blink) * strength;
-        color = color + color * amount;
-    } else if (visual == 11u) {
-        // 星:一格一颗,闪的相位各不同
-        let cell = floor(uv * vec2<f32>(24.0));
-        let seed = hash21(cell + offset);
-        let lit = step(0.82, seed);
-        let twinkle = 0.25 + 0.75 * (0.5 + 0.5 * sin(t * (0.6 + 1.6 * seed) * rate + seed * 6.2832));
-        let dot = smoothstep(0.42, 0.0, length(fract(uv * vec2<f32>(24.0)) - vec2<f32>(0.5)));
-        color = color + vec3<f32>(1.0) * lit * twinkle * dot * strength;
-    } else if (visual == 2u) {
-        // 云:在那一块里**来回**飘(不是一路飘走),形状是 fbm 云团
-        let drift = sin(t * 0.055 * rate) * 0.55;
-        let shape = fbm(
-            uv * vec2<f32>(2.6, 4.0) + vec2<f32>(drift, 0.0),
-            offset + vec2<f32>(7.3, 1.1),
-        );
-        let amount = smoothstep(0.42, 0.92, shape) * strength;
-        // 云是"提亮 + 往浅色靠":夜里那片云会被灯光照亮,白天就是白云
-        color = mix(color, max(color, P.palette[4].rgb) * 1.15, amount * 0.55);
-    } else if (visual == 3u) {
-        // 雾 / 烟:两层反向慢滚
-        let low = fbm(uv * 3.4 + vec2<f32>(t * 0.03 * rate, 0.0), offset);
-        let high = fbm(uv * 7.2 - vec2<f32>(t * 0.02 * rate, 0.0), offset + vec2<f32>(4.1, 2.7));
-        let amount = smoothstep(0.30, 0.95, low * 0.7 + high * 0.3) * strength;
-        color = mix(color, mix(color, P.palette[4].rgb, 0.45), amount * 0.6);
-    } else if (visual == 7u) {
-        // 车灯:几盏灯在**同一条车道**上来回跑。往返而不是一路开走 ——
-        // 一路开走的话它们跑到头就得瞬移回来,那一瞬就是一记跳
-        let side = select(1.0, dir_x(e.z), dir_x(e.z) != 0.0);
-        let lane = smoothstep(0.018, 0.0, abs(uv.y - (area.y + area.w * 0.35)));
-        var heads = 0.0;
-        for (var i = 0; i < 3; i = i + 1) {
-            let phase = f32(i) * 2.1;
-            let pos = 0.5 + 0.5 * sin(t * 0.19 * rate * side + phase);
-            heads = heads + smoothstep(0.13, 0.015, abs(uv.x - (area.x + (pos - 0.5) * area.z * 2.2)));
-        }
-        color = color + vec3<f32>(1.0, 0.86, 0.62) * heads * lane * strength;
-    } else if (visual == 8u) {
-        // 鸟:几个亮点慢慢飞(两个频率不同的正弦 = 一条不重复的轨迹)
-        let flip = select(1.0, dir_y(e.z), dir_y(e.z) != 0.0);
-        var dots = 0.0;
-        for (var i = 0; i < 3; i = i + 1) {
-            let phase = f32(i) * 1.7;
-            let p = area.xy + vec2<f32>(
-                sin(t * 0.085 * rate + phase) * area.z * 0.7,
-                sin(t * 0.12 * rate * flip + phase * 1.9) * area.w * 0.30,
-            );
-            dots = dots + smoothstep(0.012, 0.0, length((uv - p) * vec2<f32>(1.0, 1.7)));
-        }
-        color = color + vec3<f32>(0.95, 0.95, 0.9) * dots * strength;
-    } else if (visual == 9u) {
-        // 火 / 烛:暖色跳,比灯更快也更碎。
-        // 空间上也要碎(向上舔的 fbm):否则一块区域整块同亮同暗,又是一片"方形的火"。
-        let flicker = 0.55 + 0.45 * sin(t * 2.7 * rate) * (0.55 + 0.45 * sin(t * 6.1 * rate + 1.7));
-        let lick = fbm(uv * 9.0 + vec2<f32>(0.0, -t * 0.22 * rate), offset + vec2<f32>(2.2, 5.5));
-        let amount = smoothstep(0.42, 0.95, lick) * flicker * strength;
-        color = color + vec3<f32>(1.0, 0.52, 0.16) * amount * 0.85;
-    } else if (visual == 10u) {
-        // 雪:复用上面那套雪粒,只是裁在这一块里
-        let down = select(1.0, dir_y(e.z), dir_y(e.z) != 0.0);
-        var snow_uv = uv;
-        snow_uv.y = select(snow_uv.y, 1.0 - snow_uv.y, down < 0.0);
-        color = mix(color, vec3<f32>(1.0), snow(snow_uv, t * rate, 0.75, offset) * strength * 0.5);
-    }
-    return color;
-}
-
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 壁纸的时钟故意走得慢:0.03 是"几乎不动"的底噪,速度拉满也只有 0.33。
@@ -370,15 +201,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         uv.y = uv.y + cos(uv.x * 11.0 + t * 0.9) * 0.007 * P.intensity;
     }
 
-    // 2b · 元素层里改坐标的那几个(水波 / 摇曳):同样必须在采样之前。
-    //      五个格子**手工摊开**:对着 uniform 数组做动态下标在部分后端上会直接被拒,
-    //      而槽位本来就是定长 5,摊开既稳又清楚。
-    uv = warp_element(P.elements[0], uv, t);
-    uv = warp_element(P.elements[1], uv, t);
-    uv = warp_element(P.elements[2], uv, t);
-    uv = warp_element(P.elements[3], uv, t);
-    uv = warp_element(P.elements[4], uv, t);
-
     let sampled = textureSample(photo, photo_sampler, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)));
     var color = sampled.rgb;
 
@@ -394,14 +216,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     } else if (effect == 5u) {
         color = color + P.palette[3].rgb * glow(uv, t, P.intensity, offset) * 0.45;
     }
-
-    // 3b · 元素层:画面里"那块地方上的那个东西"在动(见上面那一段的说明)。
-    //      和效果层**互斥**:有元素的图,`PhotoParams` 会把 effect 清零(见 `from_photo`)。
-    color = apply_element(P.elements[0], uv, t, color, offset);
-    color = apply_element(P.elements[1], uv, t, color, offset);
-    color = apply_element(P.elements[2], uv, t, color, offset);
-    color = apply_element(P.elements[3], uv, t, color, offset);
-    color = apply_element(P.elements[4], uv, t, color, offset);
 
     // 4 · 统一收尾:压一点对比 + 稍微往中性色靠 —— 桌面图标常年压在壁纸上,
     //     生图那种高饱和高对比会让图标糊成一片

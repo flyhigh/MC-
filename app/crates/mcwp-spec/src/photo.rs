@@ -204,10 +204,12 @@ pub struct MotionElement {
 
 /// 一张图"动起来"的方案:**整体镜头 + 逐个元素**。
 ///
-/// 它有两个消费者,所以值得落盘成资产,而不是用完就扔:
-/// 1. 图生视频那句提示词(元素级动作由它拼出来);
-/// 2. 程序化动效层(见 §11.22):灯光在哪儿、车流朝哪边,都得从这里读 ——
-///    重看一遍图当然也能拿到,但那是又一次模型调用,而且两次结果未必一样。
+/// 它**只有一个消费者**:图生视频那句提示词(`mcwp_ai::video_prompt` 把 `camera` 和
+/// 每个 `{area}{kind}{action}` 拼成一句话)。动效不在本地渲染层做 —— 那是被否掉的
+/// 一条路(见 §11.23):画面里的东西该由画面自己动,不是在 shader 里再模拟一遍。
+///
+/// 值得落盘成资产,而不是用完就扔:**重新做一遍动态壁纸时不用再看一次图** ——
+/// 那是一次模型调用,而且两次结果未必一样。
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct MotionPlan {
     /// 整体镜头:固定机位 / 缓慢推近 / 轻微环绕…
@@ -242,173 +244,14 @@ impl MotionPlan {
     }
 }
 
-/// 元素层里"**画什么**"的编号。
+/// 「在画面的哪儿」的清单:九宫格 + 全图。
 ///
-/// 顺序就是这个编号,`photo.wgsl` 里的分支按它排 —— 挪一下顺序,城市夜景的灯就会变成雪。
-/// 0 号是"没写 / 认不出来",**整格不画**:宁可少一层,也不要拿不对的东西糊上去。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ElementVisual {
-    None = 0,
-    /// 灯、霓虹、招牌、窗口 —— 一明一暗地亮
-    Light = 1,
-    /// 云 —— 在那一块里缓缓左右飘
-    Cloud = 2,
-    /// 雾、烟、霾 —— 低速翻滚
-    Smoke = 3,
-    /// 海、湖、河、波纹、倒影 —— 采样点被正弦挪动
-    Water = 4,
-    /// 树、叶、花、草 —— 轻微摇曳(采样点被推一下)
-    Foliage = 5,
-    /// 衣摆、头发、窗帘、旗 —— 摆动
-    Cloth = 6,
-    /// 车、船、列车 —— 一条光带在那一块里流动
-    Traffic = 7,
-    /// 鸟、雁、蝶 —— 几个亮点慢慢飞
-    Bird = 8,
-    /// 火、烛 —— 暖色跳动
-    Fire = 9,
-    /// 雪、落花 —— 细腻的点阵往下落
-    Snow = 10,
-    /// 星星 —— 一闪一闪
-    Star = 11,
-}
-
-impl ElementVisual {
-    /// 全部编号,**顺序就是编号**。留着它是为了让"每个编号都得在着色器里有分支"这条测试
-    /// 可以照着它跑 —— 少一个分支,那种元素就会**静默不画**(不报错,只是没动静)。
-    pub const ALL: [ElementVisual; 12] = [
-        ElementVisual::None,
-        ElementVisual::Light,
-        ElementVisual::Cloud,
-        ElementVisual::Smoke,
-        ElementVisual::Water,
-        ElementVisual::Foliage,
-        ElementVisual::Cloth,
-        ElementVisual::Traffic,
-        ElementVisual::Bird,
-        ElementVisual::Fire,
-        ElementVisual::Snow,
-        ElementVisual::Star,
-    ];
-}
-
-/// 「在画面的哪儿」的编号:九宫格 + 全图。
-///
-/// **顺序必须和 `mcwp_ai` 那份提示词里列的十个位置一致** —— 模型照着那个清单回答,
-/// 我们照着这个表认。两边一错位,"左上角的灯"就会被画到右下角。
+/// **这是那份提示词的唯一真相**:`mcwp_ai::VISION_SYSTEM_PROMPT` 里列的就是这十个,
+/// 而且**顺序必须一致**(有条测试拿它去核提示词)。它不再喂给渲染器 ——
+/// 位置现在只影响提示词怎么写(见 §11.23 末尾:动效归提示词,不归本地渲染层)。
 pub const AREA_NAMES: [&str; 10] = [
     "左上", "上中", "右上", "左中", "正中", "右中", "左下", "下中", "右下", "全图",
 ];
-
-/// 没写方向。
-pub const DIRECTION_NONE: u32 = 0;
-
-/// 一个元素交给渲染器的四项:`(画什么, 在哪儿, 往哪边, 快慢)`。
-///
-/// 为什么不把那句话原样传下去:着色器不认识"缓缓飘来飘去",它只认**画什么**(云还是灯)、
-/// **画在哪儿**、**往哪边**、**多快**。动作那句话的价值也就这三样 ——
-/// 方向、速度,以及"每个元素不一样"的那点味道。
-pub type ElementSlot = [f32; 4];
-
-/// `MotionPlan` → 渲染器要的五个格子(没用的格子是 `[0,0,0,0]`)。
-///
-/// 认不出来的**整格丢掉**(画什么 = 0):视觉模型偶尔写"氛围""光影"这种没法画的东西,
-/// 与其猜,不如不画。
-pub fn element_slots(plan: &MotionPlan) -> [ElementSlot; MotionPlan::MAX_ELEMENTS] {
-    let mut slots = [[0.0f32; 4]; MotionPlan::MAX_ELEMENTS];
-    for (slot, element) in slots.iter_mut().zip(plan.elements.iter()) {
-        let visual = element_visual(&element.kind);
-        if visual == ElementVisual::None {
-            continue;
-        }
-        *slot = [
-            visual as u32 as f32,
-            area_code(&element.area) as f32,
-            direction_code(&element.action, visual) as f32,
-            // 快慢由动作那句话定,但**只从字符串哈希里取**:同一句动作每次得到同一个速度,
-            // 不同元素拿到不一样的速度,画面才不会像一整块在动
-            rate_from(&element.action),
-        ];
-    }
-    slots
-}
-
-/// 元素名 → 编号(关键词匹配)。
-///
-/// 为什么用关键词、而不是让模型直接给编号:它答的是自然语言("霓虹招牌""远处车流"),
-/// 而且每天换说法。**顺序有讲究** —— 越具体的排越前("雪"要在"云"前面试),
-/// 实在认不出来就不画。
-pub fn element_visual(kind: &str) -> ElementVisual {
-    let table: &[(&[&str], ElementVisual)] = &[
-        (&["雪", "落花"], ElementVisual::Snow),
-        (&["星", "银河"], ElementVisual::Star),
-        // 火要写清楚:**不能收单字「火」** —— "灯火通明"是一座城的灯,不是一堆火
-        (&["烛", "火焰", "焰火", "篝火", "火苗", "炉火", "火堆", "火炬"], ElementVisual::Fire),
-        (&["鸟", "雁", "鹤", "蝶", "蜻蜓", "风筝"], ElementVisual::Bird),
-        (&["车", "船", "列车", "地铁"], ElementVisual::Traffic),
-        (&["灯", "霓虹", "招牌", "窗口"], ElementVisual::Light),
-        (&["云"], ElementVisual::Cloud),
-        (&["雾", "烟", "霾", "蒸汽", "水汽"], ElementVisual::Smoke),
-        (&["树", "叶", "花", "草", "林", "竹", "麦", "藤"], ElementVisual::Foliage),
-        // 水排在植物**后面**:「花海」是花,不是海 —— 把它认成水,整片花田就会被推成波纹
-        (&["海", "湖", "河", "水", "波", "浪", "倒影"], ElementVisual::Water),
-        (&["衣", "裙", "袖", "发", "帘", "旗", "幡"], ElementVisual::Cloth),
-    ];
-    for (words, visual) in table {
-        if words.iter().any(|word| kind.contains(word)) {
-            return *visual;
-        }
-    }
-    ElementVisual::None
-}
-
-/// 位置名 → 九宫格编号;认不出来当**全图**(宁可大范围一点,也别让这个元素白写)。
-pub fn area_code(area: &str) -> u32 {
-    AREA_NAMES
-        .iter()
-        .position(|name| area.contains(name))
-        .map(|index| index as u32)
-        .unwrap_or(AREA_NAMES.len() as u32 - 1)
-}
-
-/// 动作里"往哪边" → 编号(1 右 / 2 左 / 3 上 / 4 下);没写就用这个元素的**默认方向**。
-///
-/// 只认带方向的词,不吃单字:「上」在"一下子""晚上"里也会出现,
-/// 而"向右/往右/朝右"这种没有歧义。
-pub fn direction_code(action: &str, visual: ElementVisual) -> u32 {
-    let table: &[(&[&str], u32)] = &[
-        (&["向右", "往右", "朝右", "向东", "往东"], 1),
-        (&["向左", "往左", "朝左", "向西", "往西"], 2),
-        (&["向上", "往上", "朝上", "上升", "升起", "飘起"], 3),
-        // 同理不收单字「落」:「角落」「部落」里也有它,而动作那句话里写的是"飘落""落下"
-        (&["向下", "往下", "朝下", "下降", "下沉", "落下", "飘落", "坠落"], 4),
-    ];
-    for (words, code) in table {
-        if words.iter().any(|word| action.contains(word)) {
-            return *code;
-        }
-    }
-    default_direction(visual)
-}
-
-/// 没写方向时按元素定:车流往右、云往左、雪往下 —— 这是"看一眼就觉得对"的那一侧。
-fn default_direction(visual: ElementVisual) -> u32 {
-    match visual {
-        ElementVisual::Traffic => 1,
-        ElementVisual::Cloud | ElementVisual::Smoke => 2,
-        ElementVisual::Snow => 4,
-        _ => DIRECTION_NONE,
-    }
-}
-
-/// 动作那句话 → 快慢系数(0.6~1.5)。
-///
-/// 它不是"语义",是**同一句动作每次都得到同一个值**的哈希:所以不引随机数、不看时钟。
-/// 上限压在 1.5 是因为壁纸要长时间看,快动作抢注意力。
-fn rate_from(action: &str) -> f32 {
-    let hash = crate::fnv1a64(action.trim().as_bytes());
-    0.6 + (hash % 900) as f32 / 1000.0
-}
 
 /// 这张壁纸是**一张静图**,还是**一段视频**(由某张图生成的动态壁纸)。
 ///
@@ -480,8 +323,8 @@ pub struct Photo {
     /// 这张图"该怎么动"的**元素级**方案(见 `MotionPlan`)。
     ///
     /// 空的就是没分析过:从桌面壁纸抬进来的、以及这份字段存在之前生成的,都是空的。
-    /// 落盘是为了让它当**资产**用 —— 图生视频那句提示词和程序化动效层都吃它,
-    /// 而且"重新做成动态壁纸"时不用再看一遍图(省一次调用,也省得两次结果不一样)。
+    /// 落盘是为了让它当**资产**用:图生视频那句提示词吃它,而且"重新做成动态壁纸"时
+    /// 不用再看一遍图(省一次调用,也省得两次结果不一样)。
     pub motion_plan: MotionPlan,
 }
 
@@ -744,107 +587,22 @@ fn normalize_hex(raw: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// 元素名 → 画什么。这张表是**手写的关键词匹配**,所以每条都得钉住:
-    /// 认错一格,画面里就会出现一个不该有的东西(比如把"氛围"画成雾)。
+    /// 位置清单本身的内容和长度。**顺序不能动**:提示词里就是照这个顺序念给模型的,
+    /// 改了这里而没改提示词,"左上"就会被理解成别的位置(同序这条由 `mcwp_ai` 那条测试盯)。
     #[test]
-    fn 元素名认得出该画什么() {
-        let cases: &[(&str, ElementVisual)] = &[
-            ("灯光", ElementVisual::Light),
-            ("霓虹招牌", ElementVisual::Light),
-            ("高楼窗口", ElementVisual::Light),
-            ("云朵", ElementVisual::Cloud),
-            ("车流", ElementVisual::Traffic),
-            ("一辆列车", ElementVisual::Traffic),
-            ("飞鸟", ElementVisual::Bird),
-            ("水面", ElementVisual::Water),
-            ("波纹倒影", ElementVisual::Water),
-            ("树叶", ElementVisual::Foliage),
-            ("花海", ElementVisual::Foliage),
-            ("衣摆", ElementVisual::Cloth),
-            ("窗帘", ElementVisual::Cloth),
-            ("烟雾", ElementVisual::Smoke),
-            ("雪花", ElementVisual::Snow),
-            ("星星", ElementVisual::Star),
-            ("烛火", ElementVisual::Fire),
-            // 认不出来的必须**什么都不画**,不能猜
-            ("氛围", ElementVisual::None),
-            ("光影", ElementVisual::None),
-            ("", ElementVisual::None),
-        ];
-        for (kind, want) in cases {
-            assert_eq!(element_visual(kind), *want, "「{kind}」认成了别的");
-        }
-    }
-
-    /// 位置名 → 九宫格编号。顺序**必须**跟提示词里那十个一致,这条是那个约定的锚。
-    #[test]
-    fn 位置编号和提示词里的清单同序() {
+    fn 位置清单是九宫格加全图() {
         assert_eq!(AREA_NAMES.len(), 10);
         assert_eq!(AREA_NAMES[0], "左上");
         assert_eq!(AREA_NAMES[4], "正中");
         assert_eq!(AREA_NAMES[9], "全图");
-        assert_eq!(area_code("左上"), 0);
-        assert_eq!(area_code("右上角的招牌"), 2);
-        assert_eq!(area_code("下中"), 7);
-        // 认不出来当全图:宁可大范围一点,也别让这个元素白写
-        assert_eq!(area_code(""), 9);
-        assert_eq!(area_code("屏幕中间偏下"), 9);
-    }
-
-    /// 方向:带方向的词优先,没写就按元素定默认方向。
-    #[test]
-    fn 动作里认得出往哪边() {
-        assert_eq!(direction_code("向右缓慢飘移", ElementVisual::Cloud), 1);
-        assert_eq!(direction_code("从右往左流动", ElementVisual::Traffic), 2);
-        assert_eq!(direction_code("缓缓飘落", ElementVisual::Snow), 4);
-        // 没写方向 → 按元素默认(车往右、云往左、雪往下)
-        assert_eq!(direction_code("缓缓流动", ElementVisual::Traffic), 1);
-        assert_eq!(direction_code("缓缓飘移", ElementVisual::Cloud), 2);
-        assert_eq!(direction_code("缓缓落下", ElementVisual::Snow), 4);
-        // 灯没有默认方向
-        assert_eq!(direction_code("一明一暗地闪烁", ElementVisual::Light), DIRECTION_NONE);
-        // "一下子亮起来"里的"下"**不能**被当成方向(只认带方向的词)
-        assert_eq!(direction_code("一下子亮起来", ElementVisual::Light), DIRECTION_NONE);
-    }
-
-    /// 方案 → 五个格子:没用的格子是零,速度落在 0.6~1.5,而且**同一句动作每次都一样**。
-    #[test]
-    fn 方案压成渲染器要的格子() {
-        let plan = MotionPlan {
-            camera: "固定机位".to_string(),
-            elements: vec![
-                MotionElement {
-                    kind: "灯光".to_string(),
-                    area: "全图".to_string(),
-                    action: "一明一暗地闪烁".to_string(),
-                },
-                MotionElement {
-                    kind: "云朵".to_string(),
-                    area: "左上".to_string(),
-                    action: "向右缓慢飘移".to_string(),
-                },
-                MotionElement {
-                    kind: "氛围".to_string(),
-                    area: "正中".to_string(),
-                    action: "变得很好看".to_string(),
-                },
-            ],
-        };
-        let slots = element_slots(&plan);
-        assert_eq!(slots[0][0], ElementVisual::Light as u32 as f32);
-        assert_eq!(slots[0][1], 9.0, "全图是 9");
-        assert_eq!(slots[1][0], ElementVisual::Cloud as u32 as f32);
-        assert_eq!(slots[1][1], 0.0, "左上角是 0");
-        assert_eq!(slots[1][2], 1.0, "往右");
-        // 认不出来的那格**整格是零**:不画
-        assert_eq!(slots[2], [0.0, 0.0, 0.0, 0.0]);
-        // 空位也是零
-        assert_eq!(slots[3], [0.0, 0.0, 0.0, 0.0]);
-        for slot in slots.iter().filter(|slot| slot[0] > 0.0) {
-            assert!((0.6..=1.5).contains(&slot[3]), "速度越界:{slot:?}");
-        }
-        // 同一份方案压两次必须逐位一样(速度来自哈希,不是随机数)
-        assert_eq!(slots, element_slots(&plan));
+        // 九个格子 + 一个全图,顺序是从左上往右下读
+        assert_eq!(AREA_NAMES[1], "上中");
+        assert_eq!(AREA_NAMES[2], "右上");
+        assert_eq!(AREA_NAMES[3], "左中");
+        assert_eq!(AREA_NAMES[5], "右中");
+        assert_eq!(AREA_NAMES[6], "左下");
+        assert_eq!(AREA_NAMES[7], "下中");
+        assert_eq!(AREA_NAMES[8], "右下");
     }
 
     fn solid(width: u32, height: u32, rgb: Rgb) -> Vec<u8> {

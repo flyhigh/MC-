@@ -1038,6 +1038,10 @@ export component Panel inherits Window {
     in-out property <string> ai-image-base-url: "";
     in-out property <string> ai-image-model: "";
     in-out property <string> ai-image-key: "";
+    // 生图画质:0 = 标准 / 1 = 高清。**不是"越大越好"的滑块** —— 服务商只认
+    // hd / standard 两个字面值,面板原样交给 Rust 落盘(`QualityChoice`)。
+    // 默认高清:standard 出来的图明显更糊(实测高频细节少 41%)。
+    in-out property <int> ai-image-quality: 1;
     // 图生视频的模型名。地址和 key 都跟生图那组走(同一家服务商的同一个接口域),
     // 所以这里只留一个模型名 —— 多两个输入框只会让人不知道该填哪个(见 `VideosConfig::load`)。
     in-out property <string> ai-video-model: "";
@@ -1144,7 +1148,7 @@ export component Panel inherits Window {
     // 把「现在桌面上那张壁纸」抬进来当作一张新的(生图之前先有东西可看)
     callback adopt-wallpaper();
     // 设置页:保存模型配置(接口地址 / 模型名 / API Key / 深度思考那一档的下标)
-    callback save-ai-config(string, string, string, int, string, string, string, string);
+    callback save-ai-config(string, string, string, int, string, string, string, int, string);
 
     title: "MC 壁纸 · 控制面板";
     // 任务栏 / Alt-Tab 的窗口图标。`@image-url` 走的还是 build.rs 的 EmbedFiles,所以图标
@@ -1908,6 +1912,18 @@ export component Panel inherits Window {
                             value <=> root.ai-image-key;
                             accent: root.accent;
                         }
+                        ChoiceRow {
+                            label: "生图画质";
+                            options: ["标准", "高清"];
+                            current <=> root.ai-image-quality;
+                            accent: root.accent;
+                        }
+                        Text {
+                            text: "标准 = 服务商默认(快,但出图明显更糊);高清让模型多跑一遍细节,实测高频细节多 41%。";
+                            color: Glass.label-3;
+                            font-size: 10px;
+                            wrap: word-wrap;
+                        }
                         FieldRow {
                             label: "视频模型名";
                             placeholder: "留空 = cogvideox-3";
@@ -1939,6 +1955,7 @@ export component Panel inherits Window {
                                             root.ai-image-base-url,
                                             root.ai-image-model,
                                             root.ai-image-key,
+                                            root.ai-image-quality,
                                             root.ai-video-model
                                         );
                                     }

@@ -114,19 +114,7 @@ pub struct PhotoParams {
     pub grain: f32,
     /// 补齐到 16 字节对齐(WGSL uniform 要求)
     pub _pad: [f32; 2],
-    /// **元素级动效**:每格四项 `(画什么, 在哪儿, 往哪边, 快慢)`(见 `mcwp_spec::element_slots`)。
-    /// 第 0 项是 0,就表示这一格不画。
-    ///
-    /// 定长 5 不是随手写的:着色器里就是 `array<vec4<f32>, 5>`,两边差一格,
-    /// 后面所有字段整体错位(有测试钉着偏移)。
-    pub elements: [[f32; 4]; ELEMENT_SLOTS],
 }
-
-/// 元素层的槽位数:和 `MotionPlan::MAX_ELEMENTS` **必须相等**。
-///
-/// 引用而不是抄一个数字,是因为"提示词那边最多写五个"和"uniform 里最多装五个"
-/// 是同一件事的两面;抄成两个字面量,改一处就会有一边静默失效(多出来的元素直接被丢掉)。
-pub const ELEMENT_SLOTS: usize = mcwp_spec::MotionPlan::MAX_ELEMENTS;
 
 impl PhotoParams {
     /// `Photo` + 屏幕尺寸 → 着色器参数。
@@ -138,12 +126,6 @@ impl PhotoParams {
             }
         }
         let motion = photo.motion;
-        // 元素层:一份方案最多五个元素,压成五格数字交给着色器(见 `element_slots`)
-        let elements = mcwp_spec::element_slots(&photo.motion_plan);
-        // 有元素层就**把"整张图一个效果"那层关掉**:两层一起上会重复 ——
-        // 方案里写着"左上角有云",配方又叠一层全屏云影,画面立刻糊成一团。
-        // 元素层是按画面分析出来的,更准,所以留下的是它。
-        let has_elements = elements.iter().any(|slot| slot[0] > 0.0);
         Self {
             resolution: [width as f32, height as f32],
             time: 0.0,
@@ -152,13 +134,8 @@ impl PhotoParams {
             zoom: motion.zoom,
             pan: motion.pan,
             speed: motion.speed,
-            // 有元素层就交给人家的元素层:两层一起上会互相重复
-            intensity: if has_elements { 0.0 } else { motion.intensity },
-            effect: if has_elements {
-                0.0
-            } else {
-                effect_index(motion.kind) as f32
-            },
+            intensity: motion.intensity,
+            effect: effect_index(motion.kind) as f32,
             image_aspect: photo.aspect(),
             screen_aspect: width as f32 / height.max(1) as f32,
             seed: photo.seed as f32,
@@ -166,7 +143,6 @@ impl PhotoParams {
             vignette: 0.55,
             grain: 0.12,
             _pad: [0.0; 2],
-            elements,
         }
     }
 
@@ -182,9 +158,6 @@ impl PhotoParams {
         params.pan = 0.0;
         params.intensity = 0.0;
         params.effect = 0.0;
-        // 元素层也关掉:视频**自己就在动**,而且它那份 `motion_plan` 是**来历的痕迹**,
-        // 不是"还要再画一遍"的指令(见 `Photo::motion_plan` 的说明)
-        params.elements = [[0.0; 4]; ELEMENT_SLOTS];
         params
     }
 }
@@ -874,15 +847,14 @@ fn build_photo_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mcwp_spec::{ElementVisual, MotionRecipe};
+    use mcwp_spec::MotionRecipe;
 
     /// uniform 的字节布局是 Rust 和 WGSL 之间**唯一**没有编译器保护的约定:
     /// 这边挪一个字段、那边不改,画面不会报错,只会诡异地错位。所以在这里把偏移钉死。
     #[test]
     fn 照片参数的显存布局和着色器逐字段对齐() {
         use std::mem::{offset_of, size_of};
-        assert_eq!(offset_of!(PhotoParams, elements), 144);
-        assert_eq!(size_of::<PhotoParams>(), 144 + ELEMENT_SLOTS * 16);
+        assert_eq!(size_of::<PhotoParams>(), 144);
         assert_eq!(offset_of!(PhotoParams, resolution), 0);
         assert_eq!(offset_of!(PhotoParams, time), 8);
         assert_eq!(offset_of!(PhotoParams, brightness), 12);
@@ -898,32 +870,11 @@ mod tests {
         assert_eq!(offset_of!(PhotoParams, vignette), 128);
         assert_eq!(offset_of!(PhotoParams, grain), 132);
         assert_eq!(offset_of!(PhotoParams, _pad), 136);
-        // 元素层接在 `_pad` 后面(144 是 16 的倍数,数组元素也对齐)
-    }
-
-    /// 槽位数两边必须一样,而且着色器里真写了这么多:少一格,第五个元素就被静默丢掉。
-    #[test]
-    fn 元素槽位数和着色器一致() {
-        assert_eq!(ELEMENT_SLOTS, 5, "提示词那边最多写五个元素");
+        // `_pad` 之后就是 WGSL 里 `Params` 的末尾:两边的字段数量必须一起变
         assert!(
-            PHOTO_SHADER.contains(&format!("array<vec4<f32>, {ELEMENT_SLOTS}>")),
-            "着色器里的元素数组长度和 Rust 这边对不上"
+            PHOTO_SHADER.contains("_pad: vec2<f32>,              // 136\n};"),
+            "着色器的 Params 尾部结构和 Rust 这边对不上了"
         );
-    }
-
-    /// 每一种"画什么"都必须在着色器里有分支。
-    ///
-    /// 这条是**静默失效**的保险:分支少写一个,那种元素不会报错、不会崩,
-    /// 只是在画面里**什么都不做** —— 而用户看到的只是"这块没动",根本无从查起。
-    #[test]
-    fn 每种元素在着色器里都有分支() {
-        for visual in ElementVisual::ALL {
-            if visual == ElementVisual::None {
-                continue;
-            }
-            let needle = format!("visual == {}u", visual as u32);
-            assert!(PHOTO_SHADER.contains(&needle), "着色器里没有分支:{needle}");
-        }
     }
 
     /// 真建一遍管线。

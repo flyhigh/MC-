@@ -88,6 +88,8 @@ pub enum UiEvent {
         image_base_url: String,
         image_model: String,
         image_api_key: String,
+        /// 生图画质:`hd` / `standard`
+        image_quality: String,
         /// 图生视频的模型名;留空 = 用内置默认
         video_model: String,
     },
@@ -178,6 +180,9 @@ pub struct AiConfigState {
     pub image_base_url: String,
     pub image_model: String,
     pub image_api_key: String,
+    /// 生图画质(`hd` / `standard`)。界面是一排小胶囊(见 `QualityChoice`),
+    /// 传下来的是落盘用的那个字符串 —— 面板不认识服务商的取值,只负责原样搬。
+    pub image_quality: String,
     /// 图生视频的模型名。**留空是合法的**:空 = 用内置默认(`cogvideox-3`)。
     /// 地址和 Key 不在这儿 —— 图生视频和生图基本总是同一家,那两个跟着生图那组走。
     pub video_model: String,
@@ -236,6 +241,57 @@ impl ThinkingChoice {
             None => Self::Unset,
             Some(true) => Self::Enabled,
             Some(false) => Self::Disabled,
+        }
+    }
+}
+
+/// 设置页里「生图画质」这一项。
+///
+/// 两档,不是"越高越好"的滑块:服务商那边只认 `hd` 和 `standard` 两个**字面值**
+/// (别的值直接 400),所以界面上就是两个胶囊,传下去的也必须是原样的那两个词。
+/// 默认给 `hd` —— 实测同一句提示词、同一个尺寸,`standard` 的高频细节少 41%,
+/// 用户抱怨"生成的壁纸怎么这么糊"时,十有八九就是这个字段没要高清。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QualityChoice {
+    /// 服务商默认档 —— 更快更省,但明显更糊
+    Standard,
+    /// 高清:多跑一遍细节
+    #[default]
+    Hd,
+}
+
+impl QualityChoice {
+    /// 面板传上来的是一排胶囊的下标(0 = 标准 / 1 = 高清);认不出的按**高清**处理,
+    /// 因为"画质"这个开关的默认值本来就该是好的那一档。
+    fn from_index(index: i32) -> Self {
+        match index {
+            0 => Self::Standard,
+            _ => Self::Hd,
+        }
+    }
+
+    fn index(self) -> i32 {
+        match self {
+            Self::Standard => 0,
+            Self::Hd => 1,
+        }
+    }
+
+    /// 落进 `ai.json` 的样子 —— 就是服务商要的那个字面值。
+    fn value(self) -> String {
+        match self {
+            Self::Standard => "standard".to_string(),
+            Self::Hd => "hd".to_string(),
+        }
+    }
+
+    /// 从 `ai.json` 读回来的反向映射。**认不出的当高清**:这个字段是"画质",
+    /// 用户手写一个拼错的值时,宁可给他好的那一档,也不要静默降成糊的。
+    fn from_value(raw: &str) -> Self {
+        if raw.trim().eq_ignore_ascii_case("standard") {
+            Self::Standard
+        } else {
+            Self::Hd
         }
     }
 }
@@ -610,7 +666,7 @@ fn build(state: &PanelState, events: Sender<UiEvent>) -> Result<Panel> {
     {
         // 设置页的「保存」。面板只把四个值原样递出去 —— 校验、落盘、重建客户端都在壁纸侧。
         let tx = events.clone();
-        ui.on_save_ai_config(move |base_url, model, api_key, thinking, image_base_url, image_model, image_api_key, video_model| {
+        ui.on_save_ai_config(move |base_url, model, api_key, thinking, image_base_url, image_model, image_api_key, image_quality, video_model| {
             let _ = tx.send(UiEvent::SaveAiConfig {
                 base_url: base_url.to_string(),
                 model: model.to_string(),
@@ -619,6 +675,7 @@ fn build(state: &PanelState, events: Sender<UiEvent>) -> Result<Panel> {
                 image_base_url: image_base_url.to_string(),
                 image_model: image_model.to_string(),
                 image_api_key: image_api_key.to_string(),
+                image_quality: QualityChoice::from_index(image_quality).value(),
                 video_model: video_model.to_string(),
             });
         });
@@ -933,6 +990,7 @@ fn apply_ai(ui: &Panel, ai: &AiConfigState) {
     ui.set_ai_image_base_url(ai.image_base_url.clone().into());
     ui.set_ai_image_model(ai.image_model.clone().into());
     ui.set_ai_image_key(ai.image_api_key.clone().into());
+    ui.set_ai_image_quality(QualityChoice::from_value(&ai.image_quality).index());
     ui.set_ai_video_model(ai.video_model.clone().into());
     ui.set_ai_thinking(ai.thinking.index());
     ui.set_ai_env_override(ai.env_override);

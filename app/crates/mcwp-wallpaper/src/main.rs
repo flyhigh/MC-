@@ -997,12 +997,13 @@ fn ai_config_state() -> mcwp_ui::AiConfigState {
         base_url: stored.base_url.clone(),
         model: stored.model.clone(),
         api_key: stored.api_key.clone(),
-        // 生图那三个**原样给**(`Stored` 里是空串):空串是合法的,意思是"跟着上面那组走"。
+        // 生图那几个**原样给**(`Stored` 里是空串):空串是合法的,意思是"跟着上面那组走"。
         // 不能提前填上默认值 —— 那样用户就分不清"我自己填的"和"程序替我填的",
         // 想改回"跟对话同一家"也就没有表达方式了。
         image_base_url: stored.image_base_url,
         image_model: stored.image_model,
         image_api_key: stored.image_api_key,
+        image_quality: stored.image_quality,
         // 同理原样给:空串 = 用内置默认(`cogvideox-3`)
         video_model: stored.video_model,
         thinking: mcwp_ui::ThinkingChoice::from_option(stored.thinking),
@@ -2690,9 +2691,10 @@ fn main() -> Result<()> {
                     image_base_url,
                     image_model,
                     image_api_key,
+                    image_quality,
                     video_model,
                 } => {
-                    // **先从盘上现读一份**再覆盖这七个字段:直接构造一个 `Stored` 会把盘上
+                    // **先从盘上现读一份**再覆盖回调带来的这几个字段:直接构造一个 `Stored` 会把盘上
                     // 这一版还不认识的字段(以后加的)悄悄抹掉 —— 那种丢失没有报错、没有提示,
                     // 是设置页最恶劣的一类 bug。
                     let mut stored = mcwp_ai::Config::stored();
@@ -2703,6 +2705,7 @@ fn main() -> Result<()> {
                     stored.image_base_url = image_base_url.trim().to_string();
                     stored.image_model = image_model.trim().to_string();
                     stored.image_api_key = image_api_key.trim().to_string();
+                    stored.image_quality = image_quality.trim().to_string();
                     stored.video_model = video_model.trim().to_string();
                     stored.thinking = thinking.to_option();
                     let status = save_ai_config(&stored, &mut ai, &mut images, &mut videos);

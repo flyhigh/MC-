@@ -13,15 +13,14 @@
 //!
 //! 现在这一层只描述 [`Photo`]:图在哪、多宽多高、动效怎么走、调色板是哪几个色。
 //! 动效有两层:[`MotionRecipe`](细颗粒的旋钮,K 帧层的推拉呼吸)和
-//! [`MotionPlan`](元素级的"灯在闪、车在走",给图生视频和程序化动效层用)。
+//! [`MotionPlan`](元素级的"灯在闪、车在走",只喂给图生视频那句提示词)。
 //! 详情见 [`photo`] 模块。
 
 pub mod photo;
 
 pub use photo::{
     palette_from_rgba, MotionElement, MotionKind, MotionPlan, MotionRecipe, Photo,
-    area_code, direction_code, element_slots, element_visual, ElementSlot, ElementVisual,
-    AREA_NAMES, DIRECTION_NONE,
+    AREA_NAMES,
 };
 
 /// 调色板的槽位数。

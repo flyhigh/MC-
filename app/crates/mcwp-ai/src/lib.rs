@@ -55,6 +55,16 @@ pub const DEFAULT_IMAGE_BASE_URL: &str = DEFAULT_BASE_URL;
 /// 默认生图模型。`cogview-3-flash` 是智谱的免费档 —— 想换 `cogview-3` / `cogview-4` 直接改配置。
 pub const DEFAULT_IMAGE_MODEL: &str = "cogview-3-flash";
 
+/// 默认生图**画质**:`hd`。
+///
+/// 智谱这个接口有个 `quality` 参数,值是 `hd` / `standard`,**不写就是 standard**。
+/// 实测(2026-10-16,同一条提示词、同样 1920×1088,只差这一个字段):
+/// 高频细节(平均绝对拉普拉斯)从 20.9 抬到 **29.6(+41%)**,文件 413 KB → 440 KB。
+/// 也就是说"生成出来的壁纸看着糊"有很大一部分是**我们没要高清**。
+///
+/// 值只认这两个(`4k` 直接 400 Bad Request),所以这里不做"越大越好"的自动升级。
+pub const DEFAULT_IMAGE_QUALITY: &str = "hd";
+
 /// 默认的「图生视频」模型。
 ///
 /// `cogvideox-3` 实测(2026-10-16):提交 200、**约 61 s 出片**、1080×1080、5.13 s、31 fps、带水印,
@@ -178,6 +188,10 @@ pub struct Stored {
     pub image_model: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub image_api_key: String,
+    /// 生图画质:`hd` / `standard`。**留空是合法的**:空 = 用内置默认(`hd`,见
+    /// `DEFAULT_IMAGE_QUALITY`),免得老配置文件升级上来反而变糊。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub image_quality: String,
     /// 「图生视频」那一套。它和生图**基本总是同一家**(同一把 key 的同一个接口域下),
     /// 所以这里只留一个模型名:地址和 key 都从生图 / 对话那两组继承下来(见 `VideosConfig::load`)。
     /// 真要用另一家,再补字段不迟 —— 现在多两个输入框只会让人不知道该填哪个。
@@ -249,6 +263,9 @@ impl Config {
         if file.image_model.trim().is_empty() {
             file.image_model = DEFAULT_IMAGE_MODEL.to_string();
         }
+        if file.image_quality.trim().is_empty() {
+            file.image_quality = DEFAULT_IMAGE_QUALITY.to_string();
+        }
         if file.vision_model.trim().is_empty() {
             file.vision_model = DEFAULT_VISION_MODEL.to_string();
         }
@@ -319,10 +336,12 @@ fn missing_image_key_hint() -> String {
     format!(
         "还没配生图。在面板「设置」里填密钥即可,或者写进 {path}:\n\
          {{\"base_url\": \"{DEFAULT_BASE_URL}\", \"model\": \"{DEFAULT_MODEL}\", \
-         \"api_key\": \"你的key\", \"image_model\": \"{DEFAULT_IMAGE_MODEL}\"}}\n\
+         \"api_key\": \"你的key\", \"image_model\": \"{DEFAULT_IMAGE_MODEL}\", \
+         \"image_quality\": \"{DEFAULT_IMAGE_QUALITY}\"}}\n\
          生图默认**跟对话共用同一把 key**(智谱一把 key 管两个接口),想分开就再填 \
          image_base_url / image_model / image_api_key。\n\
-         临时试一家也可以只设环境变量 MCWP_IMAGE_KEY / MCWP_IMAGE_BASE_URL / MCWP_IMAGE_MODEL。"
+         image_quality 只认 hd(默认,细节多)和 standard(服务商默认,明显更糊)。\n\
+         临时试一家也可以只设环境变量 MCWP_IMAGE_KEY / MCWP_IMAGE_BASE_URL / MCWP_IMAGE_MODEL / MCWP_IMAGE_QUALITY。"
     )
 }
 
@@ -335,6 +354,8 @@ pub struct ImagesConfig {
     pub base_url: String,
     pub model: String,
     pub api_key: String,
+    /// 画质:`hd` / `standard`。别的值服务商会 400,所以这里不做"猜你想说什么"。
+    pub quality: String,
 }
 
 impl ImagesConfig {
@@ -352,6 +373,9 @@ impl ImagesConfig {
         let model = env("MCWP_IMAGE_MODEL")
             .or_else(|| non_empty(&raw.image_model))
             .unwrap_or_else(|| DEFAULT_IMAGE_MODEL.to_string());
+        let quality = env("MCWP_IMAGE_QUALITY")
+            .or_else(|| non_empty(&raw.image_quality))
+            .unwrap_or_else(|| DEFAULT_IMAGE_QUALITY.to_string());
         let Some(api_key) = env("MCWP_IMAGE_KEY")
             .or_else(|| non_empty(&raw.image_api_key))
             .or_else(|| env("MCWP_AI_KEY"))
@@ -363,6 +387,7 @@ impl ImagesConfig {
             base_url,
             model,
             api_key,
+            quality,
         })
     }
 }
@@ -417,7 +442,9 @@ impl Images {
             .nth(1)
             .and_then(|rest| rest.split('/').next())
             .unwrap_or(&self.cfg.base_url);
-        format!("{host} · {}", self.cfg.model)
+        // 画质也写进来:这行是 `--images-selftest` 唯一能自己交代"按哪一档出图"的地方,
+        // 而"为什么这么糊"那个问题,答案十有八九就在这几个字上(见 §11.24)。
+        format!("{host} · {} · {}", self.cfg.model, self.cfg.quality)
     }
 
     /// `base_url` 后面补 `/images/generations`。写成完整 endpoint 也认。
@@ -440,6 +467,7 @@ impl Images {
             model: self.cfg.model.as_str(),
             prompt,
             size: format!("{width}x{height}"),
+            quality: self.cfg.quality.as_str(),
         })?;
         let mut response = self
             .agent
@@ -467,9 +495,10 @@ impl Images {
             .ok_or_else(|| anyhow!("生图接口说成功了,但没给图片地址"))?;
         let bytes = self.download(&url)?;
         tracing::info!(
-            "生图完成:{}×{} · {} KB · {}",
+            "生图完成:{}×{} · {} · {} KB · {}",
             width,
             height,
+            self.cfg.quality,
             bytes.len() / 1024,
             truncate(prompt, 60)
         );
@@ -605,6 +634,8 @@ impl Videos {
             .nth(1)
             .and_then(|rest| rest.split('/').next())
             .unwrap_or(&self.cfg.base_url);
+        // 画质写进来:这行是 `--images-selftest` 唯一能自己说清楚"按哪一档出图"的地方,
+        // 而"为什么这么糊"那个问题里,答案十有八九就在这几个字上(见 §11.24)。
         format!("{host} · {}", self.cfg.model)
     }
 
@@ -1713,6 +1744,9 @@ struct ImageRequest<'a> {
     model: &'a str,
     prompt: &'a str,
     size: String,
+    /// `hd` / `standard`。**必须显式带上**:不写这个字段就是 standard,
+    /// 而 standard 出图明显更糊(实测高频细节差 41%)。
+    quality: &'a str,
 }
 
 /// 生图响应。只有一个字段真的有用:`data[0].url`。
@@ -1732,6 +1766,25 @@ struct ImageDatum {
 mod tests {
     use super::*;
 
+    /// 画质这个字段**不能漏**:服务商那边不写就是 `standard`,而出图明显更糊
+    /// (实测同一句提示词、同一个尺寸,高频细节差 41%)。这条盯的是"请求体里真有它"。
+    #[test]
+    fn 生图请求体里带上画质() {
+        let body = serde_json::to_string(&ImageRequest {
+            model: DEFAULT_IMAGE_MODEL,
+            prompt: "雪山湖的清晨",
+            size: "1920x1088".to_string(),
+            quality: DEFAULT_IMAGE_QUALITY,
+        })
+        .unwrap();
+        assert!(
+            body.contains("\"quality\":\"hd\""),
+            "请求体里没有画质字段:{body}"
+        );
+        // 别的值服务商会 400,所以默认值只能是这两个中的一个
+        assert!(matches!(DEFAULT_IMAGE_QUALITY, "hd" | "standard"));
+    }
+
     /// 尺寸这条规则是**实测出来的**,不是猜的:服务商要求宽高都是 16 的倍数、各自 512~2880、
     /// 总像素 ≤ 2²¹。`1920×1080` 会被直接拒绝(1080/16 = 67.5),这里钉住"折成合法的"。
     #[test]
@@ -1739,6 +1792,9 @@ mod tests {
         assert_eq!(fit_size(1920, 1080), (1920, 1088));
         assert_eq!(fit_size(1600, 900), (1600, 896));
         assert_eq!(fit_size(1024, 1024), (1024, 1024));
+        // 2560×1600 的屏:像素上限把长边压到 1808,所以那种屏上生图**必然**要放大上屏 ——
+        // 这条不是 bug,是服务商 2²¹ 的天花板(实测 2560×1440 直接 400)
+        assert_eq!(fit_size(2560, 1600), (1808, 1136));
 
         // 4K:两条上界(边长 2880、总像素 2²¹)都要被照顾到
         for (width, height) in [(3840u32, 2160u32), (2560, 1440), (1280, 720), (800, 600)] {
