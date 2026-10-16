@@ -1,20 +1,17 @@
-//! MC 壁纸 · M0 壁纸宿主:把 wgpu 渲染的内置场景挂到桌面壁纸层。
+//! MC 壁纸 · 壁纸宿主:把 wgpu 渲染的照片壁纸挂到桌面壁纸层。
 //!
 //! 用法:
 //! ```text
 //! mcwp-wallpaper                          # 常驻运行(默认 60fps)
-//!                                         # 托盘常驻:打开面板 / 换预设 / 暂停渲染 / 开机自启 / 退出
+//!                                         # 托盘常驻:打开面板 / 换一张 / 暂停渲染 / 开机自启 / 退出
 //! mcwp-wallpaper --seconds 10             # 跑 10 秒自动退出(自检)
 //! mcwp-wallpaper --fps 30 --brightness 0.8
-//! mcwp-wallpaper --preset nebula_drift   # 用内置场景预设(rainy_window_city / minimal_paper /
-//!                                        # nebula_drift / focus_grid)
-//! mcwp-wallpaper --preset list           # 列出全部预设与它们的参数
-//! mcwp-wallpaper --spec path/xxx.json    # 用一份 WallpaperSpec 渲染
-//! mcwp-wallpaper --dump-spec             # 打印当前生效的 spec 与指纹
-//! mcwp-wallpaper --export-presets out/   # 把每个预设导出成示例 spec 文件
 //! mcwp-wallpaper --panel                  # 同时打开 Slint 控制面板
-//! mcwp-wallpaper --ai-selftest "把壁纸调冷一点"   # 只问模型一次,打印回复与规格(不建窗口)
 //! mcwp-wallpaper --panel --ai-ask "雨夜的城市"    # 开面板,并替用户把这句话发出去
+//! mcwp-wallpaper --gen "雨夜的城市"        # 现场生一张图并换上(整条链路,含提示词智能体)
+//! mcwp-wallpaper --photo 6a1f2b0c9d3e4f50  # 换上壁纸库里已有的一张(取库目录里的文件名)
+//! mcwp-wallpaper --adopt                  # 把**桌面上原来那张壁纸**抬进来当第一张(不生图)
+//! mcwp-wallpaper --images-selftest "雪山日出"     # 只跑一遍生图链路,打印结果(不建窗口)
 //! mcwp-wallpaper --attach auto            # 挂载策略,见 AttachMode::NAMES
 //! mcwp-wallpaper --show-host              # 额外对挂载目标调用 ShowWindow(排查用)
 //! mcwp-wallpaper --dump                   # 打印桌面窗口层级(排查用)
@@ -27,7 +24,6 @@
 //! cargo build --release --features dev-tools
 //! ```
 
-use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -41,8 +37,8 @@ use mcwp_platform::tray::{self, Tray, TrayAction};
 use mcwp_platform::desktop::{candidate_report, invalidate_window, set_gdi_background_paint};
 #[cfg(feature = "dev-tools")]
 use mcwp_platform::diag;
-use mcwp_render::{Renderer, SceneParams};
-use mcwp_spec::{Preset, WallpaperSpec};
+use mcwp_render::{PhotoParams, Renderer};
+use mcwp_spec::Photo;
 use tracing_subscriber::EnvFilter;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{GetLastError, SetLastError, ERROR_ALREADY_EXISTS, ERROR_SUCCESS};
@@ -51,6 +47,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
 };
 
+mod photos;
 mod sessions;
 
 use sessions::Sessions;
@@ -59,16 +56,37 @@ use sessions::Sessions;
 const NO_MODEL_REPLY: &str = "还没配模型,这句话先记着。面板左下角「设置」里填上接口地址和一个 \
 API Key 就能用了 —— 智谱 GLM-4-Flash 免费,去 bigmodel.cn 注册后把 key 贴进去就行。";
 
-/// 后台线程把模型结果送回主循环的包裹。
+/// 后台线程把生图结果送回主循环的包裹。
 ///
-/// 为什么要绕这一道:模型是秒级往返,主循环是 60 fps —— **绝不能在这里同步等**,否则整个桌面
-/// 卡住(还会带着面板一起卡)。所以发请求丢给线程,结果回到主循环再统一落地。
+/// 为什么要绕这一道:生图整条链路是十几秒,主循环是 60 fps —— **绝不能在这里同步等**,
+/// 否则整个桌面卡住(还会带着面板一起卡)。所以整轮丢给线程,结果回到主循环再统一落地。
+///
+/// 失败也走同一条通道,而不是另开一个:两者来自同一轮、要回同一个会话、也要用同一个 `run`
+/// 认轮次。分开走只会让"暂停"和"过期丢弃"这两处逻辑各写一遍。
 struct AiOutcome {
-    /// 这句话属于哪个会话(回复回来时用户可能已经切走了)
+    /// 这句话属于哪个会话(结果回来时用户可能已经切走了)
     session: u64,
     /// 第几轮。暂停过、或者用户又发了新的一句之后,旧请求的结果会晚一步回来 —— 认轮次丢弃。
     run: u64,
-    draft: mcwp_ai::Draft,
+    /// 整条链路的结果:`Ok` 是一张能直接上屏的壁纸,`Err` 是一句给人看的原因。
+    result: Result<Box<PhotoPayload>, String>,
+}
+
+/// 一轮生图跑完的产物:元数据 + 原始字节 + 解好的位图。
+///
+/// **解码放在后台线程做**,主循环只负责"贴上去":1080p 的 PNG 解一次上百毫秒,
+/// 那点时间放在 60fps 的主循环里就是肉眼可见的卡顿,放在后台线程里完全免费。
+struct PhotoPayload {
+    reply: String,
+    photo: Photo,
+    /// 生图接口原样返回的字节,落盘用 —— **不重新编码**,重压一次只会让画面更糊
+    bytes: Vec<u8>,
+    /// 解好的像素,主线程拿它直接当纹理
+    bitmap: mcwp_image::Bitmap,
+    /// 提示词那一步是不是走了本地降级
+    degraded: bool,
+    /// 提示词那一步发了几次请求
+    calls: u32,
 }
 
 /// 一次「交给模型」的完整任务:跑哪句话 + 属于哪个会话。
@@ -101,12 +119,29 @@ fn run_state(run: Option<&Run>) -> mcwp_ui::RunState {
     }
 }
 
+/// 当前生效的照片壁纸。程序化场景那条路没有它 —— 那正是"两条路"在这里的分水岭。
+struct ActivePhoto {
+    photo: Photo,
+    /// 每帧只改 `time`,其余由照片与屏幕尺寸一次算好
+    params: PhotoParams,
+}
+
+/// 当前 unix 秒。壁纸库靠它排序,也参与文件名。
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
 /// 新消息:先记进会话,再跑。
 fn start_run(
     text: &str,
     sessions: &mut Sessions,
-    ai: &Option<mcwp_ai::Client>,
-    spec: &WallpaperSpec,
+    chat: &Option<mcwp_ai::Client>,
+    images: &Option<mcwp_ai::Images>,
+    current: Option<Photo>,
+    screen: (u32, u32),
     tx: &Sender<AiOutcome>,
     id: u64,
 ) -> (&'static str, Option<Mission>) {
@@ -114,51 +149,290 @@ fn start_run(
         session: sessions.send(text),
         text: text.to_string(),
     };
-    run_mission(mission, sessions, ai, spec, tx, id)
+    run_mission(mission, sessions, chat, images, current, screen, tx, id)
 }
 
 /// 把一份任务丢给后台线程(新消息和「继续」走的都是这一条路)。
 ///
 /// 没配模型时当场把提示写进会话、返回 `None` —— 那种情况没有"在跑"这一轮,面板的钮也就不该
-/// 变成暂停键。**绝不在这里同步等模型**(见 `AiOutcome` 的说明)。
+/// 变成暂停键。**绝不在这里同步等**(见 `AiOutcome` 的说明)。
 fn run_mission(
     mission: Mission,
     sessions: &mut Sessions,
-    ai: &Option<mcwp_ai::Client>,
-    spec: &WallpaperSpec,
+    chat: &Option<mcwp_ai::Client>,
+    images: &Option<mcwp_ai::Images>,
+    current: Option<Photo>,
+    screen: (u32, u32),
     tx: &Sender<AiOutcome>,
     id: u64,
 ) -> (&'static str, Option<Mission>) {
-    let Some(client) = ai else {
-        // 没配模型也得有回音:不然用户发完消息看着空荡荡的右栏,只会以为程序坏了
+    let (Some(chat), Some(images)) = (chat.as_ref(), images.as_ref()) else {
+        // 没配也得有回音:不然用户发完消息看着空荡荡的右栏,只会以为程序坏了
         sessions.reply(mission.session, NO_MODEL_REPLY);
-        return ("没配模型 · 去左下角「设置」里填一个 API Key", None);
+        return ("还没配生图 · 去左下角「设置」里填一个 API Key", None);
     };
-    let client = client.clone();
+    let chat = chat.clone();
+    let images = images.clone();
     let request = mission.text.clone();
     let session = mission.session;
-    // 把当前壁纸一起带上:模型要靠它做"只改一点"这类改动
-    let current = spec.clone();
     let tx = tx.clone();
     std::thread::spawn(move || {
-        let draft = client.draft(&request, &current);
+        let result = generate_photo(&chat, &images, &request, current.as_ref(), screen)
+            .map(Box::new)
+            .map_err(|err| format!("{err:#}"));
         // 主线程收摊了(托盘退出)就随它去,没人接的结果没有意义
         let _ = tx.send(AiOutcome {
             session,
             run: id,
-            draft,
+            result,
         });
     });
-    ("正在生成壁纸…", Some(mission))
+    ("正在画一张新壁纸…", Some(mission))
+}
+
+/// 生图整条链路(**在后台线程里跑**)。三步顺序不能换:
+///
+/// 1. `plan_photo` —— 文本模型把用户那句话改写成生图提示词 + 动效配方;
+/// 2. `Images::generate` —— 出图并当场把图下下来(整轮的等待几乎全在这一步,9~16 s);
+/// 3. 解码 + 提调色板 —— 拿到像素和 5 个颜色,主循环就不用再碰这些。
+///
+/// 第 1 步失败**不致命**(`plan_photo` 会降级成"拿原话去画"),第 2 步失败才是真的没图。
+fn generate_photo(
+    chat: &mcwp_ai::Client,
+    images: &mcwp_ai::Images,
+    request: &str,
+    current: Option<&Photo>,
+    screen: (u32, u32),
+) -> Result<PhotoPayload> {
+    let plan = chat.plan_photo(request, current);
+    let generated = images.generate(&plan.image_prompt, screen.0, screen.1)?;
+    let bitmap = mcwp_image::Bitmap::decode(&generated.bytes)
+        .context("生图返回的字节解不开(不是 PNG / JPEG?)")?;
+    let created = now_secs();
+    let mut photo = Photo {
+        title: plan.title,
+        prompt: plan.image_prompt,
+        // 记**实际出图尺寸**而不是请求尺寸:服务商可能自己改,以后要按它算 cover
+        width: bitmap.width,
+        height: bitmap.height,
+        motion: plan.motion,
+        palette: mcwp_spec::palette_from_rgba(&bitmap.rgba, bitmap.width, bitmap.height),
+        // 效果层的随机盐取生成时间:同一张壁纸每次重放花纹都一样(seed 存在 JSON 里),
+        // 而同一条提示词再生成一次是另一张图 —— 花纹跟着换,正好。
+        seed: (created & 0xffff_ffff) as u32,
+        created,
+        ..Photo::default()
+    };
+    photo.normalize();
+    Ok(PhotoPayload {
+        reply: plan.reply,
+        photo,
+        bytes: generated.bytes,
+        bitmap,
+        degraded: plan.degraded,
+        calls: plan.calls,
+    })
+}
+
+/// 把一张照片装到屏幕上:换纹理 + 重算着色器参数。
+///
+/// 抽出来是因为有四个入口都要它(`--gen` / `--photo` / 点库里的卡片 / 托盘"换一张")。
+/// 少一处没同步,症状都是"点了没反应但日志说切了" —— 那种 bug 找起来最费时间。
+fn show_photo(
+    renderer: &mut Renderer,
+    photo: Photo,
+    bitmap: &mcwp_image::Bitmap,
+    screen: (u32, u32),
+    brightness: f32,
+) -> Result<ActivePhoto> {
+    renderer.set_photo(bitmap.width, bitmap.height, &bitmap.rgba)?;
+    Ok(ActivePhoto {
+        params: PhotoParams::from_photo(&photo, screen.0, screen.1, brightness),
+        photo,
+    })
+}
+
+/// 从库里换一张(点卡片 / 托盘"换一张"都走这里)。
+///
+/// 解码是在上屏这条路上**同步**做的:1080p 一次约 200 ms,对"用户点了一下"这个动作
+/// 可以接受;换成后台预取要引入一整套"图还没到该显示什么"的状态,此刻不值当。
+fn switch_to_photo(
+    renderer: &mut Renderer,
+    library: &[LibraryEntry],
+    index: usize,
+    screen: (u32, u32),
+    brightness: f32,
+) -> Result<ActivePhoto> {
+    let entry = library
+        .get(index)
+        .ok_or_else(|| anyhow::anyhow!("壁纸库里没有第 {index} 张"))?;
+    let bitmap = entry
+        .source
+        .read_image()
+        .with_context(|| format!("解不开 {}", entry.source.image.display()))?;
+    show_photo(
+        renderer,
+        entry.source.photo.clone(),
+        &bitmap,
+        screen,
+        brightness,
+    )
+}
+
+/// 一张刚出炉的照片落地:入库 → 上屏。
+///
+/// 顺序是"**先上屏再入库**":入库可能失败(盘满、权限、路径被占),而**上屏不该因此被挡住** ——
+/// 用户要看的是那张图,库里少一条只是少一条,下次还能再生成。
+fn adopt_photo(
+    renderer: &mut Renderer,
+    library: &mut Vec<LibraryEntry>,
+    payload: PhotoPayload,
+    screen: (u32, u32),
+    brightness: f32,
+) -> Result<ActivePhoto> {
+    let active = show_photo(renderer, payload.photo, &payload.bitmap, screen, brightness)?;
+    match photos::save(&active.photo, &payload.bytes, &payload.bitmap) {
+        Ok(entry) => {
+            tracing::info!("新壁纸已入库:{}", entry.meta.display());
+            *library = scan_library();
+        }
+        Err(err) => tracing::warn!("入库失败(壁纸照常显示):{err:?}"),
+    }
+    Ok(active)
+}
+
+/// 抬进来的壁纸在库里的 id:**按源文件路径**定,不按时间。
+///
+/// 为什么:同一张"桌面壁纸"会被反复抬 —— 点两次「用当前壁纸」、`--adopt` 又跑一遍、
+/// 或者换过桌面壁纸之后再抬一次。按时间生成 id 的话每次都是一条新记录,库很快就堆成一串
+/// 长得一模一样的副本(实测踩过:调试时点了八下,库里就多了八张)。
+/// 按路径定就稳定了:撞上同一个 id 就替换,库里那条始终代表"桌面上现在那张"。
+///
+/// 前缀 `adopt` 让它一眼能和生图那种纯十六进制的 id 区分开;路径先转小写,因为 Windows 的
+/// 文件名本来就不区分大小写,`C:\A.jpg` 和 `c:\a.jpg` 不该算成两张。
+fn adopted_id(path: &std::path::Path) -> String {
+    let digest = mcwp_spec::fnv1a64(path.to_string_lossy().to_lowercase().as_bytes());
+    format!("adopt{digest:016x}")
+}
+
+/// 抬进来的那张壁纸叫什么。
+///
+/// 取文件名主干,但要认得出 Windows 那个转码件:用户从「设置」里选壁纸时,系统把原图转码成
+/// 一份**没有扩展名**的 `…\Themes\TranscodedWallpaper`,而 `SPI_GETDESKWALLPAPER` 给回来的
+/// 正是它 —— 照搬主干的话,库里每一张抬进来的壁纸都会叫「TranscodedWallpaper」。
+fn desktop_wallpaper_title(path: &std::path::Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .trim();
+    // 没有扩展名 = 就是那个转码件;主干恰好叫 TranscodedWallpaper 也算(有些机器带扩展名)。
+    if path.extension().is_none() || stem.eq_ignore_ascii_case("TranscodedWallpaper") {
+        return "桌面壁纸".to_string();
+    }
+    if stem.is_empty() {
+        return "桌面壁纸".to_string();
+    }
+    stem.to_string()
+}
+
+/// 把**桌面上现在那张壁纸**抬进来:读路径 → 解码 → 入库 → 上屏。
+///
+/// 为什么值得有这条路:生图要花钱、要等十几秒,而用户机器上本来就压着一张静态壁纸 ——
+/// 把那张图直接抬进渲染管线,当场就得到一张「能动的」壁纸(静帧呼吸 + Ken Burns 推拉),
+/// 不必先等模型。它同时也是**库空着时的兜底**:我们的窗口是盖在桌面上的,什么都不画就是
+/// 一屏占位色,而"把用户原来那张抬上来"看不出接缝。
+///
+/// 抬进来的那张会**入库**,所以它和生图出来的壁纸一样能反复切换、也能被删掉。
+/// 动效给的是 `MotionRecipe::default()`(静帧呼吸:推近 12%、速度 30%)—— 保守,但一眼看得出在动。
+fn adopt_desktop(
+    renderer: &mut Renderer,
+    library: &mut Vec<LibraryEntry>,
+    screen: (u32, u32),
+    brightness: f32,
+) -> Result<ActivePhoto> {
+    let path = mcwp_platform::wallpaper::current_image_path().ok_or_else(|| {
+        anyhow::anyhow!("系统说桌面上现在没有图片(纯色背景 / 幻灯片 / 被策略接管)")
+    })?;
+    let bytes =
+        std::fs::read(&path).with_context(|| format!("读不到桌面壁纸文件:{}", path.display()))?;
+    let bitmap = mcwp_image::Bitmap::decode(&bytes)
+        .with_context(|| format!("桌面壁纸解不开(不是 PNG / JPEG?):{}", path.display()))?;
+
+    // 4K/8K 的壁纸可能大过这块 GPU 的纹理上限,那就**就地缩一份只用来上屏的** ——
+    // 落盘的仍然是原图,`photo.width/height` 也仍然记原图尺寸(cover 要按它算)。
+    let (original_width, original_height) = (bitmap.width, bitmap.height);
+    let limit = renderer.max_texture_size();
+    let bitmap = if original_width > limit || original_height > limit {
+        let small = bitmap.thumbnail(limit, limit);
+        tracing::info!(
+            "桌面壁纸 {original_width}×{original_height} 超过 GPU 纹理上限 {limit},上屏前缩到 {}×{}",
+            small.width,
+            small.height
+        );
+        small
+    } else {
+        bitmap
+    };
+
+    // 反复抬同一张不该在库里堆副本:先按 id 找找有没有旧的那条,有就删掉再存。
+    // **删掉而不是直接覆盖**:画面文件的扩展名可能变(jpg → png),`save` 只写新的那份,
+    // 旧的那份就成了一块谁也认不出来的孤儿(扫库只认 `.json`,而它已经指向新文件了)。
+    let id = adopted_id(&path);
+    if let Some(old) = library.iter().find(|entry| entry.source.photo.id == id) {
+        if let Err(err) = photos::remove(&old.source) {
+            tracing::warn!("替换旧的「抬进来」记录时删不掉旧文件:{err:?}");
+        }
+    }
+
+    let created = now_secs();
+    let mut photo = Photo {
+        id,
+        // 标题取文件名:`…\冬日雪山.jpg` → 「冬日雪山」;转码件那种没名没姓的给「桌面壁纸」。
+        title: desktop_wallpaper_title(&path),
+        // 提示词**故意留空**:这张不是"画"出来的,没有提示词可写。空着比编一句假的好 ——
+        // 库里一眼就能看出哪几张是抬进来的、哪几张是生成的。
+        width: original_width,
+        height: original_height,
+        // 动效种类是"静帧呼吸"(`MotionKind` 的默认值):只推拉,不往上叠雪雨雾 ——
+        // 往一张不认识的风景照上叠雪,十有八九不合适,而它是用户自己的壁纸,错了很扎眼。
+        motion: mcwp_spec::MotionRecipe::default(),
+        palette: mcwp_spec::palette_from_rgba(&bitmap.rgba, bitmap.width, bitmap.height),
+        seed: (created & 0xffff_ffff) as u32,
+        created,
+        ..Photo::default()
+    };
+    photo.normalize();
+    adopt_photo(
+        renderer,
+        library,
+        PhotoPayload {
+            reply: String::new(),
+            photo,
+            bytes,
+            bitmap,
+            // 这两项如实填:这条路**根本不需要模型**,不是"模型没接上"的降级
+            degraded: false,
+            calls: 0,
+        },
+        screen,
+        brightness,
+    )
 }
 
 /// 设置页要显示的模型配置:盘上那份(空字段已经用内置默认补上)+ 有没有环境变量在盖它。
 fn ai_config_state() -> mcwp_ui::AiConfigState {
     let stored = mcwp_ai::Config::stored();
     mcwp_ui::AiConfigState {
-        base_url: stored.base_url,
-        model: stored.model,
-        api_key: stored.api_key,
+        base_url: stored.base_url.clone(),
+        model: stored.model.clone(),
+        api_key: stored.api_key.clone(),
+        // 生图那三个**原样给**(`Stored` 里是空串):空串是合法的,意思是"跟着上面那组走"。
+        // 不能提前填上默认值 —— 那样用户就分不清"我自己填的"和"程序替我填的",
+        // 想改回"跟对话同一家"也就没有表达方式了。
+        image_base_url: stored.image_base_url,
+        image_model: stored.image_model,
+        image_api_key: stored.image_api_key,
         thinking: mcwp_ui::ThinkingChoice::from_option(stored.thinking),
         env_override: mcwp_ai::Config::env_override(),
     }
@@ -168,29 +442,69 @@ fn ai_config_state() -> mcwp_ui::AiConfigState {
 ///
 /// 就地重建是重点 —— 不重建的话用户得重启程序才生效,而"配完还得重启"是这类设置页最容易挨骂的
 /// 地方。写盘失败时原来的客户端原样留着:配置没写成,能力也不该跟着消失。
-fn save_ai_config(stored: &mcwp_ai::Stored, ai: &mut Option<mcwp_ai::Client>) -> String {
+fn save_ai_config(
+    stored: &mcwp_ai::Stored,
+    ai: &mut Option<mcwp_ai::Client>,
+    images: &mut Option<mcwp_ai::Images>,
+) -> String {
     if let Err(err) = mcwp_ai::Config::save(stored) {
         tracing::error!("写 ai.json 失败:{err:?}");
         return format!("保存失败:{err}");
     }
+    // 两个客户端一起按新配置重建。分开重建的话,"改的往往就是同一把 key"这件事会让用户
+    // 觉得"生图要重启才生效" —— 而这类设置页最容易挨骂的就是"配完还得重启"。
+    let describe = rebuild_clients(ai, images);
     if mcwp_ai::Config::env_override() {
         // 环境变量优先级更高:写得进去,但不生效。不说明白,用户只会觉得"保存没反应"。
         return "已写入 ai.json · 但环境变量在生效,实际用的是它们".to_string();
     }
-    match mcwp_ai::Config::load() {
+    describe
+}
+
+/// 按盘上(已与环境变量合并)的配置重建两个客户端,返回一行给面板看的状态。
+///
+/// 启动时和设置页保存后走的都是它 —— 两条路各写一遍的话,迟早出现"启动时认某个新字段、
+/// 保存后不认"这种只在某个时序下才发作的怪事。
+fn rebuild_clients(
+    ai: &mut Option<mcwp_ai::Client>,
+    images: &mut Option<mcwp_ai::Images>,
+) -> String {
+    *ai = match mcwp_ai::Config::load() {
         Ok(cfg) => {
             let client = mcwp_ai::Client::new(cfg);
-            let describe = client.describe();
-            tracing::info!("模型配置已更新:{describe}");
-            *ai = Some(client);
-            format!("模型已保存 · {describe}")
+            tracing::info!("对话模型:{}", client.describe());
+            Some(client)
         }
         Err(err) => {
-            // 没填 key 是常态(先存地址、回头再补 key),别当错误报
-            tracing::info!("模型配置已保存,但还不能用:{err}");
-            *ai = None;
-            "已保存 · 还没填 API Key".to_string()
+            // 没配只是"少个能力",不是错误:面板照常能开、能聊,回复位会说清楚去哪儿配
+            tracing::warn!("没配对话模型:{err}");
+            None
         }
+    };
+    *images = match mcwp_ai::ImagesConfig::load() {
+        Ok(cfg) => {
+            let painter = mcwp_ai::Images::new(cfg);
+            tracing::info!("生图:{}", painter.describe());
+            Some(painter)
+        }
+        Err(err) => {
+            tracing::warn!("没配生图:{err}");
+            None
+        }
+    };
+    match ai {
+        Some(client) => format!("已保存 · {}", client.describe()),
+        None => "已保存 · 还没填 API Key".to_string(),
+    }
+}
+
+/// 把内部错误压成一句能显示在面板上的话(按**字符**截,中文按字节截会切出半个字)。
+fn brief(reason: &str) -> String {
+    let flat: String = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > 90 {
+        format!("{}…", flat.chars().take(90).collect::<String>())
+    } else {
+        flat
     }
 }
 
@@ -251,127 +565,115 @@ fn trace_chain(_hwnd: windows::Win32::Foundation::HWND, _label: &str) {
     mcwp_platform::diag::describe_chain(_hwnd, _label);
 }
 
-/// `--ai-selftest`:问模型一次,把"它给的回复 / 规格 / 指纹"原样摊开。
+/// `--images-selftest`:把整条生图链路跑一遍,原样摊开。
 ///
-/// 接模型时最烦的是"错在哪一层说不清":key 不对、模型名不对、提示词不行、JSON 不合法、值越界……
-/// 这个入口把每一层都打出来 —— 调用了几次、是不是走了降级、最终落地的 spec 长什么样。
-fn run_ai_selftest(request: &str, current: &WallpaperSpec) -> Result<()> {
-    let client = mcwp_ai::Client::new(mcwp_ai::Config::load()?);
-    println!("模型:{}", client.describe());
+/// 和 `--ai-selftest` 是一对:那个看"提示词那一步",这个看"图有没有出来"。
+/// 两层都打出来,是因为出图难看时你得先知道是提示词写歪了、还是模型画歪了。
+fn run_images_selftest(request: &str, screen: (u32, u32)) -> Result<()> {
+    let chat = mcwp_ai::Client::new(mcwp_ai::Config::load()?);
+    let images = mcwp_ai::Images::new(mcwp_ai::ImagesConfig::load()?);
+    println!("对话:{}", chat.describe());
+    println!("生图:{}", images.describe());
     println!("用户说:{request}");
     let started = Instant::now();
-    let draft = client.draft(request, current);
+    let payload = generate_photo(&chat, &images, request, None, screen)?;
     println!(
-        "耗时:{:.1}s  调用:{} 次  降级:{}",
+        "耗时:{:.1}s  提示词调用:{} 次  降级:{}",
         started.elapsed().as_secs_f32(),
-        draft.calls,
-        if draft.degraded {
-            "是(模型没接上,走了本地关键词降级)"
-        } else {
-            "否"
-        }
+        payload.calls,
+        if payload.degraded { "是(拿原话去画的)" } else { "否" }
     );
-    println!("模式:{:?}", draft.mode);
-    println!("回复:{}", draft.reply);
-    if !draft.image_prompt.is_empty() {
-        println!("画面描述(留给以后文生图):{}", draft.image_prompt);
-    }
-    println!("指纹:{}", draft.spec.spec_hash());
-    println!("{}", draft.spec.to_pretty_json());
+    println!("回复:{}", payload.reply);
+    println!("标题:{}", payload.photo.title);
+    println!("提示词:{}", payload.photo.prompt);
+    println!("动效:{}", payload.photo.motion.summary());
+    println!(
+        "出图:{}×{} · {} KB",
+        payload.photo.width,
+        payload.photo.height,
+        payload.bytes.len() / 1024
+    );
+    println!("调色板:{}", payload.photo.palette.join(" "));
+    // 顺手落一份到临时目录:命令行里看不了图,但可以直接拿这个文件双击打开
+    let preview = std::env::temp_dir().join(format!("mcwp-gen-{}.png", payload.photo.id));
+    std::fs::write(&preview, &payload.bytes)
+        .with_context(|| format!("写预览图失败:{}", preview.display()))?;
+    println!("预览:{}", preview.display());
+    println!("{}", payload.photo.to_pretty_json());
     Ok(())
 }
 
-/// 决定这一轮渲染什么:`--spec` 优先,其次 `--preset`,都没有就用默认预设。
-fn load_spec(args: &Args) -> Result<WallpaperSpec> {
-    if let Some(path) = args.spec_path.as_deref() {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("读取 spec 失败:{path}"))?;
-        return WallpaperSpec::parse(&text).with_context(|| format!("解析 spec 失败:{path}"));
-    }
-    match args.preset.as_deref() {
-        Some(id) => {
-            let preset = Preset::from_id(id)
-                .ok_or_else(|| anyhow::anyhow!("未知预设 {id},用 `--preset list` 看全部预设"))?;
-            Ok(WallpaperSpec::from_preset(preset))
+/// 面板要显示的「当前壁纸」。
+///
+/// 从 `Photo` 派生出面板要的那几个字段(标题 / 短提示 / 动效摘要 / 调色板 / 身份串),
+/// **派生规则只写在这一处**:面板状态、玻璃配色、库网格里那张"当前"高亮都只认它的产物。
+///
+/// 「桌面上还没有壁纸」是个**合法空态**(第一次启动、系统壁纸又读不出来):那时给一套中性深色,
+/// 而不是空数组 —— 面板底色跟着当前壁纸走,空数组会让玻璃掉回默认的亮蓝,和黑桌面配在一起很怪。
+struct CurrentWallpaper {
+    title: String,
+    hint: String,
+    summary: String,
+    palette: Vec<String>,
+    fingerprint: String,
+}
+
+/// 没有壁纸时用的中性深色(和早期默认预设的调色板同一族)。
+const EMPTY_PALETTE: [&str; 5] = ["#0B1020", "#1B2A4A", "#4F7CFF", "#9BB8FF", "#E6ECFF"];
+
+impl CurrentWallpaper {
+    fn of(photo: Option<&Photo>) -> Self {
+        let Some(photo) = photo else {
+            return Self {
+                title: "还没有壁纸".to_string(),
+                hint: "在右边的对话里说一句想看到的样子".to_string(),
+                summary: String::new(),
+                palette: EMPTY_PALETTE.iter().map(|hex| hex.to_string()).collect(),
+                fingerprint: String::new(),
+            };
+        };
+        Self {
+            title: photo.title.clone(),
+            // 提示词就是这张壁纸的"关键词";截成短标题,不然会撑破卡片上那一行
+            hint: mcwp_spec::photo::title_from_prompt(&photo.prompt),
+            summary: photo.motion.summary(),
+            palette: photo.palette.clone(),
+            // 面板上那串"指纹"用库里的身份:和文件名、库目录里看到的那串字符是同一个
+            fingerprint: photo.id.clone(),
         }
-        None => Ok(WallpaperSpec::from_preset(Preset::DEFAULT)),
     }
 }
 
-/// 把「当前 spec + 各预设默认值 + 壁纸库 + 会话」拼成面板的初始状态。
+/// 把「当前壁纸 + 壁纸库 + 会话」拼成面板的初始状态。
 fn panel_state(
-    spec: &WallpaperSpec,
-    brightness: f32,
+    photo: Option<&Photo>,
     sessions: &Sessions,
     library: &[LibraryEntry],
 ) -> mcwp_ui::PanelState {
-    // 每张卡片自带它的三个参数名与默认值,这样点卡片时面板不用等 Rust 回话就能先自己更新。
-    let presets = mcwp_spec::PRESETS
-        .iter()
-        .map(|preset| {
-            let slots = preset.params();
-            let defaults = WallpaperSpec::from_preset(*preset);
-            mcwp_ui::PresetItem {
-                id: preset.id().into(),
-                title: preset.title().into(),
-                summary: preset.summary().into(),
-                label_a: slots[0].label.into(),
-                label_b: slots[1].label.into(),
-                label_c: slots[2].label.into(),
-                value_a: defaults.param(slots[0].key),
-                value_b: defaults.param(slots[1].key),
-                value_c: defaults.param(slots[2].key),
-                motion: defaults.motion.intensity,
-            }
-        })
-        .collect();
-
-    let preset = spec.preset();
-    let preset_index = mcwp_spec::PRESETS
-        .iter()
-        .position(|candidate| *candidate == preset)
-        .unwrap_or(0);
-    let slots = preset.params();
+    let current = CurrentWallpaper::of(photo);
 
     mcwp_ui::PanelState {
-        presets,
-        preset_index,
-        title: spec.title.clone(),
-        hint: spec.keyword_hint(),
-        // 面板上那条「指纹」用库里的身份口径(归一化后的 hash):和存进库时的文件名、
-        // 壁纸库页里那串字符都是同一个 —— 同一张壁纸到处都念得通。
-        fingerprint: library_id(spec),
-        summary: preset.summary().to_string(),
-        palette: spec.palette.clone(),
-        labels: [
-            slots[0].label.to_string(),
-            slots[1].label.to_string(),
-            slots[2].label.to_string(),
-        ],
-        params: [
-            spec.param(slots[0].key),
-            spec.param(slots[1].key),
-            spec.param(slots[2].key),
-        ],
-        brightness,
-        motion: spec.motion.intensity,
+        title: current.title,
+        hint: current.hint,
+        fingerprint: current.fingerprint,
+        summary: current.summary,
+        palette: current.palette,
         session: sessions.state(),
         library: library_items(library),
-        library_current: library_current(spec, library),
+        library_current: library_current(photo, library),
     }
 }
 
-/// 打开控制面板:把「当前 spec + 预设表」拼成初始状态交给 UI 线程。
+/// 打开控制面板:把「当前壁纸 + 库 + 会话」拼成初始状态交给 UI 线程。
 ///
 /// `--panel` 启动时和托盘「打开控制面板」都走这里。
 fn open_panel(
-    spec: &WallpaperSpec,
-    brightness: f32,
+    photo: Option<&Photo>,
     sessions: &Sessions,
     library: &[LibraryEntry],
     events: &Sender<mcwp_ui::UiEvent>,
 ) -> Option<mcwp_ui::PanelHandle> {
-    let state = panel_state(spec, brightness, sessions, library);
+    let state = panel_state(photo, sessions, library);
     // 面板字体是子集化的,文案里冒出新字就会画不出来,先摊在日志里。
     for (field, missing) in state.missing_chars() {
         tracing::warn!("面板字体缺字:{field} 里的 {missing:?} 不在内嵌子集内");
@@ -388,128 +690,97 @@ fn open_panel(
     }
 }
 
-/// 壁纸库目录:`%APPDATA%\MC壁纸\library`,一张壁纸 = 一个 JSON,文件名就是 spec 指纹。
-fn library_root() -> Result<PathBuf> {
-    Ok(std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("读不到 APPDATA,无法定位壁纸库目录"))?
-        .join("MC壁纸")
-        .join("library"))
-}
+// —— 图片库搬到 `photos.rs` 了 ——
+//
+// 老的那一套(一份 spec = 一个 JSON、文件名是 spec 指纹)随"预设清零"一起退休:
+// 它服务的世界是"画面由本地着色器现算",那个世界正在被生图取代。
+// 新的库是"一张图 + 一份元数据",去重也不再是卖点 —— 同一句提示词两次生成本来就是两张图。
 
-/// 一份 spec 在壁纸库里的 id(也就是文件名)。
+/// 壁纸库里的一条:**面板要显示的那份** + **它在盘上的真身**。
 ///
-/// `id` 自己不参与指纹计算,所以先把 source 归一成 Snapshot、算完 hash 再当作文件名 ——
-/// 反复存同一份壁纸不会冒出新条目,存与读也用同一把尺子。
-fn library_id(spec: &WallpaperSpec) -> String {
-    let mut stored = spec.clone();
-    stored.source = mcwp_spec::Source::Snapshot;
-    stored.normalize();
-    stored.id = stored.spec_hash();
-    stored.id
-}
-
-/// 存进壁纸库:一张壁纸 = 一个 JSON,文件名就是 spec 指纹,所以重复保存天然去重。
-///
-/// 这是壁纸库的第一个版本(文件版);等要做标签、历史、缩略图时再换 SQLite。
-fn save_to_library(spec: &WallpaperSpec) -> Result<PathBuf> {
-    let root = library_root()?;
-    std::fs::create_dir_all(&root)
-        .with_context(|| format!("创建壁纸库目录失败:{}", root.display()))?;
-
-    // 落盘的那份是"快照":source 钉成 Snapshot,文件名用归一化后的指纹。
-    let mut stored = spec.clone();
-    stored.source = mcwp_spec::Source::Snapshot;
-    stored.normalize();
-    stored.id = library_id(spec);
-
-    let path = root.join(format!("{}.json", stored.id));
-    std::fs::write(&path, stored.to_pretty_json())
-        .with_context(|| format!("写入壁纸失败:{}", path.display()))?;
-    Ok(path)
-}
-
-/// 壁纸库里的一个条目:面板要显示的那份(纯数据)+ spec 真身(点它的时候要切过去)。
+/// 两样都留着是因为两件事都要用它:点卡片要按 `source.image` 现解一次图,右键删除要按
+/// `source` 自己记着的那三个路径删(`photos::remove` 只认那一条记录,不按 id 通配)。
 struct LibraryEntry {
-    item: mcwp_ui::LibraryItem,
-    spec: WallpaperSpec,
+    view: mcwp_ui::LibraryEntryView,
+    source: photos::Entry,
 }
 
-/// 扫一遍壁纸库目录,最近存的排最前。
+/// 盘上的一条记录 → 库里的一条。
+///
+/// 缩略图**在这里就解好**:面板一屏要几十张,每张现解一次 1080p 原图就是好几秒起步,
+/// 而缩略图是几百字节的 PNG,读它几乎不花时间(`photos::Entry::read_thumb` 缺图时还会
+/// 顺手补一张存下去)。解出来的裸像素交给面板线程去装 `slint::Image` —— 见 `LibraryEntryView`。
+fn library_entry(source: photos::Entry) -> LibraryEntry {
+    let photo = &source.photo;
+    let view = mcwp_ui::LibraryEntryView {
+        // 照片的 id 就是它的文件名,天然唯一,也天然和"当前壁纸"比对得上
+        id: photo.id.clone(),
+        title: photo.title.clone(),
+        // 提示词限长:`hint` 是卡片上那行小字,长提示词会把卡片撑到两行
+        hint: mcwp_spec::photo::title_from_prompt(&photo.prompt),
+        summary: photo.motion.summary(),
+        // 卡片的主色用照片自己提出来的强调色 —— 面板玻璃也跟着它染色,
+        // 所以切壁纸的时候整个面板的色调会一起变,而不是只有壁纸变了
+        accent: mcwp_ui::glass_colors(&photo.palette).accent(),
+        thumb: thumb_pixels(&source),
+    };
+    LibraryEntry { view, source }
+}
+
+/// 一条库记录的缩略图,裸像素(RGBA8 + 宽高)。
+///
+/// 读不出来**不致命**:那张原图可能坏了,但标题还在 —— 给 1×1 全透明,格子里就只剩
+/// 底色和标题,好过整张卡片消失(用户还能右键把它删掉)。这里只记一条日志不往外抛,
+/// 是因为调用方在扫库的循环里,一坏就中断会让**整个库**都打不开。
+fn thumb_pixels(entry: &photos::Entry) -> (u32, u32, Vec<u8>) {
+    match entry.read_thumb() {
+        Ok(bitmap) => (bitmap.width, bitmap.height, bitmap.rgba),
+        Err(err) => {
+            tracing::warn!("缩略图读不出来({}):{err}", entry.thumb.display());
+            (1, 1, vec![0, 0, 0, 0])
+        }
+    }
+}
+
+/// 扫一遍壁纸库,最近生成的排最前。
 ///
 /// 面板不碰文件系统:库列表的真相在壁纸这一侧,面板只是它的投影 —— 和会话数据一个道理。
-/// 库目录是用户可写的地方(手工删文件、拷别人的壁纸进去都算正常用法),所以坏 JSON 只记一条
-/// 日志跳过,不能因为它让整块面板打不开。
+/// 库目录是用户可写的地方(手工删文件、拷别人的壁纸进来都算正常用法),坏条目只记一条日志跳过。
 fn scan_library() -> Vec<LibraryEntry> {
-    let root = match library_root() {
-        Ok(root) => root,
-        Err(err) => {
-            tracing::warn!("扫壁纸库失败:{err}");
-            return Vec::new();
-        }
-    };
-    // 一次都没存过时目录还不存在,这是正常状态,不是错误。
-    let Ok(dir) = std::fs::read_dir(&root) else {
-        return Vec::new();
-    };
-
-    let mut files: Vec<(std::time::SystemTime, PathBuf)> = dir
-        .flatten()
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-        .filter_map(|entry| {
-            let path = entry.path();
-            let stamp = entry.metadata().ok()?.modified().ok()?;
-            Some((stamp, path))
-        })
-        .collect();
-    files.sort_by(|left, right| right.0.cmp(&left.0));
-
-    files
-        .into_iter()
-        .filter_map(|(_, path)| match std::fs::read_to_string(&path) {
-            Ok(text) => match WallpaperSpec::parse(&text) {
-                Ok(spec) => {
-                    // 每张壁纸的卡片用自己调色板里的主色,一眼能认出是哪张。
-                    let accent = mcwp_ui::glass_colors(&spec.palette).accent();
-                    Some(LibraryEntry {
-                        item: mcwp_ui::LibraryItem {
-                            // 面板拿它与"当前壁纸"比对,所以用归一化后的指纹当身份 ——
-                            // 手工拷进来的文件(没有 id 字段)也算得出来,点一下就认识它了。
-                            id: library_id(&spec).into(),
-                            title: spec.title.clone().into(),
-                            hint: spec.keyword_hint().into(),
-                            summary: spec.preset().summary().into(),
-                            accent,
-                        },
-                        spec,
-                    })
-                }
-                Err(err) => {
-                    tracing::warn!("壁纸库里的 {} 解析失败,跳过:{err}", path.display());
-                    None
-                }
-            },
-            Err(err) => {
-                tracing::warn!("读壁纸库里的 {} 失败,跳过:{err}", path.display());
-                None
-            }
-        })
-        .collect()
+    photos::scan().into_iter().map(library_entry).collect()
 }
 
-/// 交给面板的那份库列表(只有显示数据,spec 真身留在这一侧)。
-fn library_items(library: &[LibraryEntry]) -> Vec<mcwp_ui::LibraryItem> {
-    library.iter().map(|entry| entry.item.clone()).collect()
+/// 交给面板的那份库列表(只有显示数据,照片真身留在这一侧)。
+fn library_items(library: &[LibraryEntry]) -> Vec<mcwp_ui::LibraryEntryView> {
+    library.iter().map(|entry| entry.view.clone()).collect()
 }
 
-/// 当前生效的壁纸在库里的 id;不在库里(比如刚用内置预设改了参数、还没存过)就是空串。
-fn library_current(spec: &WallpaperSpec, library: &[LibraryEntry]) -> String {
-    let id = library_id(spec);
+/// 当前照片在库里的下标。不在库里(刚生成、扫库还没跟上)就当"最后一张" ——
+/// 这样托盘"换一张"的 `+1` 会绕回第一张,而不是从第一张跳到第二张。
+fn current_photo_index(active: &Option<ActivePhoto>, library: &[LibraryEntry]) -> usize {
+    let Some(photo) = active.as_ref().map(|it| &it.photo) else {
+        return 0;
+    };
     library
         .iter()
-        .any(|entry| entry.item.id == id)
-        .then_some(id)
-        .unwrap_or_default()
+        .position(|entry| entry.source.photo.id == photo.id)
+        .unwrap_or_else(|| library.len().saturating_sub(1))
+}
+
+/// 当前生效的壁纸在库里的 id;不是库里的(比如还在程序化场景上)就是空串。
+fn library_current(photo: Option<&Photo>, library: &[LibraryEntry]) -> String {
+    let Some(photo) = photo else {
+        return String::new();
+    };
+    // 只有"桌面上那张也在库里"才把 id 给面板去高亮 —— 刚抬进来、库还没跟上时它还不是库里的东西。
+    if library
+        .iter()
+        .any(|entry| entry.source.photo.id == photo.id)
+    {
+        photo.id.clone()
+    } else {
+        String::new()
+    }
 }
 
 #[derive(Debug)]
@@ -527,20 +798,19 @@ struct Args {
     plain_window: bool,
     /// 离屏渲染一次并回读中心像素,用来区分渲染问题与呈现问题
     selftest: bool,
-    /// 直接指定一份 spec 文件
-    spec_path: Option<String>,
-    /// 用内置预设;`list` 表示只列目录
-    preset: Option<String>,
-    /// 打印当前生效的 spec
-    dump_spec: bool,
-    /// 把全部预设导出成示例 spec 到指定目录
-    export_presets: Option<String>,
     /// 启动时打开控制面板
     panel: bool,
-    /// 只问模型一次,打印结果就退出(不建窗口)
-    ai_selftest: Option<String>,
     /// 开面板,并替用户把这句话发出去
     ai_ask: Option<String>,
+    /// 现场生一张图并换上(整条链路:提示词智能体 → 生图 → 上屏)
+    generate: Option<String>,
+    /// 换上壁纸库里已有的一张(id = 库目录里的文件名)
+    photo_id: Option<String>,
+    /// 把桌面上现在那张壁纸**再**抬一次(库空时本来就会自动抬,这个参数是给
+    /// 「换过桌面壁纸之后想把它收进来」准备的)
+    adopt: bool,
+    /// 只跑一遍生图链路、打印结果就退出(不建窗口)
+    images_selftest: Option<String>,
     stats_interval: Duration,
 }
 
@@ -557,13 +827,12 @@ impl Args {
             gdi_only: false,
             plain_window: false,
             selftest: false,
-            spec_path: None,
-            preset: None,
-            dump_spec: false,
-            export_presets: None,
             panel: false,
-            ai_selftest: None,
             ai_ask: None,
+            generate: None,
+            photo_id: None,
+            adopt: false,
+            images_selftest: None,
             stats_interval: Duration::from_secs(5),
         };
         let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -619,32 +888,28 @@ impl Args {
                     args.selftest = true;
                     i += 1;
                 }
-                "--spec" => {
-                    args.spec_path = value.cloned();
-                    i += 2;
-                }
-                "--preset" => {
-                    args.preset = value.cloned();
-                    i += 2;
-                }
-                "--dump-spec" => {
-                    args.dump_spec = true;
-                    i += 1;
-                }
-                "--export-presets" => {
-                    args.export_presets = value.cloned();
-                    i += 2;
-                }
                 "--panel" => {
                     args.panel = true;
                     i += 1;
                 }
-                "--ai-selftest" => {
-                    args.ai_selftest = value.cloned();
-                    i += 2;
-                }
                 "--ai-ask" => {
                     args.ai_ask = value.cloned();
+                    i += 2;
+                }
+                "--gen" => {
+                    args.generate = value.cloned();
+                    i += 2;
+                }
+                "--photo" => {
+                    args.photo_id = value.cloned();
+                    i += 2;
+                }
+                "--adopt" => {
+                    args.adopt = true;
+                    i += 1;
+                }
+                "--images-selftest" => {
+                    args.images_selftest = value.cloned();
                     i += 2;
                 }
                 "--attach" => {
@@ -676,50 +941,21 @@ fn main() -> Result<()> {
     let args = Args::parse();
     tracing::info!("启动内存:工作集={ws0:.1}MB 私有={private0:.1}MB");
 
-    // 「列目录」和「导出示例」是一次性动作,处理完直接退出,不建窗口也不建渲染器。
-    if args.preset.as_deref() == Some("list") {
-        print!("{}", mcwp_spec::presets::catalog());
-        return Ok(());
-    }
-    if let Some(dir) = args.export_presets.as_deref() {
-        std::fs::create_dir_all(dir).with_context(|| format!("创建目录失败:{dir}"))?;
-        for preset in mcwp_spec::PRESETS {
-            let spec = WallpaperSpec::from_preset(preset);
-            let path = std::path::Path::new(dir).join(format!("{}.json", preset.id()));
-            std::fs::write(&path, spec.to_pretty_json())
-                .with_context(|| format!("写入失败:{}", path.display()))?;
-            tracing::info!("导出预设 {} → {}", preset.id(), path.display());
-        }
-        return Ok(());
-    }
-
     // 排查用的那几个参数要么不挂桌面要么只是看状态,不该被单实例挡住。
     let is_diagnostic_run = args.standalone_window
         || args.plain_window
         || args.dump
         || args.gdi_only
         || args.selftest
-        || args.ai_selftest.is_some();
+        || args.images_selftest.is_some();
     if !is_diagnostic_run && !claim_single_instance() {
         return Ok(());
     }
 
-    let mut spec = load_spec(&args)?;
-    tracing::info!(
-        "壁纸规格:{} | 场景={} | 关键词={} | 指纹={}",
-        spec.title,
-        spec.preset().id(),
-        spec.keyword_hint(),
-        spec.spec_hash()
-    );
-    if args.dump_spec {
-        println!("{}", spec.to_pretty_json());
-    }
-
-    // 「只问模型一次」也是不建窗口的一次性动作:打印回复 + 规格 + 指纹就退出。
-    // 这是接模型时唯一需要的调试入口 —— 不用开面板、不用点鼠标,也不用管中文输入法。
-    if let Some(request) = args.ai_selftest.as_deref() {
-        run_ai_selftest(request, &spec)?;
+    // 「只跑一遍生图」同理:不建窗口、不占桌面,接生图时唯一需要的调试入口。
+    if let Some(request) = args.images_selftest.as_deref() {
+        // 还不知道真实屏幕尺寸(窗口还没建),但生图尺寸只影响出图分辨率,不影响链路
+        run_images_selftest(request, (1920, 1080))?;
         return Ok(());
     }
     #[cfg(not(feature = "dev-tools"))]
@@ -778,31 +1014,21 @@ fn main() -> Result<()> {
     let (ws2, private2) = memory_mb();
     tracing::info!("建渲染器后内存:工作集={ws2:.1}MB 私有={private2:.1}MB");
 
-    let mut brightness = args.brightness.clamp(0.2, 1.6);
-    let mut params = SceneParams::from_spec(&spec, width as u32, height as u32, brightness);
-
-    #[cfg(feature = "dev-tools")]
-    if args.selftest {
-        params.time = 1.0;
-        let pixel = renderer.readback_center(&params)?;
-        println!("离屏回读中心像素 = {pixel:?}(洋红=(255,0,255) 表示绘制没发生)");
-        return Ok(());
-    }
+    let brightness = args.brightness.clamp(0.2, 1.6);
+    // 这一次运行绑定的屏幕尺寸。照片的 cover 裁剪、生图的请求尺寸都用它。
+    let screen = (width as u32, height as u32);
+    // 当前挂在屏幕上的照片;`None` = 这一次还没有可画的东西(库空、桌面上也抬不到图)。
+    // 那种情况下屏幕上是 `Renderer::new` 铺的那块占位色 —— 认得出是"还没画",不是黑屏。
+    let mut active: Option<ActivePhoto> = None;
 
     // —— 模型 ——
     // 没配就只是"少个能力",不是错误:面板照常能开、能聊,回复位会说清楚去哪儿配。
-    // `mut`:设置页保存之后要就地换掉它(见 `save_ai_config`)。
-    let mut ai = match mcwp_ai::Config::load() {
-        Ok(cfg) => {
-            let client = mcwp_ai::Client::new(cfg);
-            tracing::info!("模型已就绪:{}", client.describe());
-            Some(client)
-        }
-        Err(err) => {
-            tracing::warn!("没配模型,生图先退回提示文案:{err}");
-            None
-        }
-    };
+    // 两个都是 `mut`:设置页保存之后要就地换掉(见 `save_ai_config`)。
+    let mut ai: Option<mcwp_ai::Client> = None;
+    // 生图是**独立的一套配置**:同一把 key 默认共用,也可以指向另一家(见 `ImagesConfig`)。
+    // 它和对话客户端分开建,是因为超时差一个数量级(45 s vs 180 s)、地址也不同。
+    let mut images: Option<mcwp_ai::Images> = None;
+    rebuild_clients(&mut ai, &mut images);
     // 请求跑在后台线程,结果从这里回到主循环
     let (ai_tx, ai_rx) = std::sync::mpsc::channel::<AiOutcome>();
     // 当前这一轮(在跑 / 被暂停 / 没有)。`run_id` 只增不减:每起一轮换一个,结果回来时拿它对
@@ -820,8 +1046,94 @@ fn main() -> Result<()> {
     // 壁纸库同理:开面板时先扫一遍库目录,面板打开就是最新的一张列表。
     let mut library = scan_library();
     tracing::info!("壁纸库里有 {} 张壁纸", library.len());
+
+    // —— 起手那张壁纸 ——
+    // 优先级:`--gen`(现场生成)> `--photo`(点库里的一张)> 抬桌面上那张 > 库里最新的一张。
+    if let Some(request) = args.generate.clone() {
+        match (ai.as_ref(), images.as_ref()) {
+            (Some(chat), Some(painter)) => {
+                tracing::info!("`--gen`:先画一张「{request}」");
+                let started = Instant::now();
+                let payload = generate_photo(chat, painter, &request, None, screen)
+                    .context("`--gen` 生图失败")?;
+                tracing::info!("生图耗时 {:.1}s", started.elapsed().as_secs_f32());
+                active = Some(adopt_photo(
+                    &mut renderer,
+                    &mut library,
+                    payload,
+                    screen,
+                    brightness,
+                )?);
+            }
+            _ => tracing::warn!("`--gen` 需要先配好模型与生图 key,这次跳过"),
+        }
+    } else if let Some(id) = args.photo_id.clone() {
+        match photos::load(&id).and_then(|entry| {
+            let bitmap = entry.read_image()?;
+            show_photo(&mut renderer, entry.photo, &bitmap, screen, brightness)
+        }) {
+            Ok(photo) => {
+                tracing::info!("`--photo`:已换上 {}", photo.photo.title);
+                active = Some(photo);
+            }
+            Err(err) => tracing::warn!("`--photo {id}` 没换成功:{err:?}"),
+        }
+    } else {
+        // 抬桌面上那张。两种情况下做:`--adopt` 是用户显式点的(换过桌面壁纸之后想收进来),
+        // 库里空着时则**自动做** —— 见 `adopt_desktop` 的说明,这是"第一次启动就有东西看"的兜底。
+        if args.adopt || library.is_empty() {
+            match adopt_desktop(&mut renderer, &mut library, screen, brightness) {
+                Ok(photo) => {
+                    tracing::info!("已把桌面上那张抬进来:{}", photo.photo.title);
+                    active = Some(photo);
+                }
+                Err(err) => {
+                    if args.adopt {
+                        tracing::warn!("`--adopt` 没抬成:{err:?}");
+                    } else {
+                        tracing::info!("壁纸库是空的,桌面上也没有可用的图:{err:?}");
+                    }
+                }
+            }
+        }
+        // 还没定下画什么,就回落到库里最新的一张(上次退出时挂着的大概率就是它)。
+        // 抬桌面壁纸已经上过屏的情况**不走这里** —— 那等于把同一张图再从盘上解一遍。
+        if active.is_none() {
+            if let Some(first) = library.first() {
+                let title = first.view.title.clone();
+                match switch_to_photo(&mut renderer, &library, 0, screen, brightness) {
+                    Ok(photo) => {
+                        tracing::info!("沿用库里最新的一张:{title}");
+                        active = Some(photo);
+                    }
+                    Err(err) => tracing::warn!("沿用上次的壁纸失败,先留着占位色:{err:?}"),
+                }
+            }
+        }
+    }
+
+    // 自检:把当前这一刻的参数渲染到离屏纹理再回读中心像素。洋红 = 绘制没发生(管线问题),
+    // 回读到画面本身 = 渲染是好的(那问题就在呈现 / 合成环节)。没有可画的东西就没得回读。
+    #[cfg(feature = "dev-tools")]
+    if args.selftest {
+        match &mut active {
+            Some(photo) => {
+                photo.params.time = 1.0;
+                let pixel = renderer.readback_center(&photo.params)?;
+                println!("离屏回读中心像素 = {pixel:?}(洋红=(255,0,255) 表示绘制没发生)");
+            }
+            None => println!("没有壁纸可回读(库是空的,桌面上也没抬到图)"),
+        }
+        return Ok(());
+    }
+
     let mut panel = if args.panel {
-        open_panel(&spec, brightness, &sessions, &library, &ui_tx)
+        open_panel(
+            active.as_ref().map(|it| &it.photo),
+            &sessions,
+            &library,
+            &ui_tx,
+        )
     } else {
         None
     };
@@ -839,7 +1151,17 @@ fn main() -> Result<()> {
     // 顺带成了唯一的"整条链路"自检方式 —— 合成的键盘输入会被本机中文输入法吃掉,打字那条路验不了。
     if let Some(text) = args.ai_ask.clone() {
         run_id += 1;
-        let (status, mission) = start_run(&text, &mut sessions, &ai, &spec, &ai_tx, run_id);
+        let current = active.as_ref().map(|it| it.photo.clone());
+        let (status, mission) = start_run(
+            &text,
+            &mut sessions,
+            &ai,
+            &images,
+            current,
+            screen,
+            &ai_tx,
+            run_id,
+        );
         run = mission.map(|mission| Run::Running { id: run_id, mission });
         if let Some(handle) = &panel {
             handle.refresh_session(sessions.state());
@@ -867,37 +1189,17 @@ fn main() -> Result<()> {
     let mut frames_in_window = 0u32;
     let mut rendered_total = 0u64;
     let mut last_stats = Instant::now();
-    // 当前选中的预设下标。「换一个预设」要按它往后轮。
-    let mut preset_index = mcwp_spec::PRESETS
-        .iter()
-        .position(|candidate| *candidate == spec.preset())
-        .unwrap_or(0);
     let mut paused = false;
     // 动画时钟按帧累加,而不是直接取墙钟 —— 暂停几分钟再继续,动画从停下的地方接着走。
     let mut clock = 0.0f32;
     let mut last_tick = Instant::now();
 
     while window.pump_pending() {
-        // 这一帧要切到哪张预设:面板和托盘两个来源都往这里投票,循环末尾统一落地。
-        let mut wanted_preset: Option<usize> = None;
+        // 这一帧要切到库里哪一张:面板点卡片、托盘"换一张"都往这里投票,循环末尾统一落地。
+        let mut wanted_photo: Option<usize> = None;
         while let Ok(event) = ui_rx.try_recv() {
             tracing::debug!("面板事件:{event:?}");
             match event {
-                mcwp_ui::UiEvent::SelectPreset(index) => wanted_preset = Some(index),
-                mcwp_ui::UiEvent::Values {
-                    params: ui_params,
-                    brightness: ui_brightness,
-                    motion,
-                } => {
-                    // 面板上的三个滑杆就是该预设声明的三个参数,按位置写回 spec。
-                    for (spec_slot, value) in spec.preset().params().iter().zip(ui_params) {
-                        spec.scene.params.insert(spec_slot.key.to_string(), value);
-                    }
-                    spec.motion.intensity = motion;
-                    spec.normalize();
-                    brightness = ui_brightness.clamp(0.2, 1.6);
-                    params = SceneParams::from_spec(&spec, width as u32, height as u32, brightness);
-                }
                 // —— 生图界面:一句话 → 模型给一份壁纸规格 → 换上去 —— 
                 mcwp_ui::UiEvent::SendMessage(text) => {
                     if text.trim().is_empty() {
@@ -917,8 +1219,17 @@ fn main() -> Result<()> {
                     // 换一个 run_id 就够,旧结果回来认不上轮次,自己会被丢掉。用户的原话是
                     // "发送之后跑下一个",所以这里不是排队,是**取代**。
                     run_id += 1;
-                    let (status, mission) =
-                        start_run(&text, &mut sessions, &ai, &spec, &ai_tx, run_id);
+                    let current = active.as_ref().map(|it| it.photo.clone());
+                    let (status, mission) = start_run(
+                        &text,
+                        &mut sessions,
+                        &ai,
+                        &images,
+                        current,
+                        screen,
+                        &ai_tx,
+                        run_id,
+                    );
                     run = mission.map(|mission| Run::Running { id: run_id, mission });
                     if let Some(handle) = &panel {
                         handle.refresh_session(sessions.state());
@@ -957,8 +1268,17 @@ fn main() -> Result<()> {
                             continue;
                         }
                         run_id += 1;
-                        let (status, mission) =
-                            run_mission(mission, &mut sessions, &ai, &spec, &ai_tx, run_id);
+                        let current = active.as_ref().map(|it| it.photo.clone());
+                        let (status, mission) = run_mission(
+                            mission,
+                            &mut sessions,
+                            &ai,
+                            &images,
+                            current,
+                            screen,
+                            &ai_tx,
+                            run_id,
+                        );
                         run = mission.map(|mission| Run::Running { id: run_id, mission });
                         if let Some(handle) = &panel {
                             handle.set_run_state(run_state(run.as_ref()));
@@ -1007,44 +1327,60 @@ fn main() -> Result<()> {
                         handle.set_status("已标为未读");
                     }
                 }
-                mcwp_ui::UiEvent::Save => match save_to_library(&spec) {
-                    Ok(path) => {
-                        let name = path
-                            .file_name()
-                            .map(|name| name.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        tracing::info!("已存为壁纸:{}", path.display());
-                        // 库里多了一张:顺手重扫一遍灌回面板,不用等下次开面板。
-                        library = scan_library();
-                        if let Some(panel) = &panel {
-                            panel.refresh_library(
-                                library_items(&library),
-                                library_current(&spec, &library),
-                            );
-                            panel.set_status(format!("已存为壁纸 · {name}"));
+                // 库卡片右键「删除这一张」:**只动库,不动屏**。
+                //
+                // 正在看的那张被删掉时画面不会花 —— 纹理已经在显存里了,盘上的文件没了也不影响
+                // 这一帧和后面每一帧。但那条记录从"库"里摘掉了,所以面板上的高亮会跟着掉
+                // (`library_current` 现算),下次重启也不会再挂着它。
+                mcwp_ui::UiEvent::DeleteWallpaper(index) => {
+                    let Some(entry) = library.get(index) else {
+                        continue;
+                    };
+                    let title = entry.view.title.clone();
+                    match photos::remove(&entry.source) {
+                        Ok(()) => {
+                            tracing::info!("已从壁纸库删除「{title}」");
+                            library = scan_library();
+                            if let Some(handle) = &panel {
+                                handle.refresh_library(
+                                    library_items(&library),
+                                    library_current(active.as_ref().map(|it| &it.photo), &library),
+                                );
+                                handle.set_status(format!("已删除「{title}」"));
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!("删除「{title}」失败:{err:?}");
+                            if let Some(handle) = &panel {
+                                let reason = brief(&format!("{err:#}"));
+                                handle.set_status(format!("删不掉:{reason}"));
+                            }
                         }
                     }
-                    Err(err) => {
-                        tracing::error!("存为壁纸失败:{err:?}");
-                        if let Some(panel) = &panel {
-                            panel.set_status(format!("保存失败:{err}"));
+                }
+                // 库页工具栏「用当前壁纸」:把桌面上那张抬进来(和 `--adopt` 同一条路)。
+                mcwp_ui::UiEvent::AdoptWallpaper => {
+                    match adopt_desktop(&mut renderer, &mut library, screen, brightness) {
+                        Ok(photo) => {
+                            let title = photo.photo.title.clone();
+                            tracing::info!("已把桌面上那张抬进来:{title}");
+                            active = Some(photo);
+                            if let Some(handle) = &panel {
+                                handle.refresh(panel_state(
+                                    active.as_ref().map(|it| &it.photo),
+                                    &sessions,
+                                    &library,
+                                ));
+                                handle.set_status(format!("已把桌面上那张抬进来:{title}"));
+                            }
                         }
-                    }
-                },
-                mcwp_ui::UiEvent::Reset => {
-                    spec = WallpaperSpec::from_preset(spec.preset());
-                    params = SceneParams::from_spec(&spec, width as u32, height as u32, brightness);
-                    if let Some(panel) = &panel {
-                        panel.set_values(
-                            [
-                                spec.param(spec.preset().params()[0].key),
-                                spec.param(spec.preset().params()[1].key),
-                                spec.param(spec.preset().params()[2].key),
-                            ],
-                            brightness,
-                            spec.motion.intensity,
-                        );
-                        panel.set_status("已恢复默认");
+                        Err(err) => {
+                            tracing::warn!("抬桌面壁纸失败:{err:?}");
+                            if let Some(handle) = &panel {
+                                let reason = brief(&format!("{err:#}"));
+                                handle.set_status(format!("没读到桌面壁纸:{reason}"));
+                            }
+                        }
                     }
                 }
                 mcwp_ui::UiEvent::Closed => {
@@ -1059,23 +1395,31 @@ fn main() -> Result<()> {
                     if let Some(handle) = &panel {
                         handle.refresh_library(
                             library_items(&library),
-                            library_current(&spec, &library),
+                            library_current(active.as_ref().map(|it| &it.photo), &library),
                         );
                     }
                 }
-                // 点库里的某一张:直接换成它,和托盘切预设走同一套落地逻辑。
+                // 点库里的某一张:现解一次图换上。和托盘"换一张"走同一个入口(`switch_to_photo`)。
                 mcwp_ui::UiEvent::OpenWallpaper(index) => {
-                    if let Some(entry) = library.get(index) {
-                        spec = entry.spec.clone();
-                        params = SceneParams::from_spec(&spec, width as u32, height as u32, brightness);
-                        preset_index = mcwp_spec::PRESETS
-                            .iter()
-                            .position(|candidate| *candidate == spec.preset())
-                            .unwrap_or(0);
-                        tracing::info!("切换到壁纸库:{}({})", entry.item.title, entry.item.id);
-                        if let Some(handle) = &panel {
-                            handle.refresh(panel_state(&spec, brightness, &sessions, &library));
-                            handle.set_status(format!("已切到 {}", entry.item.title));
+                    match switch_to_photo(&mut renderer, &library, index, screen, brightness) {
+                        Ok(photo) => {
+                            let title = photo.photo.title.clone();
+                            tracing::info!("切换到壁纸库里第 {index} 张:{title}");
+                            active = Some(photo);
+                            if let Some(handle) = &panel {
+                                handle.refresh(panel_state(
+                                    active.as_ref().map(|it| &it.photo),
+                                    &sessions,
+                                    &library,
+                                ));
+                                handle.set_status(format!("已切到 {title}"));
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!("切到第 {index} 张失败:{err:?}");
+                            if let Some(handle) = &panel {
+                                handle.set_status(format!("这张打不开:{}", brief(&format!("{err:#}"))));
+                            }
                         }
                     }
                 }
@@ -1085,15 +1429,23 @@ fn main() -> Result<()> {
                     model,
                     api_key,
                     thinking,
+                    image_base_url,
+                    image_model,
+                    image_api_key,
                 } => {
-                    let stored = mcwp_ai::Stored {
-                        // 一律 trim:从输入框里复制粘贴十有八九带空格/换行,而 key 多一个空格就是 401
-                        base_url: base_url.trim().to_string(),
-                        model: model.trim().to_string(),
-                        api_key: api_key.trim().to_string(),
-                        thinking: thinking.to_option(),
-                    };
-                    let status = save_ai_config(&stored, &mut ai);
+                    // **先从盘上现读一份**再覆盖这七个字段:直接构造一个 `Stored` 会把盘上
+                    // 这一版还不认识的字段(以后加的)悄悄抹掉 —— 那种丢失没有报错、没有提示,
+                    // 是设置页最恶劣的一类 bug。
+                    let mut stored = mcwp_ai::Config::stored();
+                    // 一律 trim:从输入框里复制粘贴十有八九带空格/换行,而 key 多一个空格就是 401
+                    stored.base_url = base_url.trim().to_string();
+                    stored.model = model.trim().to_string();
+                    stored.api_key = api_key.trim().to_string();
+                    stored.image_base_url = image_base_url.trim().to_string();
+                    stored.image_model = image_model.trim().to_string();
+                    stored.image_api_key = image_api_key.trim().to_string();
+                    stored.thinking = thinking.to_option();
+                    let status = save_ai_config(&stored, &mut ai, &mut images);
                     if let Some(handle) = &panel {
                         // 回填一次:trim 之后的值要显示回来,用户才知道真存进去的是什么
                         handle.refresh_ai(ai_config_state());
@@ -1103,13 +1455,14 @@ fn main() -> Result<()> {
             }
         }
 
-        // —— 模型的结果落地 —— 
-        // 只有会话还在才继续:用户可能在等的时候把这条删了,那就别把壁纸也换掉(会显得"删了还生效")。
+        // —— 生图的结果落地 —— 
+        // 只有会话还在才继续:用户可能在等的时候把这条删了,那就别把壁纸也换掉
+        // (删了还生效,比不生效更让人困惑)。
         while let Ok(outcome) = ai_rx.try_recv() {
             let AiOutcome {
                 session,
                 run: outcome_run,
-                draft,
+                result,
             } = outcome;
             // 认轮次:暂停过、或者用户又发了新的一句之后,旧请求的结果会晚一步回来 —— 扔掉。
             if !matches!(&run, Some(Run::Running { id, .. }) if *id == outcome_run) {
@@ -1121,43 +1474,58 @@ fn main() -> Result<()> {
             if let Some(handle) = &panel {
                 handle.set_run_state(mcwp_ui::RunState::Idle);
             }
-            if !sessions.reply(session, &draft.reply) {
+            if !sessions.exists(session) {
+                tracing::info!("这一轮的会话已经被删掉了,结果不再落地");
                 continue;
             }
-            spec = draft.spec;
-            params = SceneParams::from_spec(&spec, width as u32, height as u32, brightness);
-            preset_index = mcwp_spec::PRESETS
-                .iter()
-                .position(|candidate| *candidate == spec.preset())
-                .unwrap_or(preset_index);
-            // T3(显式创作)才入库;T2(「冷一点」这类)只改参数 —— 不然聊两句库里就一堆垃圾
-            if draft.mode == mcwp_ai::Mode::Create {
-                match save_to_library(&spec) {
-                    Ok(path) => {
-                        tracing::info!("新壁纸已入壁纸库:{}", path.display());
-                        library = scan_library();
+            let (reply, status) = match result {
+                Ok(payload) => {
+                    let calls = payload.calls;
+                    let degraded = payload.degraded;
+                    let reply = payload.reply.clone();
+                    match adopt_photo(&mut renderer, &mut library, *payload, screen, brightness) {
+                        Ok(photo) => {
+                            let title = photo.photo.title.clone();
+                            active = Some(photo);
+                            tracing::info!(
+                                "已换上新壁纸:{title} | 提示词调用={calls} | 降级={degraded}"
+                            );
+                            let status = if degraded {
+                                format!("模型没接上 · 用你的原话画了「{title}」")
+                            } else if calls > 1 {
+                                format!("已换上「{title}」(提示词重试过一次)")
+                            } else {
+                                format!("已换上「{title}」")
+                            };
+                            (reply, status)
+                        }
+                        Err(err) => {
+                            tracing::error!("图出来了但上屏失败:{err:?}");
+                            let reason = brief(&format!("{err:#}"));
+                            (reply, format!("图出来了但没能上屏:{reason}"))
+                        }
                     }
-                    Err(err) => tracing::warn!("生成成功但入库失败:{err:?}"),
                 }
-            }
-            let status = if draft.degraded {
-                format!("模型没接上 · 先用内置预设顶了「{}」", spec.title)
-            } else if draft.calls > 1 {
-                format!("已换壁纸 ·「{}」(重试过一次)", spec.title)
-            } else {
-                format!("已换壁纸 ·「{}」", spec.title)
+                Err(reason) => {
+                    tracing::warn!("这一轮生图失败:{reason}");
+                    let reason = brief(&reason);
+                    (
+                        format!("这次没画出来({reason}),再试一次?"),
+                        format!("生图失败:{reason}"),
+                    )
+                }
             };
+            if !sessions.reply(session, &reply) {
+                continue;
+            }
             if let Some(handle) = &panel {
-                handle.refresh(panel_state(&spec, brightness, &sessions, &library));
+                handle.refresh(panel_state(
+                    active.as_ref().map(|it| &it.photo),
+                    &sessions,
+                    &library,
+                ));
                 handle.set_status(status);
             }
-            tracing::info!(
-                "应用了模型给的壁纸:{} | 预设={} | 调用={} | 降级={}",
-                spec.title,
-                spec.preset().id(),
-                draft.calls,
-                draft.degraded
-            );
         }
 
         // 会话改过就落盘。放在这儿而不是每个动作里各写一遍:一帧里可能连着好几笔改动
@@ -1176,13 +1544,20 @@ fn main() -> Result<()> {
                         }
                     } else {
                         library = scan_library();
-                        panel = open_panel(&spec, brightness, &sessions, &library, &ui_tx);
+                        panel = open_panel(
+                            active.as_ref().map(|it| &it.photo),
+                            &sessions,
+                            &library,
+                            &ui_tx,
+                        );
                     }
                 }
                 TrayAction::NextPreset => {
-                    let count = mcwp_spec::PRESETS.len();
-                    if count > 0 {
-                        wanted_preset = Some((preset_index + 1) % count);
+                    // 托盘「换一张」= 库里的下一张(走到头绕回第一张)。库空着就没得换 ——
+                    // 那种情况连"当前是哪张"都无从谈起,什么都不做比乱切一张强。
+                    if !library.is_empty() {
+                        wanted_photo =
+                            Some((current_photo_index(&active, &library) + 1) % library.len());
                     }
                 }
                 TrayAction::TogglePause => {
@@ -1203,17 +1578,20 @@ fn main() -> Result<()> {
             }
         }
 
-        if let Some(index) = wanted_preset {
-            if let Some(preset) = mcwp_spec::PRESETS.get(index) {
-                spec = WallpaperSpec::from_preset(*preset);
-                params = SceneParams::from_spec(&spec, width as u32, height as u32, brightness);
-                preset_index = index;
-                if let Some(handle) = &panel {
-                    // 面板自己点卡片时已经先改过自己了,这次回填是无副作用的对齐;
-                    // 托盘切换则全靠它把面板同步过来。
-                    handle.refresh(panel_state(&spec, brightness, &sessions, &library));
+        if let Some(index) = wanted_photo {
+            match switch_to_photo(&mut renderer, &library, index, screen, brightness) {
+                Ok(photo) => {
+                    tracing::info!("托盘换了一张:{}", photo.photo.title);
+                    active = Some(photo);
+                    if let Some(handle) = &panel {
+                        handle.refresh(panel_state(
+                            active.as_ref().map(|it| &it.photo),
+                            &sessions,
+                            &library,
+                        ));
+                    }
                 }
-                tracing::info!("切换到预设:{}", preset.id());
+                Err(err) => tracing::warn!("换一张失败:{err:?}"),
             }
         }
 
@@ -1231,10 +1609,14 @@ fn main() -> Result<()> {
         let frame_start = Instant::now();
         if !paused {
             clock += (frame_start - last_tick).as_secs_f32();
-            params.time = clock;
-            renderer.render(&params)?;
-            frames_in_window += 1;
-            rendered_total += 1;
+            // 有照片就画照片。**没有可画的东西时一帧都不画**:`Renderer::new` 已经铺过一块
+            // 认得出是"还没画"的占位色,继续重画同一帧只是白烧 GPU 和电。
+            if let Some(photo) = &mut active {
+                photo.params.time = clock;
+                renderer.render(&photo.params)?;
+                frames_in_window += 1;
+                rendered_total += 1;
+            }
         }
         last_tick = frame_start;
 

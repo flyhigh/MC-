@@ -1,7 +1,13 @@
-//! 壁纸渲染器:wgpu 之上的一层薄封装,负责「一份 SceneParams → 一帧画面」。
+//! 壁纸渲染器:wgpu 之上的一层薄封装,负责「一组参数 → 一帧画面」。
 //!
-//! M0 只有一个内置场景(雨夜色调渐变),但接口按最终形态设计:
-//! 之后 WallpaperSpec 通过校验后,直接映射成 `SceneParams` 喂进来即可。
+//! 只有一条路:`render()` + `PhotoParams` —— 一张(生好的 / 抬进来的)图当纹理,
+//! 着色器负责构图(cover 裁切 + Ken Burns 推拉平移)与叠加动效层。
+//!
+//! 上一代那条「纯程序化场景」的路(`SceneParams` + `scene.wgsl`)已经随**预设清零**退休:
+//! 那种画面靠几个噪声函数现算,模型画出来的东西比它好看得多,留着只是两套并行的东西要一起维护。
+//!
+//! 取帧 / 提交 / 呈现那一整段每一行都是踩过坑换来的注释(见 `Dx12SwapchainKind` /
+//! `latency_waitable_object` / 显式 `present`),所以全部收在私有的 `draw()` 里,只此一份。
 
 use std::num::NonZeroIsize;
 use std::time::Instant;
@@ -31,7 +37,7 @@ fn mem_mb() -> (f64, f64) {
     }
 }
 use bytemuck::{Pod, Zeroable};
-use mcwp_spec::{Preset, WallpaperSpec};
+use mcwp_spec::{MotionKind, Photo};
 use raw_window_handle::{RawWindowHandle, Win32WindowHandle};
 
 /// 一个最小的 `HasDisplayHandle` 实现。
@@ -53,122 +59,12 @@ impl raw_window_handle::HasDisplayHandle for WindowsDisplay {
     }
 }
 
-/// 内置场景着色器。
-pub const SCENE_SHADER: &str = include_str!("scene.wgsl");
+/// 照片壁纸着色器:一张静态图 + 时间轴 = 会动的壁纸(推拉、平移、效果层)。
+pub const PHOTO_SHADER: &str = include_str!("photo.wgsl");
 
-/// 传给着色器的场景参数,内存布局必须与 `scene.wgsl` 的 `Params` 完全一致。
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
-pub struct SceneParams {
-    /// 渲染分辨率(像素)
-    pub resolution: [f32; 2],
-    /// 累计时间(秒)
-    pub time: f32,
-    /// 亮度系数,建议 0.2 ~ 1.6
-    pub brightness: f32,
-    /// 5 色调色板(rgba,alpha 保留)
-    pub palette: [[f32; 4]; 5],
-    /// 动势 0 ~ 1
-    pub motion: f32,
-    /// 强度 0 ~ 1
-    pub intensity: f32,
-    /// 动势速度系数 0 ~ 1
-    pub speed: f32,
-    /// 颗粒感 0 ~ 1(纸感场景用它当纸纤维)
-    pub grain: f32,
-    /// 场景自由参数 A(雨量 / 暖度 / 云密度 / 网格清晰度)
-    pub density: f32,
-    /// 场景自由参数 B(雾面 / 柔度 / 亮核 / 对比)
-    pub softness: f32,
-    /// 主光强度 0 ~ 1
-    pub light_key: f32,
-    /// 场景自由参数 C(视差 / 漩涡 / 扫描线)
-    pub accent: f32,
-    /// 暗角强度 0 ~ 1
-    pub vignette: f32,
-    /// 随机种子,保证同一份 spec 永远渲染出同一张画面
-    pub seed: f32,
-    /// 场景编号,对应 `Preset::scene_index()`
-    pub scene: u32,
-    /// 补齐到 16 字节对齐(WGSL uniform 要求)
-    pub _pad: f32,
-}
-
-impl SceneParams {
-    /// spec → 着色器参数:全项目唯一的「语义 → 画面槽位」翻译层。
-    ///
-    /// 分工:spec 负责「像什么」(预设 + 参数 + 配色),这里把情绪与亮度折算成具体系数。
-    /// 着色器本身不认识 spec,只认这些槽位。
-    pub fn from_spec(
-        spec: &WallpaperSpec,
-        width: u32,
-        height: u32,
-        desktop_brightness: f32,
-    ) -> Self {
-        let preset = spec.preset();
-        let mood = spec.mood;
-
-        // 每个预设声明三个自由参数,统一映射到 density / softness / accent 三个槽位。
-        let (density, softness, accent) = match preset {
-            Preset::RainyWindowCity => (
-                spec.param("rain"),
-                spec.param("blur"),
-                spec.param("parallax"),
-            ),
-            Preset::MinimalPaper => (spec.param("warmth"), spec.param("softness"), 0.0),
-            Preset::NebulaDrift => (
-                spec.param("density"),
-                spec.param("glow"),
-                spec.param("swirl"),
-            ),
-            Preset::FocusGrid => (
-                spec.param("contrast"),
-                spec.param("grid"),
-                spec.param("scan"),
-            ),
-        };
-
-        // 颗粒:纸感场景用 spec 里的纸纤维强度,其余场景用它压掉渐变色带。
-        let grain = match preset {
-            Preset::MinimalPaper => spec.param("grain"),
-            _ => 0.20 + 0.45 * (1.0 - mood.calm),
-        };
-
-        // 暗角:纸感要「干净」,所以几乎不打暗角。
-        let vignette = match preset {
-            Preset::MinimalPaper => 0.22,
-            Preset::FocusGrid => 0.70,
-            _ => 0.85,
-        };
-
-        let mut palette = [[0.0f32; 4]; 5];
-        for (slot, hex) in palette.iter_mut().zip(spec.palette.iter()) {
-            if let Some(rgb) = parse_hex(hex) {
-                *slot = rgb;
-            }
-        }
-
-        Self {
-            resolution: [width as f32, height as f32],
-            time: 0.0,
-            brightness: desktop_brightness.clamp(0.2, 1.6),
-            palette,
-            motion: spec.motion.intensity,
-            // 能量高 → 光感更足;专注高 → 收敛一点。
-            intensity: (0.55 + 0.45 * mood.energy - 0.15 * mood.focus).clamp(0.2, 1.4),
-            speed: spec.motion.speed,
-            grain,
-            density,
-            softness,
-            light_key: spec.lighting.key_light,
-            accent,
-            vignette,
-            seed: spec.seed as f32,
-            scene: preset.scene_index(),
-            _pad: 0.0,
-        }
-    }
-}
+/// 照片纹理的格式。**必须是 sRGB**:生图存下来就是 sRGB 编码的 PNG,
+/// 用 `Rgba8Unorm` 读会把 gamma 当线性处理,画面整体发灰发暗。
+const PHOTO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 fn parse_hex(hex: &str) -> Option<[f32; 4]> {
     let s = hex.trim().trim_start_matches('#');
@@ -184,14 +80,102 @@ fn parse_hex(hex: &str) -> Option<[f32; 4]> {
     ])
 }
 
+/// 传给照片着色器的参数,内存布局必须与 `photo.wgsl` 的 `Params` 完全一致。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct PhotoParams {
+    /// 渲染分辨率(像素)
+    pub resolution: [f32; 2],
+    /// 累计时间(秒)
+    pub time: f32,
+    /// 亮度系数,取值区间 0.2 ~ 1.6
+    pub brightness: f32,
+    /// 从这张图里提出来的 5 色调色板(rgba)
+    pub palette: [[f32; 4]; 5],
+    /// Ken Burns 推近幅度 0~1
+    pub zoom: f32,
+    /// 平移幅度 0~1
+    pub pan: f32,
+    /// 速度 0~1
+    pub speed: f32,
+    /// 效果层强度 0~1
+    pub intensity: f32,
+    /// 动效编号,取值见 `effect_index()`
+    pub effect: f32,
+    /// 图的长宽比
+    pub image_aspect: f32,
+    /// 屏的长宽比
+    pub screen_aspect: f32,
+    /// 随机种子,决定效果层花纹落在哪
+    pub seed: f32,
+    /// 暗角强度 0~1
+    pub vignette: f32,
+    /// 颗粒感 0~1
+    pub grain: f32,
+    /// 补齐到 16 字节对齐(WGSL uniform 要求)
+    pub _pad: [f32; 2],
+}
+
+impl PhotoParams {
+    /// `Photo` + 屏幕尺寸 → 着色器参数。
+    pub fn from_photo(photo: &Photo, width: u32, height: u32, desktop_brightness: f32) -> Self {
+        let mut palette = [[0.0f32; 4]; 5];
+        for (slot, hex) in palette.iter_mut().zip(photo.palette.iter()) {
+            if let Some(rgb) = parse_hex(hex) {
+                *slot = rgb;
+            }
+        }
+        let motion = photo.motion;
+        Self {
+            resolution: [width as f32, height as f32],
+            time: 0.0,
+            brightness: desktop_brightness.clamp(0.2, 1.6),
+            palette,
+            zoom: motion.zoom,
+            pan: motion.pan,
+            speed: motion.speed,
+            intensity: motion.intensity,
+            effect: effect_index(motion.kind) as f32,
+            image_aspect: photo.aspect(),
+            screen_aspect: width as f32 / height.max(1) as f32,
+            seed: photo.seed as f32,
+            // 暗角给得比程序化场景轻:照片本身已经有构图和明暗,再压一圈会显得脏
+            vignette: 0.55,
+            grain: 0.12,
+            _pad: [0.0; 2],
+        }
+    }
+}
+
+/// `MotionKind` → `photo.wgsl` 里那个 `effect` 编号。
+///
+/// 没写成 `match`:那个 `match` 和 `MotionKind::ALL` 的顺序是同一件事,写两遍迟早会漂。
+/// 定死"编号 = `ALL` 里的下标",改枚举顺序时 WGSL 那边一起改一次就够了。
+fn effect_index(kind: MotionKind) -> u32 {
+    MotionKind::ALL
+        .iter()
+        .position(|candidate| *candidate == kind)
+        .unwrap_or(0) as u32
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    pipeline: wgpu::RenderPipeline,
-    uniform: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
+    /// 管线:两组 bind —— group 0 是参数(uniform),group 1 是纹理 + 采样器(见 `photo.wgsl`)
+    photo_pipeline: wgpu::RenderPipeline,
+    photo_uniform: wgpu::Buffer,
+    /// group 0:参数
+    photo_bind: wgpu::BindGroup,
+    /// group 1:纹理 + 采样器。换图 = 换它
+    photo_texture_bind: wgpu::BindGroup,
+    /// group 1 的布局与采样器。换图时只重建 bind group,这两个全程不变
+    photo_texture_layout: wgpu::BindGroupLayout,
+    photo_sampler: wgpu::Sampler,
+    /// 纹理本体。**必须和 `photo_texture_bind` 一起活到同一个生命周期**:
+    /// bind group 里的 texture view 是它的借用,纹理先没了 view 就悬空。
+    photo_texture: wgpu::Texture,
     /// 跳过的帧数(被遮挡 / 超时 / 需要重新配置),用于健康度上报
     pub skipped_frames: u64,
     /// 上一帧的三个阶段耗时(毫秒):取帧 / 编码提交 / 呈现
@@ -309,20 +293,10 @@ impl Renderer {
         config.desired_maximum_frame_latency = 1;
         surface.configure(&device, &config);
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("mcwp-scene"),
-            source: wgpu::ShaderSource::Wgsl(SCENE_SHADER.into()),
-        });
-
-        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mcwp-scene-params"),
-            size: std::mem::size_of::<SceneParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
+        // group 0 的布局:一个 uniform(参数表)。只有一份 —— 照片那条路的
+        // `photo_bind` 就是按它建的,换图时重新建的只有 group 1(纹理)。
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("mcwp-scene-layout"),
+            label: Some("mcwp-params-layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
@@ -334,27 +308,57 @@ impl Renderer {
                 count: None,
             }],
         });
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mcwp-scene-bind"),
+        let photo_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("mcwp-photo"),
+            source: wgpu::ShaderSource::Wgsl(PHOTO_SHADER.into()),
+        });
+        let photo_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mcwp-photo-params"),
+            size: std::mem::size_of::<PhotoParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let photo_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mcwp-photo-params-bind"),
             layout: &layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: uniform.as_entire_binding(),
+                resource: photo_uniform.as_entire_binding(),
             }],
         });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("mcwp-pipeline-layout"),
-            bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
+        // 纹理那一路的布局只在这里建一次,换图时重建的只有 bind group(便宜)。
+        let photo_texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mcwp-photo-texture-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         });
-
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("mcwp-scene-pipeline"),
-            layout: Some(&pipeline_layout),
+        let photo_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("mcwp-photo-pipeline-layout"),
+                bind_group_layouts: &[Some(&layout), Some(&photo_texture_layout)],
+                immediate_size: 0,
+            });
+        let photo_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("mcwp-photo-pipeline"),
+            layout: Some(&photo_pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: &photo_shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
                 buffers: &[],
@@ -363,7 +367,7 @@ impl Renderer {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: &photo_shader,
                 entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
@@ -375,15 +379,80 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        // 还没有照片时先挂一张 1×1 的占位纹理:这样 `render` 不需要处理
+        // "纹理还没准备好"的分支 —— 它的正确用法是"先 set_photo 再每帧 render",
+        // 万一顺序写反,屏幕上出现的是一块可认出来的占位色,而不是黑屏或 panic。
+        let photo_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("mcwp-photo-placeholder"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: PHOTO_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &photo_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[24, 26, 32, 255],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let photo_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("mcwp-photo-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let photo_texture_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mcwp-photo-texture-bind"),
+            layout: &photo_texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &photo_texture.create_view(&Default::default()),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&photo_sampler),
+                },
+            ],
+        });
 
         Ok(Self {
             surface,
             device,
             queue,
             config,
-            pipeline,
-            uniform,
-            bind_group,
+            photo_pipeline,
+            photo_uniform,
+            photo_bind,
+            photo_texture_bind,
+            photo_texture_layout,
+            photo_sampler,
+            photo_texture,
             skipped_frames: 0,
             last_acquire_ms: 0.0,
             last_submit_ms: 0.0,
@@ -409,11 +478,97 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// 渲染一帧。返回 `false` 表示这一帧被跳过(仍需继续循环)。
-    pub fn render(&mut self, params: &SceneParams) -> Result<bool> {
+    /// GPU 允许的纹理最大边长。调用方拿它在**传图之前**把图缩到塞得下的尺寸 ——
+    /// 不然只能等这里报错,那时候图早就解开了、内存也花掉了。
+    pub fn max_texture_size(&self) -> u32 {
+        self.device.limits().max_texture_dimension_2d
+    }
+
+    /// 换一张照片。旧纹理在这里直接丢掉(从下一帧起没人再引用它)。
+    ///
+    /// 参数收 `&[u8]` 而不是某个位图结构:渲染器**不该认识 PNG** —— 解码、缩放全在
+    /// `mcwp-image`,这里只要"行优先、无 padding 的 RGBA 字节",这样渲染 crate 的依赖树
+    /// 里永远不会有解码器。
+    pub fn set_photo(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<()> {
+        if width == 0 || height == 0 {
+            return Err(anyhow!("照片尺寸是 0"));
+        }
+        let limit = self.max_texture_size();
+        if width > limit || height > limit {
+            return Err(anyhow!(
+                "照片 {width}×{height} 超过这块 GPU 的上限 {limit},先在 `mcwp-image` 里缩一下"
+            ));
+        }
+        let needed = width as usize * height as usize * 4;
+        if rgba.len() < needed {
+            return Err(anyhow!(
+                "RGBA 字节不够:按 {width}×{height} 需要 {needed},实际只有 {}",
+                rgba.len()
+            ));
+        }
+
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("mcwp-photo"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: PHOTO_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        // `write_texture` 没有 256 字节行对齐的要求(那是 `copy_buffer_to_texture` 的规矩),
+        // 所以整块一次写进去就行,不用按行补齐 —— 1080p 上省掉一次 8 MB 的中转。
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rgba[..needed],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let view = texture.create_view(&Default::default());
+        self.photo_texture_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mcwp-photo-texture-bind"),
+            layout: &self.photo_texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.photo_sampler),
+                },
+            ],
+        });
+        self.photo_texture = texture;
+        Ok(())
+    }
+
+    /// 渲染一帧壁纸。返回 `false` 表示这一帧被跳过(仍需继续循环)。
+    ///
+    /// **先 `set_photo` 再调它**:纹理还没换上去时,画出来的是一块可认出来的占位色。
+    pub fn render(&mut self, params: &PhotoParams) -> Result<bool> {
         let t0 = Instant::now();
         self.queue
-            .write_buffer(&self.uniform, 0, bytemuck::bytes_of(params));
+            .write_buffer(&self.photo_uniform, 0, bytemuck::bytes_of(params));
         let t_write = Instant::now();
 
         let frame = match self.surface.get_current_texture() {
@@ -457,8 +612,9 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_pipeline(&self.photo_pipeline);
+            pass.set_bind_group(0, &self.photo_bind, &[]);
+            pass.set_bind_group(1, &self.photo_texture_bind, &[]);
             pass.draw(0..3, 0..1);
         }
         self.queue.submit([encoder.finish()]);
@@ -474,11 +630,11 @@ impl Renderer {
         Ok(true)
     }
 
-    /// 自检:把同一个场景渲染到**离屏**纹理再回读中心像素。
+    /// 自检:把当前壁纸渲染到**离屏**纹理再回读中心像素。
     ///
     /// 离屏渲染的 clear 色故意用洋红:回读到洋红说明「绘制没发生」(管线问题),
-    /// 回读到深蓝渐变说明「渲染是好的」(那问题就在呈现/合成环节)。
-    pub fn readback_center(&mut self, params: &SceneParams) -> Result<[u8; 4]> {
+    /// 回读到画面本身说明「渲染是好的」(那问题就在呈现/合成环节)。
+    pub fn readback_center(&mut self, params: &PhotoParams) -> Result<[u8; 4]> {
         let width = self.config.width;
         let height = self.config.height;
         let format = self.config.format;
@@ -500,7 +656,7 @@ impl Renderer {
         let view = texture.create_view(&Default::default());
 
         self.queue
-            .write_buffer(&self.uniform, 0, bytemuck::bytes_of(params));
+            .write_buffer(&self.photo_uniform, 0, bytemuck::bytes_of(params));
 
         let mut encoder = self
             .device
@@ -529,8 +685,9 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_pipeline(&self.photo_pipeline);
+            pass.set_bind_group(0, &self.photo_bind, &[]);
+            pass.set_bind_group(1, &self.photo_texture_bind, &[]);
             pass.draw(0..3, 0..1);
         }
 
@@ -590,6 +747,81 @@ impl Renderer {
         drop(data);
         readback.unmap();
         Ok(pixel)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mcwp_spec::MotionRecipe;
+
+    /// uniform 的字节布局是 Rust 和 WGSL 之间**唯一**没有编译器保护的约定:
+    /// 这边挪一个字段、那边不改,画面不会报错,只会诡异地错位。所以在这里把偏移钉死。
+    #[test]
+    fn 照片参数的显存布局和着色器逐字段对齐() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<PhotoParams>(), 144);
+        assert_eq!(offset_of!(PhotoParams, resolution), 0);
+        assert_eq!(offset_of!(PhotoParams, time), 8);
+        assert_eq!(offset_of!(PhotoParams, brightness), 12);
+        assert_eq!(offset_of!(PhotoParams, palette), 16);
+        assert_eq!(offset_of!(PhotoParams, zoom), 96);
+        assert_eq!(offset_of!(PhotoParams, pan), 100);
+        assert_eq!(offset_of!(PhotoParams, speed), 104);
+        assert_eq!(offset_of!(PhotoParams, intensity), 108);
+        assert_eq!(offset_of!(PhotoParams, effect), 112);
+        assert_eq!(offset_of!(PhotoParams, image_aspect), 116);
+        assert_eq!(offset_of!(PhotoParams, screen_aspect), 120);
+        assert_eq!(offset_of!(PhotoParams, seed), 124);
+        assert_eq!(offset_of!(PhotoParams, vignette), 128);
+        assert_eq!(offset_of!(PhotoParams, grain), 132);
+        assert_eq!(offset_of!(PhotoParams, _pad), 136);
+    }
+
+    /// 动效编号 = `MotionKind::ALL` 的下标,而 `photo.wgsl` 里的 `if (effect == n)` 就是这个
+    /// 下标。枚举顺序一改、着色器不改,动效会整体串位(雪变成雨),所以在这里钉死。
+    #[test]
+    fn 动效编号和着色器里的分支一一对应() {
+        assert_eq!(effect_index(MotionKind::Still), 0);
+        assert_eq!(effect_index(MotionKind::Snow), 1);
+        assert_eq!(effect_index(MotionKind::Rain), 2);
+        assert_eq!(effect_index(MotionKind::Fog), 3);
+        assert_eq!(effect_index(MotionKind::Cloud), 4);
+        assert_eq!(effect_index(MotionKind::Glow), 5);
+        assert_eq!(effect_index(MotionKind::Ripple), 6);
+    }
+
+    #[test]
+    fn 照片参数把配方和比例原样带过去() {
+        let mut photo = Photo {
+            title: "雪山日出".into(),
+            prompt: "雪山日出".into(),
+            width: 1920,
+            height: 1088,
+            palette: vec![
+                "#0B1020".into(),
+                "#1B2A4A".into(),
+                "#4F7CFF".into(),
+                "#9BB8FF".into(),
+                "#E6ECFF".into(),
+            ],
+            ..Default::default()
+        };
+        photo.motion = MotionRecipe {
+            kind: MotionKind::Snow,
+            intensity: 0.4,
+            zoom: 0.2,
+            pan: 0.1,
+            speed: 0.25,
+        };
+        let params = PhotoParams::from_photo(&photo, 2560, 1440, 1.0);
+        assert_eq!(params.effect, 1.0);
+        assert_eq!(params.zoom, 0.2);
+        assert_eq!(params.speed, 0.25);
+        assert!((params.image_aspect - 1920.0 / 1088.0).abs() < 1e-6);
+        assert!((params.screen_aspect - 2560.0 / 1440.0).abs() < 1e-6);
+        // 调色板第一个槽是 #0B1020 → r=11/255
+        assert!((params.palette[0][0] - 11.0 / 255.0).abs() < 1e-6);
     }
 }
 

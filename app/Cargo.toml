@@ -4,6 +4,7 @@ members = [
     "crates/mcwp-platform",
     "crates/mcwp-render",
     "crates/mcwp-ai",
+    "crates/mcwp-image",
     "crates/mcwp-spec",
     "crates/mcwp-ui",
     "crates/mcwp-wallpaper",

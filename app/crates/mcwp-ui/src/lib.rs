@@ -61,15 +61,6 @@ pub use slint::{ModelRc, SharedString, VecModel};
 /// 面板发回壁纸进程的事件。
 #[derive(Debug, Clone)]
 pub enum UiEvent {
-    /// 用户点了第 `index` 张预设卡片(`PanelState::presets` 的下标)
-    SelectPreset(usize),
-    /// 参数被拖动 —— 每一次变化都会发,用来做实时预览
-    Values {
-        /// 三个场景参数,顺序与 `Preset::params()` 一致
-        params: [f32; 3],
-        brightness: f32,
-        motion: f32,
-    },
     /// 用户在输入框里发了一条消息(生图界面)
     SendMessage(String),
     /// 点开了左栏里的某个会话(左栏下标)
@@ -93,6 +84,10 @@ pub enum UiEvent {
         model: String,
         api_key: String,
         thinking: ThinkingChoice,
+        /// 生图那一组;留空 = 跟着上面那三个走
+        image_base_url: String,
+        image_model: String,
+        image_api_key: String,
     },
     /// 对话进行中点「暂停」:这一轮的请求作废(结果回来会被丢掉)。
     PauseRun,
@@ -100,34 +95,49 @@ pub enum UiEvent {
     ResumeRun,
     /// 点了壁纸库里的第 `index` 张(`PanelState::library` 的下标)
     OpenWallpaper(usize),
-    /// 「存为壁纸」
-    Save,
-    /// 「恢复默认」
-    Reset,
+    /// 库那一格的右键菜单:删掉第 `index` 张
+    DeleteWallpaper(usize),
+    /// 「用当前壁纸」:把桌面上原来那张抬进来当作库里的新一张
+    AdoptWallpaper,
     /// 面板窗口被关掉了
     Closed,
 }
 
 /// 打开面板时喂给它的初始状态。
 pub struct PanelState {
-    pub presets: Vec<PresetItem>,
-    pub preset_index: usize,
     pub title: String,
     pub hint: String,
     pub fingerprint: String,
     pub summary: String,
-    /// 当前壁纸的调色板(`WallpaperSpec::palette`),玻璃色由它推出来
+    /// 当前壁纸的调色板(`Photo::palette`),玻璃色由它推出来
     pub palette: Vec<String>,
-    pub labels: [String; 3],
-    pub params: [f32; 3],
-    pub brightness: f32,
-    pub motion: f32,
     /// 生图界面:左栏历史 + 右栏会话
     pub session: SessionState,
     /// 壁纸库:由壁纸侧扫描库目录得到,面板只负责画(和会话数据同一个道理)
-    pub library: Vec<LibraryItem>,
-    /// 当前生效的壁纸在库里的 id;空串表示这张还没存进库
+    pub library: Vec<LibraryEntryView>,
+    /// 当前生效的壁纸在库里的 id;空串表示桌面上那张不在库里(比如刚抬进来的系统壁纸)
     pub library_current: String,
+}
+
+/// 面板要显示的一条库记录(**能跨线程**的那份)。
+///
+/// 和 Slint 那个 `LibraryItem` 的唯一区别是缩略图:`slint::Image` **不是 `Send`**,
+/// 带着它就过不了线程边界(`PanelState` 要移进面板线程)。所以这里放的是**裸像素** ——
+/// RGBA8 + 宽高;贴进面板时(`apply_library`,那已经在面板线程里)才装成 `slint::Image`。
+///
+/// 为什么不是"把编码好的 PNG 送过去让 Slint 解":那要多开一个图片解码特性,
+/// 而壁纸侧本来就有解码器(`mcwp-image`),解完送过来正好省掉面板这一步。
+#[derive(Debug, Clone)]
+pub struct LibraryEntryView {
+    /// 照片 id(= 库目录里的文件夹名),面板靠它和「当前是哪张」比对
+    pub id: String,
+    pub title: String,
+    /// 卡片上那行小字(提示词掐短)
+    pub hint: String,
+    pub summary: String,
+    pub accent: slint::Color,
+    /// (宽, 高, RGBA8 像素)。**必须和宽高对得上**,不然贴出来是花的。
+    pub thumb: (u32, u32, Vec<u8>),
 }
 
 /// 设置页要显示的模型配置。
@@ -140,6 +150,11 @@ pub struct AiConfigState {
     pub base_url: String,
     pub model: String,
     pub api_key: String,
+    /// 生图那一组。**留空是合法的**:空 = 跟着上面那三个走(见 `mcwp_ai::ImagesConfig::load`),
+    /// 所以"同一家服务商"时用户只需要填上面那组。
+    pub image_base_url: String,
+    pub image_model: String,
+    pub image_api_key: String,
     /// 「深度思考」选的哪一档
     pub thinking: ThinkingChoice,
     /// 有 `MCWP_AI_*` 环境变量在生效:界面上要提醒一句,不然用户改完发现没反应。
@@ -276,14 +291,10 @@ impl PanelState {
             ("关键词".into(), self.hint.clone()),
             ("说明".into(), self.summary.clone()),
         ];
-        for (index, preset) in self.presets.iter().enumerate() {
-            fields.push((format!("预设{index} 标题"), preset.title.to_string()));
-            fields.push((format!("预设{index} 说明"), preset.summary.to_string()));
-        }
-        // 库里的壁纸名是动态的(AI 生成 / 用户存的),同样要盯缺字
+        // 库里的壁纸名是动态的(AI 起的标题),同样要盯缺字
         for (index, item) in self.library.iter().enumerate() {
             fields.push((format!("库{index} 标题"), item.title.to_string()));
-            fields.push((format!("库{index} 关键词"), item.hint.to_string()));
+            fields.push((format!("库{index} 说明"), item.summary.to_string()));
         }
         let mut missing_fields: Vec<(String, Vec<char>)> = fields
             .into_iter()
@@ -324,20 +335,6 @@ impl PanelHandle {
         });
     }
 
-    /// 从壁纸侧回填参数(「恢复默认」之后用),不会引发再次回调。
-    pub fn set_values(&self, params: [f32; 3], brightness: f32, motion: f32) {
-        let weak = self.weak.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(panel) = weak.upgrade() {
-                panel.set_param_a(params[0]);
-                panel.set_param_b(params[1]);
-                panel.set_param_c(params[2]);
-                panel.set_brightness(brightness);
-                panel.set_motion(motion);
-            }
-        });
-    }
-
     /// 整块回填会话视图(左栏列表 + 当前会话的消息)。发消息 / 切会话 / 新建会话都走它。
     pub fn refresh_session(&self, session: SessionState) {
         let weak = self.weak.clone();
@@ -349,7 +346,7 @@ impl PanelHandle {
     }
 
     /// 整块回填壁纸库(存了新壁纸、面板切到库页时用)。
-    pub fn refresh_library(&self, library: Vec<LibraryItem>, current: String) {
+    pub fn refresh_library(&self, library: Vec<LibraryEntryView>, current: String) {
         let weak = self.weak.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(panel) = weak.upgrade() {
@@ -454,42 +451,6 @@ fn build(state: &PanelState, events: Sender<UiEvent>) -> Result<Panel> {
 
     {
         let tx = events.clone();
-        ui.on_select_preset(move |index| {
-            let _ = tx.send(UiEvent::SelectPreset(index.max(0) as usize));
-        });
-    }
-
-    {
-        // 回调要读面板当前值,所以这里必须拿 weak,不能把 ui 自己捕获进去(会成环)。
-        let weak = ui.as_weak();
-        let tx = events.clone();
-        ui.on_values_changed(move || {
-            if let Some(panel) = weak.upgrade() {
-                let _ = tx.send(UiEvent::Values {
-                    params: [panel.get_param_a(), panel.get_param_b(), panel.get_param_c()],
-                    brightness: panel.get_brightness(),
-                    motion: panel.get_motion(),
-                });
-            }
-        });
-    }
-
-    {
-        let tx = events.clone();
-        ui.on_save_requested(move || {
-            let _ = tx.send(UiEvent::Save);
-        });
-    }
-
-    {
-        let tx = events.clone();
-        ui.on_reset_requested(move || {
-            let _ = tx.send(UiEvent::Reset);
-        });
-    }
-
-    {
-        let tx = events.clone();
         ui.on_send_message(move |text| {
             let _ = tx.send(UiEvent::SendMessage(text.to_string()));
         });
@@ -557,14 +518,32 @@ fn build(state: &PanelState, events: Sender<UiEvent>) -> Result<Panel> {
     }
 
     {
+        // 库那一格的右键菜单:只转发下标,删谁、删完怎么办是壁纸侧的事
+        let tx = events.clone();
+        ui.on_delete_wallpaper(move |index| {
+            let _ = tx.send(UiEvent::DeleteWallpaper(index.max(0) as usize));
+        });
+    }
+
+    {
+        let tx = events.clone();
+        ui.on_adopt_wallpaper(move || {
+            let _ = tx.send(UiEvent::AdoptWallpaper);
+        });
+    }
+
+    {
         // 设置页的「保存」。面板只把四个值原样递出去 —— 校验、落盘、重建客户端都在壁纸侧。
         let tx = events.clone();
-        ui.on_save_ai_config(move |base_url, model, api_key, thinking| {
+        ui.on_save_ai_config(move |base_url, model, api_key, thinking, image_base_url, image_model, image_api_key| {
             let _ = tx.send(UiEvent::SaveAiConfig {
                 base_url: base_url.to_string(),
                 model: model.to_string(),
                 api_key: api_key.to_string(),
                 thinking: ThinkingChoice::from_index(thinking),
+                image_base_url: image_base_url.to_string(),
+                image_model: image_model.to_string(),
+                image_api_key: image_api_key.to_string(),
             });
         });
     }
@@ -760,7 +739,7 @@ fn apply_session(ui: &Panel, session: &SessionState) {
     ui.set_message_revision(session.revision);
 }
 
-/// 把一份面板状态写进已经建好的面板。初始化与「托盘切预设」共用同一段。
+/// 把一份面板状态写进已经建好的面板。初始化与「换了一张壁纸」共用同一段。
 fn apply_state(ui: &Panel, state: &PanelState) {
     let colors = glass_colors(&state.palette);
     ui.set_ambient_a(colors.ambient_a());
@@ -769,29 +748,33 @@ fn apply_state(ui: &Panel, state: &PanelState) {
     ui.set_glass_tint(colors.glass_tint());
     ui.set_accent(colors.accent());
 
-    ui.set_presets(slint::ModelRc::new(slint::VecModel::from(
-        state.presets.clone(),
-    )));
-    ui.set_current_preset(state.preset_index as i32);
     ui.set_wallpaper_title(state.title.clone().into());
-    ui.set_wallpaper_hint(state.hint.clone().into());
-    ui.set_fingerprint(state.fingerprint.clone().into());
-    ui.set_preset_summary(state.summary.clone().into());
-    ui.set_label_a(state.labels[0].clone().into());
-    ui.set_label_b(state.labels[1].clone().into());
-    ui.set_label_c(state.labels[2].clone().into());
-    ui.set_param_a(state.params[0]);
-    ui.set_param_b(state.params[1]);
-    ui.set_param_c(state.params[2]);
-    ui.set_brightness(state.brightness);
-    ui.set_motion(state.motion);
     apply_session(ui, &state.session);
     apply_library(ui, state.library.clone(), state.library_current.clone());
 }
 
-/// 把壁纸库写进面板:列表本身 + 当前生效的是哪一张(画成选中态)。
-fn apply_library(ui: &Panel, library: Vec<LibraryItem>, current: String) {
-    ui.set_library(slint::ModelRc::new(slint::VecModel::from(library)));
+/// 把壁纸库写进面板:网格本身 + 当前生效的是哪一张(画成选中态)。
+///
+/// **缩略图在这一步才装成 `slint::Image`** —— 这个函数跑在面板线程里,而裸像素是
+/// 跨线程送过来的(见 `LibraryEntryView`)。装的时候要把像素复制一份给 Slint:
+/// `SharedPixelBuffer` 拿的是所有权。
+fn apply_library(ui: &Panel, library: Vec<LibraryEntryView>, current: String) {
+    let items: Vec<LibraryItem> = library
+        .into_iter()
+        .map(|entry| {
+            let (width, height, ref pixels) = entry.thumb;
+            let buffer = slint::SharedPixelBuffer::clone_from_slice(pixels, width, height);
+            LibraryItem {
+                id: entry.id.into(),
+                title: entry.title.into(),
+                hint: entry.hint.into(),
+                summary: entry.summary.into(),
+                accent: entry.accent,
+                thumb: slint::Image::from_rgba8(buffer),
+            }
+        })
+        .collect();
+    ui.set_library(slint::ModelRc::new(slint::VecModel::from(items)));
     ui.set_library_current(current.into());
 }
 
@@ -800,6 +783,9 @@ fn apply_ai(ui: &Panel, ai: &AiConfigState) {
     ui.set_ai_base_url(ai.base_url.clone().into());
     ui.set_ai_model(ai.model.clone().into());
     ui.set_ai_key(ai.api_key.clone().into());
+    ui.set_ai_image_base_url(ai.image_base_url.clone().into());
+    ui.set_ai_image_model(ai.image_model.clone().into());
+    ui.set_ai_image_key(ai.image_api_key.clone().into());
     ui.set_ai_thinking(ai.thinking.index());
     ui.set_ai_env_override(ai.env_override);
 }

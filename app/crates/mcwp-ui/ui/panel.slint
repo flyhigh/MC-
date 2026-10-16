@@ -10,18 +10,20 @@
 //   │  对话一 ·…    │ 消息流(用户的靠右、染色;回复靠左、薄填充)  │
 //   │  对话二 ·…    │                                             │
 //   │  …            │ ──────────────────────────────────────────  │
-//   │  壁纸参数     │ [ 说一句想看到的样子…         ] [ 发送 ]    │
-//   │  壁纸库       │                                             │
+//   │  壁纸库       │ [ 说一句想看到的样子…         ] [ 发送 ]    │
 //   │  设置         │                                             │
 //   └──────────────┴────────────────────────────────────────────┘
 //
-// 左栏是会话历史常驻的位置,底部三项把右栏换成参数 / 库 / 设置 —— 原来「壁纸 / 库 / 设置」
-// 三个页签的内容没丢,只是从顶部挪到了左栏底部,顶上那一行留给会话标题。`view` 是纯界面状态
-// (0 会话 / 1 参数 / 2 库 / 3 设置),不进 Rust;切视图一律用 `if` 而不是 `visible`。
+// 左栏是会话历史常驻的位置,底部两项把右栏换成库 / 设置,顶上那一行留给会话标题。
+// `view` 是纯界面状态(0 会话 / 1 壁纸库 / 2 设置),不进 Rust;切视图一律用 `if` 而不是 `visible`。
 //
-// 壁纸库页的列表不写死在面板里:壁纸侧扫过 `%APPDATA%\MC壁纸\library` 再整块灌进来
+// 老的那一页「壁纸参数」(预设卡片 + 三个滑杆)随**预设清零**一起拆了:画面不再是本地着色器
+// 那几个参数算出来的,而是一张生好的图 —— 能改的只有"再生成一张",那件事走右栏的对话。
+//
+// 壁纸库页的网格不写死在面板里:壁纸侧扫过 `%APPDATA%\MC壁纸\photos` 再整块灌进来
 // (`library` / `library-current`),切到库页时回调 `refresh-library` 要一份最新的 ——
-// 库目录是用户可写的地方,面板自己不去读文件。
+// 库目录是用户可写的地方,面板自己不去读文件。缩略图也是壁纸侧在入库时生成好、随列表一起送来的
+// (面板这边只负责贴,不做解码)。
 //
 // —— 视觉与软件渲染器的能力边界(踩过才知道,别重犯)——
 //   * 支持:线性/径向渐变、圆角、alpha 混合、旋转、颜色插值动画
@@ -81,19 +83,6 @@ global Glass {
 }
 
 // 参数视图里的一张预设卡片(原来是"壁纸"页的主内容)。
-export struct PresetItem {
-    id: string,
-    title: string,
-    summary: string,
-    label-a: string,
-    label-b: string,
-    label-c: string,
-    value-a: float,
-    value-b: float,
-    value-c: float,
-    motion: float,
-}
-
 // 一条消息。`mine` = 用户自己发的那条。
 export struct ChatMessage {
     mine: bool,
@@ -110,14 +99,16 @@ export struct ConversationItem {
     unread: bool,
 }
 
-// 壁纸库里的一张壁纸(壁纸侧扫描库目录得到)。`accent` 是它调色板里的主色,卡片靠它区分;
-// 真缩略图要拿 spec 渲染一张才准,那是后面的事,先不假装有。
+// 壁纸库里的一张壁纸(壁纸侧扫描库目录得到)。`thumb` 是**真缩略图** ——
+// 壁纸侧在入库时顺手存了一张小的(见 `photos.rs` 的 `THUMB_*`),面板直接贴。
+// `accent` 是它调色板里的主色,面板玻璃跟着它染色,所以换壁纸时整个面板的色调一起变。
 export struct LibraryItem {
     id: string,
     title: string,
     hint: string,
     summary: string,
     accent: color,
+    thumb: image,
 }
 // 玻璃上的「胶囊」按钮。主操作是 tinted(染色玻璃),次操作是普通玻璃。
 component Pill inherits Rectangle {
@@ -199,149 +190,6 @@ component RunButton inherits Rectangle {
     touch := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
-    }
-}
-
-// iOS 风格滑杆:粗胶囊轨道 + 白色圆钮。
-component GlassSlider inherits VerticalLayout {
-    in property <string> label: "";
-    in property <float> minimum: 0;
-    in property <float> maximum: 1;
-    in property <color> accent: #0A84FF;
-    in-out property <float> value: 0.5;
-
-    spacing: 7px;
-    height: 52px;
-
-    HorizontalLayout {
-        height: 15px;
-        Text {
-            text: root.label;
-            color: Glass.label-2;
-            font-size: 12px;
-            vertical-alignment: center;
-            horizontal-stretch: 1;
-        }
-        Text {
-            text: "\{round((root.value - root.minimum) / (root.maximum - root.minimum) * 100)}%";
-            color: Glass.label-3;
-            font-size: 12px;
-            vertical-alignment: center;
-        }
-    }
-
-    track := Rectangle {
-        height: 30px;
-        border-radius: 15px;
-        // 凹槽:实色压暗 + 内缘暗线,读起来像被"挖"进玻璃里。
-        background: #0000003D;
-        border-width: 1px;
-        border-color: Glass.hairline-dim;
-
-        // 已填充部分:染色玻璃
-        Rectangle {
-            x: 1px;
-            y: 1px;
-            width: max(0px, min(parent.width - 2px, knob.x + knob.width / 2 - 1px));
-            height: parent.height - 2px;
-            border-radius: (parent.height - 2px) / 2;
-            background: accent.brighter(0.10);
-            opacity: 0.92;
-        }
-
-        knob := Rectangle {
-            width: 24px;
-            height: 24px;
-            y: (parent.height - self.height) / 2;
-            x: clamp((parent.width - self.width) * (root.value - root.minimum) / (root.maximum - root.minimum), 0px, parent.width - self.width);
-            border-radius: self.width / 2;
-            background: #FFFFFF;
-            border-width: 1px;
-            border-color: #FFFFFFE6;
-            animate x { duration: 120ms; easing: ease-out; }
-        }
-
-        touch := TouchArea {
-            mouse-cursor: pointer;
-            pointer-event(e) => {
-                // `move` 事件是"悬停也会来"的:不加 `touch.pressed` 这道闸,鼠标只是从滑杆上
-                // 划过就会改值 —— 面板上几个滑杆会被一次挥动全部带动。
-                if (e.kind == PointerEventKind.down
-                    || (e.kind == PointerEventKind.move && touch.pressed)) {
-                    root.value = root.minimum + clamp((touch.mouse-x - knob.width / 2) / (track.width - knob.width), 0, 1) * (root.maximum - root.minimum);
-                }
-            }
-            clicked => {
-                root.value = root.minimum + clamp((touch.mouse-x - knob.width / 2) / (track.width - knob.width), 0, 1) * (root.maximum - root.minimum);
-            }
-        }
-    }
-}
-// 参数视图里的预设卡片。选中的用染色玻璃表示,未选中的是薄填充。
-component PresetRow inherits Rectangle {
-    in property <bool> selected: false;
-    in property <string> heading: "";
-    in property <string> sub: "";
-    in property <color> accent: #0A84FF;
-
-    callback picked();
-
-    height: 58px;
-    border-radius: Glass.r-card;
-    border-width: 1px;
-    border-color: selected ? accent.with-alpha(0.5) : Glass.hairline-dim;
-    background: selected
-        ? accent.with-alpha(touch.has-hover ? 0.2 : 0.16)
-        : (touch.has-hover ? Glass.fill-hover : Glass.fill);
-    animate background { duration: 160ms; easing: ease-out; }
-    animate border-color { duration: 160ms; easing: ease-out; }
-
-    HorizontalLayout {
-        padding-left: 12px;
-        padding-right: 12px;
-        spacing: 10px;
-        // 不写 alignment:横向布局的它是主轴方向,会把内容挤到中间(见文件顶部)
-
-        // 选中指示器:一颗小圆点(套 VBox 才能在行内竖直居中,见文件顶部的布局说明)
-        VerticalLayout {
-            alignment: center;
-
-            Rectangle {
-                width: 7px;
-                height: 7px;
-                border-radius: 3.5px;
-                background: selected ? accent : Glass.label-3;
-                opacity: selected ? 1 : 0.35;
-                animate opacity { duration: 160ms; }
-            }
-        }
-
-        VerticalLayout {
-            alignment: center;
-            spacing: 2px;
-            horizontal-stretch: 1;
-
-            Text {
-                text: root.heading;
-                color: selected ? Glass.label : Glass.label-2;
-                font-size: 14px;
-                font-weight: selected ? 600 : 400;
-                animate color { duration: 160ms; }
-            }
-            Text {
-                text: root.sub;
-                color: Glass.label-3;
-                font-size: 11px;
-                wrap: word-wrap;
-                max-height: 14px;
-                overflow: elide;
-            }
-        }
-    }
-
-    touch := TouchArea {
-        mouse-cursor: pointer;
-        clicked => { root.picked(); }
     }
 }
 
@@ -598,77 +446,106 @@ component ConversationMenu inherits Rectangle {
     }
 }
 
-// 壁纸库里的一张壁纸:左边一块主色色卡(缩略图的占位),右边标题 + 关键词,尾巴上挂指纹。
-component LibraryRow inherits Rectangle {
+// 壁纸库里的一格:一张**真缩略图** + 底下一行标题。
+//
+// 尺寸写死(168 × 116)而不是让布局撑出来:网格靠这两个数算行列(见 `CELL-W` / `CELL-H`
+// 那两个常量),而布局撑出来的尺寸面板读不到 —— 和右键菜单那两个数同一个道理,改记得一起改。
+component LibraryCell inherits Rectangle {
+    in property <image> thumb;
     in property <string> heading: "";
-    in property <string> sub: "";
-    in property <string> meta: "";
-    in property <color> accent: #0A84FF;
     in property <bool> selected: false;
+    in property <color> accent: #0A84FF;
 
     callback picked();
+    callback menu-requested(length, length);
 
-    height: 54px;
+    width: 168px;
+    height: 116px;
     border-radius: Glass.r-card;
-    // 未选中时不画描边(透明描边 + 实色填充,圆角才生效)
     border-width: 1px;
-    border-color: selected ? accent.with-alpha(0.5) : #FFFFFF00;
-    background: selected
-        ? accent.with-alpha(touch.has-hover ? 0.22 : 0.16)
-        : (touch.has-hover ? Glass.fill-hover : #FFFFFF00);
+    border-color: root.selected ? root.accent.with-alpha(0.6) : Glass.hairline-dim;
+    background: root.selected
+        ? root.accent.with-alpha(0.20)
+        : (touch.has-hover ? Glass.fill-hover : Glass.fill);
     animate background { duration: 160ms; easing: ease-out; }
 
-    HorizontalLayout {
-        padding-left: 12px;
-        padding-right: 12px;
-        spacing: 12px;
+    Image {
+        x: 6px;
+        y: 6px;
+        width: parent.width - 12px;
+        height: 94px;
+        source: root.thumb;
+        image-fit: cover;
+    }
 
-        // 这里不要写 alignment:横向布局的 alignment 是主轴(水平)方向,写了会把整条内容
-        // 挤到中间去(和左栏 NavRow 是同一个坑);竖直居中交给布局默认的 cross 居中。
-
-        // 色卡:这张壁纸自己的主色(实色才有圆角,渐变画不出圆角)。
-        // 套 VBox 是为了在 54px 的行里竖直居中,见文件顶部的布局说明。
-        VerticalLayout {
-            alignment: center;
-
-            Rectangle {
-                width: 36px;
-                height: 36px;
-                border-radius: 10px;
-                background: root.accent;
-            }
-        }
-
-        VerticalLayout {
-            horizontal-stretch: 1;
-            alignment: center;
-            spacing: 2px;
-
-            Text {
-                text: root.heading;
-                color: root.selected ? Glass.label : Glass.label-2;
-                font-size: 13px;
-                overflow: elide;
-            }
-            Text {
-                text: root.sub;
-                color: Glass.label-3;
-                font-size: 11px;
-                overflow: elide;
-            }
-        }
-
-        Text {
-            text: root.meta;
-            color: Glass.label-3;
-            font-size: 10px;
-            vertical-alignment: center;
-        }
+    Text {
+        x: 8px;
+        y: 100px;
+        width: parent.width - 16px;
+        height: 14px;
+        text: root.heading;
+        color: root.selected ? Glass.label : Glass.label-2;
+        font-size: 11px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        overflow: elide;
     }
 
     touch := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.picked(); }
+        pointer-event(e) => {
+            // 右键:菜单弹在点下去的地方(左键那条走 clicked,和会话行同一个写法)
+            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
+                root.menu-requested(
+                    self.absolute-position.x + self.mouse-x,
+                    self.absolute-position.y + self.mouse-y,
+                );
+            }
+        }
+    }
+}
+
+// 壁纸库那一格的右键菜单:换上这一张 / 删除这一张。
+//
+// 只有两项,所以比会话菜单矮(93 而不是 143):面板那侧各存了一份尺寸,
+// 菜单得知道自己多大才能贴着窗口边收住(布局撑出来的高度面板读不到)。
+component LibraryMenu inherits Rectangle {
+    in property <color> plate: #161B28;
+
+    callback apply-picked();
+    callback delete-picked();
+
+    width: 176px;
+    height: 93px;
+    border-radius: 10px;
+    // 实色(不是玻璃):菜单要压住底下的缩略图读字
+    background: plate;
+    border-width: 1px;
+    border-color: Glass.hairline;
+
+    VerticalLayout {
+        x: 6px;
+        y: 6px;
+        width: parent.width - 12px;
+        height: parent.height - 12px;
+        spacing: 0px;
+
+        MenuRow { text: "换上这一张"; picked => { root.apply-picked(); } }
+
+        Rectangle {
+            height: 11px;
+
+            Rectangle {
+                x: 6px;
+                y: 5px;
+                width: parent.width - 12px;
+                height: 1px;
+                background: Glass.hairline-dim;
+            }
+        }
+
+        MenuRow { text: "删除这一张"; danger: true; picked => { root.delete-picked(); } }
     }
 }
 
@@ -965,30 +842,21 @@ export component Panel inherits Window {
     in-out property <string> ai-base-url: "";
     in-out property <string> ai-model: "";
     in-out property <string> ai-key: "";
+    // 生图那一组。**留空 = 跟着上面那三个走**,所以"同一家服务商"时只填上面那组就够。
+    in-out property <string> ai-image-base-url: "";
+    in-out property <string> ai-image-model: "";
+    in-out property <string> ai-image-key: "";
     // 深度思考:0 = 不发这个字段(服务商默认)/ 1 = 发 enabled / 2 = 发 disabled。
     // 三态不是偷懒 —— 面板把它原样交给 Rust,由 Rust 决定 `Stored::thinking` 落 None/true/false。
     in-out property <int> ai-thinking: 0;
     // 有 MCWP_AI_* 环境变量在生效 —— 界面上得说一句,不然用户在这儿改完发现没反应。
     in property <bool> ai-env-override: false;
 
-    // 右栏当前显示哪个视图:0 = 会话,1 = 壁纸参数,2 = 壁纸库,3 = 设置。纯界面状态,不进 Rust。
+    // 右栏当前显示哪个视图:0 = 会话,1 = 壁纸库,2 = 设置。纯界面状态,不进 Rust。
     in-out property <int> view: 0;
 
-    // —— 参数视图(原来「壁纸」页那一套)——
-    in property <[PresetItem]> presets;
-    in-out property <int> current-preset: 0;
+    // 顶栏右边那行小字:现在挂在桌面上的是哪张
     in property <string> wallpaper-title: "—";
-    in property <string> wallpaper-hint: "";
-    in property <string> fingerprint: "";
-    in-out property <string> preset-summary: "";
-    in-out property <string> label-a: "";
-    in-out property <string> label-b: "";
-    in-out property <string> label-c: "";
-    in-out property <float> param-a: 0.5;
-    in-out property <float> param-b: 0.5;
-    in-out property <float> param-c: 0.5;
-    in-out property <float> brightness: 1.0;
-    in-out property <float> motion: 0.5;
     in property <string> status: "";
 
     // 环境底色板由 Rust 按当前壁纸调色板算出来,玻璃因此会"透"出当前壁纸的色。
@@ -1023,10 +891,13 @@ export component Panel inherits Window {
     // 点了别处"和 Esc 是一回事:这次改名作废。
     private property <int> rename-row: -1;
 
-    callback select-preset(int);
-    callback values-changed();
-    callback save-requested();
-    callback reset-requested();
+    // —— 壁纸库那一格的右键菜单:另一份状态,和会话菜单**分开** ——
+    // 两边共用一套坐标本来也行("同时只开一个"),但那样两处 `if` 会一起命中,
+    // 两个菜单叠在同一处画出来。分开存变量的代价只是两对坐标,换来的是不必推理"谁先关谁"。
+    private property <int> lib-menu-row: -1;
+    // 库菜单比会话菜单矮(只有两项),所以尺寸也分开存
+    private property <length> lib-menu-h: 93px;
+
     callback close-requested();
     callback drag-start();
     callback drag-move();
@@ -1050,8 +921,12 @@ export component Panel inherits Window {
     // 壁纸库:点了某一张 / 切进库页时想要一份最新的列表
     callback open-wallpaper(int);
     callback refresh-library();
+    // 壁纸库那一格的右键菜单:删掉第 `index` 张
+    callback delete-wallpaper(int);
+    // 把「现在桌面上那张壁纸」抬进来当作一张新的(生图之前先有东西可看)
+    callback adopt-wallpaper();
     // 设置页:保存模型配置(接口地址 / 模型名 / API Key / 深度思考那一档的下标)
-    callback save-ai-config(string, string, string, int);
+    callback save-ai-config(string, string, string, int, string, string, string);
 
     title: "MC 壁纸 · 控制面板";
     // 任务栏 / Alt-Tab 的窗口图标。`@image-url` 走的还是 build.rs 的 EmbedFiles,所以图标
@@ -1065,12 +940,6 @@ export component Panel inherits Window {
     background: ambient-c;
     default-font-family: "MCWP Sans";
     default-font-size: 14px;
-
-    changed param-a => { root.values-changed(); }
-    changed param-b => { root.values-changed(); }
-    changed param-c => { root.values-changed(); }
-    changed brightness => { root.values-changed(); }
-    changed motion => { root.values-changed(); }
 
     // 发消息:空输入不发(免得刷出一堆空气泡)
     function submit() {
@@ -1092,6 +961,17 @@ export component Panel inherits Window {
         root.menu-pinned = pinned;
         root.menu-x = max(8px, min(at-x, root.width - root.menu-w - 8px));
         root.menu-y = max(8px, min(at-y, root.height - root.menu-h - 8px));
+    }
+
+    // 库菜单的两个函数:和上面那对一一对应,只是换了行号变量和高度
+    function close-lib-menu() {
+        root.lib-menu-row = -1;
+    }
+
+    function open-lib-menu(row: int, at-x: length, at-y: length) {
+        root.lib-menu-row = row;
+        root.menu-x = max(8px, min(at-x, root.width - root.menu-w - 8px));
+        root.menu-y = max(8px, min(at-y, root.height - root.lib-menu-h - 8px));
     }
 
     // 收掉正在改名的那一行,不提交(改名只有回车算数)
@@ -1379,32 +1259,23 @@ export component Panel inherits Window {
 
                 // 底部三个入口:再点一次当前项就回到会话
                 NavRow {
-                    text: "壁纸参数";
+                    text: "壁纸库";
                     active: root.view == 1;
                     accent: root.accent;
                     picked => {
                         root.stop-rename();
                         root.view = root.view == 1 ? 0 : 1;
+                        // 切进库页时问一次:库目录被外面改过(手工删、拷别人的壁纸进来)也能跟上
+                        if (root.view == 1) { root.refresh-library(); }
                     }
                 }
                 NavRow {
-                    text: "壁纸库";
+                    text: "设置";
                     active: root.view == 2;
                     accent: root.accent;
                     picked => {
                         root.stop-rename();
                         root.view = root.view == 2 ? 0 : 2;
-                        // 切进库页时问一次:库目录被外面改过(手工删、拷别人的壁纸进来)也能跟上
-                        if (root.view == 2) { root.refresh-library(); }
-                    }
-                }
-                NavRow {
-                    text: "设置";
-                    active: root.view == 3;
-                    accent: root.accent;
-                    picked => {
-                        root.stop-rename();
-                        root.view = root.view == 3 ? 0 : 3;
                     }
                 }
             }
@@ -1422,7 +1293,7 @@ export component Panel inherits Window {
                     Text {
                         text: root.view == 0
                             ? root.session-title
-                            : (root.view == 1 ? "壁纸参数" : (root.view == 2 ? "壁纸库" : "设置"));
+                            : (root.view == 1 ? "壁纸库" : "设置");
                         color: Glass.label;
                         font-size: 17px;
                         vertical-alignment: center;
@@ -1439,7 +1310,7 @@ export component Panel inherits Window {
                         max-width: 280px;
                     }
                     if root.view == 1 : Text {
-                        text: "指纹 " + root.fingerprint;
+                        text: root.library.length + " 张";
                         color: Glass.label-3;
                         font-size: 11px;
                         vertical-alignment: center;
@@ -1549,77 +1420,8 @@ export component Panel inherits Window {
                     }
                 }
 
-                // —— 视图 1:壁纸参数(原来「壁纸」页的内容,原样搬过来)—— 
-                if root.view == 1 : HorizontalLayout {
-                    vertical-stretch: 1;
-                    spacing: 14px;
-
-                    VerticalLayout {
-                        width: 300px;
-                        spacing: 8px;
-
-                        Text {
-                            text: "场景预设";
-                            color: Glass.label-3;
-                            font-size: 11px;
-                            font-weight: 600;
-                            letter-spacing: 0.5px;
-                        }
-
-                        for preset[i] in root.presets : PresetRow {
-                            selected: i == root.current-preset;
-                            heading: preset.title;
-                            sub: preset.summary;
-                            accent: root.accent;
-
-                            picked => {
-                                root.current-preset = i;
-                                root.label-a = preset.label-a;
-                                root.label-b = preset.label-b;
-                                root.label-c = preset.label-c;
-                                root.param-a = preset.value-a;
-                                root.param-b = preset.value-b;
-                                root.param-c = preset.value-c;
-                                root.motion = preset.motion;
-                                root.preset-summary = preset.summary;
-                                root.select-preset(i);
-                            }
-                        }
-
-                        Rectangle { vertical-stretch: 1; }
-                    }
-
-                    Rectangle {
-                        horizontal-stretch: 1;
-                        border-radius: Glass.r-card;
-                        background: Glass.fill;
-
-                        VerticalLayout {
-                            padding: 14px;
-                            spacing: 2px;
-
-                            Text {
-                                text: "场景参数";
-                                color: Glass.label-3;
-                                font-size: 11px;
-                                font-weight: 600;
-                                letter-spacing: 0.5px;
-                            }
-
-                            GlassSlider { label: root.label-a; minimum: 0; maximum: 1; accent: root.accent; value <=> root.param-a; }
-                            GlassSlider { label: root.label-b; minimum: 0; maximum: 1; accent: root.accent; value <=> root.param-b; }
-                            GlassSlider { label: root.label-c; minimum: 0; maximum: 1; accent: root.accent; value <=> root.param-c; }
-
-                            Rectangle { height: 1px; background: Glass.hairline-dim; }
-
-                            GlassSlider { label: "桌面亮度"; minimum: 0.2; maximum: 1.6; accent: root.accent; value <=> root.brightness; }
-                            GlassSlider { label: "动势"; minimum: 0; maximum: 1; accent: root.accent; value <=> root.motion; }
-                        }
-                    }
-                }
-
-                // —— 视图 2:壁纸库(列表由壁纸侧扫库目录灌进来,点一张就切过去)—— 
-                if root.view == 2 : Rectangle {
+                // —— 视图 1:壁纸库(缩略图网格;数据由壁纸侧扫库目录灌进来)—— 
+                if root.view == 1 : Rectangle {
                     vertical-stretch: 1;
                     border-radius: Glass.r-card;
                     background: Glass.fill;
@@ -1628,73 +1430,116 @@ export component Panel inherits Window {
                         padding: 14px;
                         spacing: 10px;
 
-                        Text {
-                            text: "库里存着的每一张都在这里,点一张就切过去";
-                            color: Glass.label-3;
-                            font-size: 11px;
-                        }
-
-                        // 空态:一次都没存过时,教怎么存第一张
-                        if root.library.length == 0 : Rectangle {
-                            vertical-stretch: 1;
+                        HorizontalLayout {
+                            spacing: 10px;
+                            // 不写 alignment:说明文字撑开、按钮贴右边
 
                             Text {
-                                text: "库还是空的 —— 到「壁纸参数」里调好,点一下「存为壁纸」,这里就会多出一张。";
+                                text: "点一张就换上去;右键有更多";
                                 color: Glass.label-3;
-                                font-size: 12px;
-                                wrap: word-wrap;
-                                horizontal-alignment: center;
+                                font-size: 11px;
                                 vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+
+                            VerticalLayout {
+                                alignment: center;
+                                Pill {
+                                    text: "用当前壁纸";
+                                    accent: root.accent;
+                                    clicked => { root.adopt-wallpaper(); }
+                                }
                             }
                         }
 
-                        if root.library.length > 0 : Flickable {
+                        // 空态和网格**共用同一个** Flickable。
+                        //
+                        // 为什么不是"两个 `if` 分支各自撑一个元素":布局里两个都带 `vertical-stretch`
+                        // 的元素会把空白**各分一份**,实测结果是网格被压到卡片中部以下、头上空一大块
+                        // (而两个分支里真正渲染的只有一个)。只留一个撑开的元素,这件事就没得猜错。
+                        flick-lib := Flickable {
                             vertical-stretch: 1;
                             viewport-width: self.width;
-                            // 条目定高(54px)+ 10px 间距,内容高度直接算:比问布局要稳
-                            viewport-height: max(self.height, root.library.length * 64px - 10px);
+                            viewport-height: lib-grid.height;
 
-                            VerticalLayout {
-                                width: parent.width;
-                                spacing: 10px;
-                                alignment: start;
+                            // 4 列一行,**自己算坐标**而不是用 GridLayout:Slint 的 GridLayout
+                            // 不支持 `for`(`'if' or 'for' expressions are not currently supported
+                            // in grid layouts`),而列数要在运行期按库里的张数折行。
+                            //
+                            // 格子尺寸(168 × 116)在 LibraryCell 里写死,这里的间距也得跟它对齐:
+                            // 横向 178 = 168 + 10,纵向 126 = 116 + 10。
+                            lib-grid := Rectangle {
+                                width: flick-lib.viewport-width;
+                                // 行数 = ⌈张数 / 4⌉;最后一行不满也按一行算,所以先 +3 再整除。
+                                // 再和视口高度取大:一张都没有时行数是 0(算出来是负的),而空态那句
+                                // 说明要占满整个视口才谈得上居中。
+                                height: max(flick-lib.height, ((root.library.length + 3) / 4) * 126px - 10px);
 
-                                for item[i] in root.library : LibraryRow {
+                                // 空态:一张都没有时,说清楚第一张从哪儿来
+                                if root.library.length == 0 : Text {
+                                    x: 0;
+                                    y: 0;
+                                    width: parent.width;
+                                    height: parent.height;
+                                    text: "库还是空的 —— 在右边的对话里说一句想看到的样子,出图之后就会收到这里。";
+                                    color: Glass.label-3;
+                                    font-size: 12px;
+                                    wrap: word-wrap;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+
+                                for item[i] in root.library : LibraryCell {
+                                    x: Math.mod(i, 4) * 178px;
+                                    y: (i / 4) * 126px;
+                                    thumb: item.thumb;
                                     heading: item.title;
-                                    sub: item.hint;
-                                    meta: item.id;
-                                    accent: item.accent;
                                     selected: item.id == root.library-current;
+                                    accent: item.accent;
 
                                     picked => { root.open-wallpaper(i); }
+                                    menu-requested(x, y) => { root.open-lib-menu(i, x, y); }
                                 }
                             }
                         }
                     }
                 }
 
-                // —— 视图 3:设置 —— 
-                // 目前只有"模型"这一组(那是接生图那一环绕不开的东西);开机自启、省电策略后面再加。
-                if root.view == 3 : Rectangle {
+                // —— 视图 2:设置 —— 
+                // 分两组:**对话模型**(把一句话写成提示词)和**生图模型**(拿提示词出图)。
+                // 两组可以不是同一家,所以各留一套接口地址 / 模型名 / Key;生图那组留空就跟着
+                // 对话那组走(见 `mcwp_ai::ImagesConfig::load`)。
+                if root.view == 2 : Rectangle {
                     vertical-stretch: 1;
                     border-radius: Glass.r-card;
                     background: Glass.fill;
 
-                    VerticalLayout {
-                        padding: 18px;
+                    // 内容比卡片高是可预料的(两组各三行输入框),所以套一层 Flickable:
+                    // 软件渲染器下溢出的部分**不是裁掉而是直接不画**,不滚动的话下面几行会静默消失。
+                    set-flick := Flickable {
+                        x: 18px;
+                        y: 18px;
+                        width: parent.width - 36px;
+                        height: parent.height - 36px;
+                        viewport-width: self.width;
+                        viewport-height: set-col.preferred-height;
+
+                        set-col := VerticalLayout {
+                            width: set-flick.viewport-width;
                         spacing: 10px;
 
                         Text {
-                            text: "模型";
+                            text: "对话模型";
                             color: Glass.label;
                             font-size: 15px;
                             font-weight: 600;
                         }
                         Text {
-                            text: "填好点保存,写进 %APPDATA%\\MC壁纸\\ai.json;下次启动自动读回来。";
+                            text: "把你说的一句话写成一段给生图模型的提示词。填好点保存,写进 %APPDATA%\\MC壁纸\\ai.json;下次启动自动读回来。";
                             color: Glass.label-3;
                             font-size: 11px;
-                            overflow: elide;
+                            wrap: word-wrap;
                         }
 
                         FieldRow {
@@ -1735,6 +1580,39 @@ export component Panel inherits Window {
                             overflow: elide;
                         }
 
+                        Rectangle { height: 1px; background: Glass.hairline-dim; }
+
+                        Text {
+                            text: "生图模型";
+                            color: Glass.label;
+                            font-size: 15px;
+                            font-weight: 600;
+                        }
+                        Text {
+                            text: "拿上面那段提示词出图。留空就跟上面那组一样(同一家时只填上面就够)。";
+                            color: Glass.label-3;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        FieldRow {
+                            label: "生图地址";
+                            placeholder: "留空 = 跟上面的接口地址一样";
+                            value <=> root.ai-image-base-url;
+                            accent: root.accent;
+                        }
+                        FieldRow {
+                            label: "生图模型名";
+                            placeholder: "cogview-3-flash";
+                            value <=> root.ai-image-model;
+                            accent: root.accent;
+                        }
+                        FieldRow {
+                            label: "生图 Key";
+                            placeholder: "留空 = 跟上面的 API Key 一样";
+                            value <=> root.ai-image-key;
+                            accent: root.accent;
+                        }
+
                         HorizontalLayout {
                             spacing: 10px;
                             // 胶囊按钮在横向布局里会贴着上沿,套一层竖直居中的布局才不歪
@@ -1749,15 +1627,17 @@ export component Panel inherits Window {
                                             root.ai-base-url,
                                             root.ai-model,
                                             root.ai-key,
-                                            root.ai-thinking
+                                            root.ai-thinking,
+                                            root.ai-image-base-url,
+                                            root.ai-image-model,
+                                            root.ai-image-key
                                         );
                                     }
                                 }
                             }
                             Rectangle { horizontal-stretch: 1; }
                         }
-
-                        Rectangle { vertical-stretch: 1; }
+                        }
                     }
                 }
 
@@ -1852,25 +1732,6 @@ export component Panel inherits Window {
                     }
                 }
 
-                if root.view == 1 : HorizontalLayout {
-                    height: 34px;
-                    spacing: 10px;
-                    // 不写 alignment:两个按钮贴左边,说明文字贴右边
-
-                    Pill { text: "存为壁纸"; primary: true; accent: root.accent; clicked => { root.save-requested(); } }
-                    Pill { text: "恢复默认"; accent: root.accent; clicked => { root.reset-requested(); } }
-
-                    Rectangle { horizontal-stretch: 1; }
-
-                    Text {
-                        text: root.preset-summary;
-                        color: Glass.label-3;
-                        font-size: 11px;
-                        vertical-alignment: center;
-                        overflow: elide;
-                        max-width: 320px;
-                    }
-                }
             }
         }
     }
@@ -1914,6 +1775,33 @@ export component Panel inherits Window {
             delete-picked => {
                 root.delete-conversation(root.menu-row);
                 root.close-menu();
+            }
+        }
+    }
+
+    // 壁纸库那一格的右键菜单浮层。和会话菜单同一个规矩:最后声明 = 盖在所有东西之上。
+    if root.lib-menu-row >= 0 : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+
+        dismiss-lib := TouchArea {
+            clicked => { root.close-lib-menu(); }
+        }
+
+        LibraryMenu {
+            x: root.menu-x;
+            y: root.menu-y;
+            plate: root.caption-plate.brighter(0.06);
+
+            apply-picked => {
+                root.open-wallpaper(root.lib-menu-row);
+                root.close-lib-menu();
+            }
+            delete-picked => {
+                root.delete-wallpaper(root.lib-menu-row);
+                root.close-lib-menu();
             }
         }
     }

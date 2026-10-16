@@ -2473,6 +2473,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcwp-image"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "image",
+ "tracing",
+]
+
+[[package]]
 name = "mcwp-platform"
 version = "0.1.0"
 dependencies = [
@@ -2522,6 +2531,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "mcwp-ai",
+ "mcwp-image",
  "mcwp-platform",
  "mcwp-render",
  "mcwp-spec",

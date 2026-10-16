@@ -1,31 +1,35 @@
-//! MC 壁纸 · 对话 → 「壁纸规格」的模型客户端(OpenAI 兼容接口)。
+//! MC 壁纸 · 对话 → 生图提示词 → 图片的模型客户端(OpenAI 兼容接口)。
 //!
-//! 方案 3.1 定的路子是**不让模型画图**:模型只输出一份 `WallpaperSpec` JSON,本地着色器毫秒级
-//! 渲染。这个 crate 就干这一件事 —— 一次调用、严格 JSON、失败了本地降级。
+//! 一路上有**两次调用**,分属两家(可以是同一把 key、同一家服务商):
+//! 1. [`Client::plan_photo`]:用户一句话 → 一句**给生图模型的提示词** + 一套动效配方。
+//!    这一步是文本模型干的,正是它擅长、而生图模型完全不会的事(见 `PhotoDraft` 的说明)。
+//! 2. [`Images::generate`]:那句提示词 → 一张图的字节。
+//!
+//! 上一代那条路(模型输出一份 `WallpaperSpec` JSON、本地着色器现算画面)已经随**预设清零**退休:
+//! 那是"用文字填参数",而现在要的是"直接生成一张图"。留下这份说明,是因为下面好几处选择
+//! (超时、`response_format`、`thinking`)是在那条路上踩出来的,换路之后依然成立。
 //!
 //! 几个刻意的选择:
-//! - **一次调用,不搞"提示词智能体"**:参数空间已经被 4 个预设和取值范围锁死,"设计提示词"在这个
-//!   环节里等价于"填参数",再套一层只会把成本、延迟、失败点全翻倍。真需要两步(生成 → 自评 →
-//!   改提示词)是位图那条路的事,而且也得等 A 档跑通、发现效果不够之后再上。
-//! - **形状走样就地修,不靠重试**:小模型会把单元素数组写成裸字符串(实测 glm-4-flash 的
-//!   `"keywords": "雨夜城市"`),而"把错误丢回去让它重写"它照抄原样、白等 7 秒。所以解析前先按
-//!   已知的几种走样修一遍(`repair_shape`),一次往返省下来。
-//! - **绝不返回 Err 给用户**:`draft()` 要么给出模型的结果,要么给出本地降级(方案 3.4 的 L1),
-//!   调用方拿到的永远是一份能渲染的 spec。用户敲了字,桌面总得有反应,不能弹个错误框了事。
+//! - **第 1 步失败不致命**:`plan_photo()` 绝不返回 Err —— 模型答不上来就退化成"拿用户原话去画"
+//!   (见 `fallback_image_prompt`)。用户敲了字,桌面总得有反应,不能弹个错误框了事。
+//! - **只有第 2 步会失败**:生图接口真的挂了才会报错,那时由调用方决定怎么跟用户交代。
+//! - **一句提示词就该是干净的**:模型偶尔把 `motion` 写成裸字符串而不是对象,解析时就地认下来
+//!   (不重试 —— 实测把错误丢回去它会照抄原样,白等一轮)。
 //! - **超时 45 s**:方案里那句"LLM 超时默认 3 s"是给 T1 环境联动用的;这里是用户敲完字等结果的
 //!   T3/T2,3 s 太紧(中文长回复常态 5~15 s)。调用跑在后台线程 + 面板显示"生成中…",等得起。
+//!   生图那一侧更慢(选图那一次要十几秒),所以 `Images` 用**180 s** 超时。
 //! - **不传 `response_format: json_object`**:各家的兼容实现对这个字段态度不一(有的直接 400),
 //!   提示词里已经写死"只输出 JSON",再加一道本地提取,比赌服务商实现稳。
 //! - **`thinking` 只在配置里显式写了才发**:智谱 GLM-4.7 系列默认开深度思考,一句"换张壁纸"也要先
 //!   想十几秒;可这个字段别家不认(理由同 `response_format`)。所以做成可选 —— `ai.json` 里写了
 //!   `"thinking": false` 才带上 `{"type":"disabled"}`,不写就完全不出现在请求体里。
-//! - `image_prompt` 是**给以后留的钩子**:3.2 的 B 档(文生图 + 2.5D)要用,现在只落日志。
+//! - **生图返回的 URL 当场下载**:智谱那些地址只有 7 天有效期,只存 URL 等于存了个会过期的壁纸。
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use mcwp_spec::{Preset, Source, WallpaperSpec};
+use mcwp_spec::{MotionKind, MotionRecipe, Photo};
 use serde::{Deserialize, Serialize};
 use ureq::tls::{TlsConfig, TlsProvider};
 
@@ -40,38 +44,58 @@ pub const DEFAULT_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
 /// 想换过去记得同时配 `"thinking": false`,不然一句话要等十几秒。
 pub const DEFAULT_MODEL: &str = "glm-4-flash-250414";
 
+/// 默认生图服务商。还是智谱、还是同一把 key —— 它的免费档 `cogview-3-flash` 实测能出图
+/// (9~16 s 一张,100~230 KB),所以我们不额外引入第二家。
+///
+/// 免费档的代价是**右下角有"AI生成"水印**(约占宽 9% × 高 5%)。这不影响使用:
+/// 壁纸本来就按 cover 裁,把 UV 往左上挪一点点就把它推出画面了(见 `mcwp-render/src/photo.wgsl`)。
+/// 要彻底没水印就换一家(硅基流动的 Kolors / FLUX.1-schnell 也免费),所以这里必须是配置项。
+pub const DEFAULT_IMAGE_BASE_URL: &str = DEFAULT_BASE_URL;
+
+/// 默认生图模型。`cogview-3-flash` 是智谱的免费档 —— 想换 `cogview-3` / `cogview-4` 直接改配置。
+pub const DEFAULT_IMAGE_MODEL: &str = "cogview-3-flash";
+
+/// 生图接口对尺寸的硬要求(智谱 CogView 实测):宽高都得是 **16 的整数倍**、各自落在
+/// 512~2880,且总像素不超过 2²¹。
+///
+/// 最容易踩的是第一条 —— `1920×1080` 会被**直接拒绝**,因为 1080/16 = 67.5。
+/// 1080p 屏得请求 `1920×1088` 再由渲染器按 cover 裁掉那 8 个像素。
+const SIZE_MIN: u32 = 512;
+const SIZE_MAX: u32 = 2880;
+const SIZE_PIXEL_MAX: u64 = 1 << 21;
+
+/// 提示词最长多少字。太长的提示词对 `cogview` 那种小模型是负担,反而容易画糊。
+const MAX_IMAGE_PROMPT_CHARS: usize = 400;
+
 /// 请求超时(见文件头说明)。
 const TIMEOUT: Duration = Duration::from_secs(45);
 
 /// 模型回复里能塞给用户看的最大字符数,免得某家模型话痨把面板撑爆。
 const MAX_REPLY_CHARS: usize = 120;
 
-/// 走一次:模型给的这份规格 + 一句回复 + 它顺手写的画面描述。
-pub struct Draft {
+/// 生图这条路的第一跳:用户一句话 → 一句**给文生图模型的提示词** + 一套动效配方。
+///
+/// 为什么不把用户原话直接丢给生图模型 —— 那正是这个结构存在的理由:
+/// - **两边的语言不一样**。用户说的是"我想要个安静点的桌面",生图模型要听的是
+///   "清晨薄雾的湖面,远景雪山,柔和的冷蓝调,开阔构图,高清数字插画"。
+///   这中间的翻译,正是文本模型擅长的、而生图模型完全不会的那一步。
+/// - **动效是本地的事,生图模型不知道**。雪景该配落雪、湖面该配水波 —— 这个判断需要
+///   先理解需求,再"看"一眼自己写的画面描述,只能由写提示词的那一方顺手给出。
+/// - 这条路上**多花的那一次调用是值的**:它换来的是一张构图稳定的图,而不是一张
+///   靠运气、还得反复重生的图(生图一次 9~16 s,重试成本比一次文本调用高得多)。
+pub struct PhotoDraft {
     /// 说给用户听的一句话
     pub reply: String,
-    /// 可以直接渲染的规格(越界值已经在 `normalize()` 里夹紧)
-    pub spec: WallpaperSpec,
-    /// 画面描述,给以后接文生图用(现在只落日志)
+    /// 这张壁纸的短标题
+    pub title: String,
+    /// 真正发给生图模型的提示词
     pub image_prompt: String,
-    /// 用户的意图:只调参数,还是要一张新的
-    pub mode: Mode,
-    /// 是不是走了本地降级(模型没答上来)。面板拿它决定要不要跟一句"这次是内置预设顶的"。
+    /// 出图之后怎么动
+    pub motion: MotionRecipe,
+    /// 走了本地降级(模型没答上来,提示词是拿用户原话拼的)
     pub degraded: bool,
-    /// 实际发出去的请求次数(降级路径可以是 1;没配 key 时是 0)
+    /// 实际发出去的请求次数
     pub calls: u32,
-}
-
-/// 用户的意图。方案 3.5 把"聊一句就换壁纸"拆成了 T2(指令)和 T3(显式创作):
-/// T2 只改参数、不进壁纸库,T3 才是新壁纸 + 入库。这一区分交给模型判断最省事。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Mode {
-    /// "暗一点""别动那么快" —— 只改当前 spec 的参数
-    Tweak,
-    /// "换一张""我要赛博朋克" —— 新壁纸,该入壁纸库
-    #[default]
-    Create,
 }
 
 /// 一份**能直接用**的配置(缺哪个字段都已经填上默认值),`Client::new` 收的就是它。
@@ -104,6 +128,14 @@ pub struct Stored {
     /// 见文件头:只在设置页里显式勾了才写出来(`None` 连字段都不落),免得把别家 400 掉。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<bool>,
+    /// 生图单独一套配置,留空就**跟对话那套共用**(智谱一把 key 管两个接口)。
+    /// 做成独立字段是为了"对话用 A 家、生图用 B 家"这种真实需求 —— 免费额度各花各的。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub image_base_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub image_model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub image_api_key: String,
 }
 
 impl Config {
@@ -153,6 +185,12 @@ impl Config {
         if file.model.trim().is_empty() {
             file.model = DEFAULT_MODEL.to_string();
         }
+        if file.image_base_url.trim().is_empty() {
+            file.image_base_url = DEFAULT_IMAGE_BASE_URL.to_string();
+        }
+        if file.image_model.trim().is_empty() {
+            file.image_model = DEFAULT_IMAGE_MODEL.to_string();
+        }
         file
     }
 
@@ -181,6 +219,9 @@ impl Config {
             "MCWP_AI_BASE_URL",
             "MCWP_AI_MODEL",
             "MCWP_AI_THINKING",
+            "MCWP_IMAGE_KEY",
+            "MCWP_IMAGE_BASE_URL",
+            "MCWP_IMAGE_MODEL",
         ]
         .iter()
         .any(|key| std::env::var(key).is_ok_and(|value| !value.trim().is_empty()))
@@ -203,6 +244,220 @@ impl Config {
              临时试一家也可以只设环境变量 MCWP_AI_KEY / MCWP_AI_BASE_URL / MCWP_AI_MODEL / MCWP_AI_THINKING。"
         )
     }
+}
+
+/// 生图那条路缺 key 时给人话。
+///
+/// 单独写一条而不是复用 `missing_key_hint`,是因为**这里多数时候不是"没配",而是配错了地方**:
+/// 用户看着对话能聊天、以为配置好了,结果是 `api_key` 空白(靠 `MCWP_AI_KEY` 环境变量跑着)。
+fn missing_image_key_hint() -> String {
+    let path = config_file()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "%APPDATA%\\MC壁纸\\ai.json".to_string());
+    format!(
+        "还没配生图。在面板「设置」里填密钥即可,或者写进 {path}:\n\
+         {{\"base_url\": \"{DEFAULT_BASE_URL}\", \"model\": \"{DEFAULT_MODEL}\", \
+         \"api_key\": \"你的key\", \"image_model\": \"{DEFAULT_IMAGE_MODEL}\"}}\n\
+         生图默认**跟对话共用同一把 key**(智谱一把 key 管两个接口),想分开就再填 \
+         image_base_url / image_model / image_api_key。\n\
+         临时试一家也可以只设环境变量 MCWP_IMAGE_KEY / MCWP_IMAGE_BASE_URL / MCWP_IMAGE_MODEL。"
+    )
+}
+
+/// 生图那一套配置。缺哪个字段都已经填上默认值。
+///
+/// 优先级和对话那边一样:**环境变量 > `ai.json` 的 image_* 字段 > `ai.json` 的对话字段 > 内置默认**。
+/// 中间那两层是刻意的 —— 只配了对话、没碰生图的话,生图自动跟着走,不用把同一个 key 填两遍。
+#[derive(Debug, Clone)]
+pub struct ImagesConfig {
+    pub base_url: String,
+    pub model: String,
+    pub api_key: String,
+}
+
+impl ImagesConfig {
+    pub fn load() -> Result<Self> {
+        let raw = read_stored().unwrap_or_default();
+        let env = |key: &str| {
+            std::env::var(key)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        };
+        let base_url = env("MCWP_IMAGE_BASE_URL")
+            .or_else(|| non_empty(&raw.image_base_url))
+            .or_else(|| non_empty(&raw.base_url))
+            .unwrap_or_else(|| DEFAULT_IMAGE_BASE_URL.to_string());
+        let model = env("MCWP_IMAGE_MODEL")
+            .or_else(|| non_empty(&raw.image_model))
+            .unwrap_or_else(|| DEFAULT_IMAGE_MODEL.to_string());
+        let Some(api_key) = env("MCWP_IMAGE_KEY")
+            .or_else(|| non_empty(&raw.image_api_key))
+            .or_else(|| env("MCWP_AI_KEY"))
+            .or_else(|| non_empty(&raw.api_key))
+        else {
+            return Err(anyhow!("{}", missing_image_key_hint()));
+        };
+        Ok(Self {
+            base_url,
+            model,
+            api_key,
+        })
+    }
+}
+
+/// 生图接口的客户端。
+///
+/// 和 `Client`(对话)分开,而不是给 `Client` 加一个方法,有三个实打实的理由:
+/// - **超时差一个数量级**。对话 45 s 已经算宽裕,生图 9~16 s 是常态、排队时能到一分钟,
+///   再叠加一次"下载图片",用同一个 agent 要么把对话拖成龟速、要么把生图掐在半路。
+/// - **地址不同**。对话打 `/chat/completions`,生图打 `/images/generations`,
+///   配置也各自独立(见 `ImagesConfig`)。
+/// - 这两件事**失败的意义也不同**:对话失败降级成"我记下了",生图失败是"没画出图",
+///   面板要给的提示完全不一样,混在一起只会让两边的错误处理都变糊。
+#[derive(Clone)]
+pub struct Images {
+    cfg: ImagesConfig,
+    agent: ureq::Agent,
+}
+
+/// 一次生图的产物。
+///
+/// 同时带 URL 和字节,是因为**两个都要用**:字节拿去解码 / 当纹理,URL 留给"图生视频"
+/// (那个接口要的是 `image_url` 而不是上传文件,见方案里的 L2)。
+pub struct GeneratedImage {
+    pub url: String,
+    pub bytes: Vec<u8>,
+}
+
+impl Images {
+    pub fn new(cfg: ImagesConfig) -> Self {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            // 生图的等待时间比对话长得多(实测 9~16 s,高峰期更久),所以给到 3 分钟
+            .timeout_global(Some(Duration::from_secs(180)))
+            .http_status_as_error(false)
+            // 理由同 `Client::new`:不显式挑 native-tls,ureq 会在 https 上直接 panic
+            .tls_config(
+                TlsConfig::builder()
+                    .provider(TlsProvider::NativeTls)
+                    .build(),
+            )
+            .build()
+            .into();
+        Self { cfg, agent }
+    }
+
+    /// 给人看的服务商 / 模型标识,写进日志和状态行。
+    pub fn describe(&self) -> String {
+        let host = self
+            .cfg
+            .base_url
+            .split("//")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or(&self.cfg.base_url);
+        format!("{host} · {}", self.cfg.model)
+    }
+
+    /// `base_url` 后面补 `/images/generations`。写成完整 endpoint 也认。
+    fn endpoint(&self) -> String {
+        let base = self.cfg.base_url.trim_end_matches('/');
+        if base.ends_with("/images/generations") {
+            base.to_string()
+        } else {
+            format!("{base}/images/generations")
+        }
+    }
+
+    /// 出一张图:提交生成任务 → 拿到图片 URL → **当场把图下下来**。
+    ///
+    /// 为什么要立刻下载而不是把 URL 存起来慢慢取:智谱返回的图片 URL **7 天就失效**,
+    /// 而壁纸是要长期留着的。存 URL = 存一个七天后的死链。
+    pub fn generate(&self, prompt: &str, width: u32, height: u32) -> Result<GeneratedImage> {
+        let (width, height) = fit_size(width, height);
+        let body = serde_json::to_string(&ImageRequest {
+            model: self.cfg.model.as_str(),
+            prompt,
+            size: format!("{width}x{height}"),
+        })?;
+        let mut response = self
+            .agent
+            .post(&self.endpoint())
+            .header("Content-Type", "application/json")
+            .header("Authorization", &format!("Bearer {}", self.cfg.api_key))
+            .send(body.as_str())
+            .map_err(|err| anyhow!("请求生图失败:{err}"))?;
+        let status = response.status();
+        let raw = response.body_mut().read_to_string().context("读生图响应失败")?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "生图接口返回 {}:{}",
+                status.as_u16(),
+                truncate(&raw, 300)
+            ));
+        }
+        let parsed: ImageResponse = serde_json::from_str(&raw)
+            .with_context(|| format!("生图响应没有 data[].url:{}", truncate(&raw, 200)))?;
+        let url = parsed
+            .data
+            .into_iter()
+            .map(|entry| entry.url)
+            .find(|url| !url.trim().is_empty())
+            .ok_or_else(|| anyhow!("生图接口说成功了,但没给图片地址"))?;
+        let bytes = self.download(&url)?;
+        tracing::info!(
+            "生图完成:{}×{} · {} KB · {}",
+            width,
+            height,
+            bytes.len() / 1024,
+            truncate(prompt, 60)
+        );
+        Ok(GeneratedImage { url, bytes })
+    }
+
+    /// 把图片 URL 抓成字节。走同一个 agent(超时和 TLS 配置都现成)。
+    fn download(&self, url: &str) -> Result<Vec<u8>> {
+        let mut response = self
+            .agent
+            .get(url)
+            .call()
+            .map_err(|err| anyhow!("下载图片失败:{err}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow!("下载图片返回 {}:{}", status.as_u16(), url));
+        }
+        let bytes = response
+            .body_mut()
+            .read_to_vec()
+            .context("读图片字节失败")?;
+        if bytes.is_empty() {
+            return Err(anyhow!("下载到的图片是空的:{}", truncate(url, 120)));
+        }
+        Ok(bytes)
+    }
+}
+
+/// 把"屏幕分辨率"折成服务商能接受的尺寸(规则见 `SIZE_MIN` 那段)。
+///
+/// 步骤:等比缩到总像素上限内 → 夹到 512~2880 → 四舍五入到 16 的倍数 → 再保一次总像素。
+/// 最后那一步不是多余:`2880×2880` = 829 万像素 > 2²¹,贴到上界时确实会超。
+pub fn fit_size(width: u32, height: u32) -> (u32, u32) {
+    let mut width = width.max(1).min(SIZE_MAX);
+    let mut height = height.max(1).min(SIZE_MAX);
+    let pixels = width as u64 * height as u64;
+    if pixels > SIZE_PIXEL_MAX {
+        let scale = (SIZE_PIXEL_MAX as f64 / pixels as f64).sqrt();
+        width = ((width as f64 * scale) as u32).max(1);
+        height = ((height as f64 * scale) as u32).max(1);
+    }
+    // 四舍五入而不是向下取整:1080 → 1088(而不是 1072),少裁一点是一点
+    let snap = |value: u32| -> u32 { ((value + 8) / 16 * 16).clamp(SIZE_MIN, SIZE_MAX) };
+    width = snap(width);
+    height = snap(height);
+    while width as u64 * height as u64 > SIZE_PIXEL_MAX && width > SIZE_MIN {
+        width = snap(width - 16);
+        height = snap(height - 16);
+    }
+    (width, height)
 }
 
 /// 会话用的客户端。`clone` 很便宜(Agent 内部是共享的),发请求时丢给后台线程就行。
@@ -259,16 +514,16 @@ impl Client {
         }
     }
 
-    /// 把一句话翻译成一份壁纸规格。**不会返回 Err**:失败就是本地降级。
-    pub fn draft(&self, request: &str, current: &WallpaperSpec) -> Draft {
+    /// 生图这条路的第一跳:一句话 → 生图提示词 + 动效配方。**同样不会返回 Err** ——
+    /// 模型不争气时,退化成"拿用户原话去画",这条路必须走得通,否则用户敲了字什么都没发生。
+    pub fn plan_photo(&self, request: &str, current: Option<&Photo>) -> PhotoDraft {
         let mut messages = vec![
-            Message::system(system_prompt()),
-            Message::user(first_prompt(request, current)),
+            Message::system(PHOTO_SYSTEM_PROMPT.to_string()),
+            Message::user(photo_request(request, current)),
         ];
         let mut calls = 0;
         let mut last_error = String::new();
 
-        // 两次机会:第一次读不懂,把错误原样丢回去让它重写一遍 —— 比本地"猜着修 JSON"靠谱。
         for attempt in 0..2 {
             calls += 1;
             let text = match self.chat(&messages) {
@@ -279,23 +534,20 @@ impl Client {
                     break;
                 }
             };
-            match parse_reply(&text, request) {
-                Ok(parsed) => {
+            match parse_photo_reply(&text) {
+                Ok(plan) => {
                     tracing::info!(
-                        "模型给的规格:{} | 预设={} | 指纹={} | 第 {} 次调用",
-                        parsed.spec.title,
-                        parsed.spec.preset().id(),
-                        parsed.spec.spec_hash(),
-                        attempt + 1
+                        "生图计划:{}({})| 动效={} | 提示词={}",
+                        plan.title,
+                        if plan.reply.is_empty() { "无回复" } else { &plan.reply },
+                        plan.motion.summary(),
+                        truncate(&plan.image_prompt, 80)
                     );
-                    if !parsed.image_prompt.is_empty() {
-                        tracing::info!("画面描述(留给以后的文生图):{}", parsed.image_prompt);
-                    }
-                    return Draft {
-                        reply: parsed.reply,
-                        spec: parsed.spec,
-                        image_prompt: parsed.image_prompt,
-                        mode: parsed.mode,
+                    return PhotoDraft {
+                        reply: plan.reply,
+                        title: plan.title,
+                        image_prompt: plan.image_prompt,
+                        motion: plan.motion,
                         degraded: false,
                         calls,
                     };
@@ -303,7 +555,7 @@ impl Client {
                 Err(err) => {
                     last_error = format!("{err:#}");
                     tracing::warn!(
-                        "模型这次给的 JSON 用不了(第 {} 次):{last_error}",
+                        "模型这次给的生图计划用不了(第 {} 次):{last_error}",
                         attempt + 1
                     );
                     messages.push(Message::assistant(text));
@@ -315,15 +567,15 @@ impl Client {
             }
         }
 
-        tracing::warn!("模型这条路没走通({last_error}),改用本地降级");
-        Draft {
+        tracing::warn!("生图提示词这条路没走通({last_error}),直接用用户原话出图");
+        PhotoDraft {
             reply: format!(
-                "模型没接上({}),先按内置预设给你换了一张。",
+                "模型没接上({}),先用你的原话去画一张。",
                 friendly_reason(&last_error)
             ),
-            spec: fallback_spec(request, current),
-            image_prompt: String::new(),
-            mode: Mode::Create,
+            title: mcwp_spec::photo::title_from_prompt(request),
+            image_prompt: fallback_image_prompt(request),
+            motion: MotionRecipe::default(),
             degraded: true,
             calls,
         }
@@ -371,206 +623,13 @@ impl Client {
     }
 }
 
-/// 解析模型那段文本,拆出 spec 与回复。
-fn parse_reply(text: &str, request: &str) -> Result<Parsed> {
-    let json = extract_json(text)?;
-    let answer: ModelReply = serde_json::from_str(json).context("不是约定的 JSON 结构")?;
-    // 模型有没有自己起名:`normalize()` 会把空标题补成预设名,但那对用户太没信息量了,
-    // 所以先记下"它到底写没写",空的就用用户那句话来命名。
-    let had_title = answer
-        .spec
-        .get("title")
-        .and_then(|value| value.as_str())
-        .is_some_and(|title| !title.trim().is_empty());
-    // 形状走样先修好再解析(见 `repair_shape`):实测这一条能把"重试也救不回来"的失败直接消化掉
-    let mut spec_value = answer.spec;
-    let repaired = repair_shape(&mut spec_value);
-    if !repaired.is_empty() {
-        tracing::info!("模型的 JSON 有形状走样,已就地修好:{}", repaired.join(" / "));
-    }
-    let mut spec: WallpaperSpec =
-        serde_json::from_value(spec_value).context("spec 字段不是一个合法的壁纸规格")?;
-    // 出处是"对话",库那边另说(`save_to_library` 会归一成快照)
-    spec.source = Source::Conversation;
-    // 越界的数值、缺的参数、多出来的键,全在这里被拉回合法范围
-    spec.normalize();
-    if !had_title {
-        spec.title = title_from(request);
-    }
-    if spec.id.trim().is_empty() {
-        spec.id = spec.spec_hash();
-    }
-    let reply = if answer.reply.trim().is_empty() {
-        format!("已换成「{}」。", spec.title)
-    } else {
-        truncate(answer.reply.trim(), MAX_REPLY_CHARS)
-    };
-    Ok(Parsed {
-        reply,
-        spec,
-        image_prompt: answer.image_prompt.unwrap_or_default().trim().to_string(),
-        mode: answer.mode,
-    })
-}
-
-struct Parsed {
-    reply: String,
-    spec: WallpaperSpec,
-    image_prompt: String,
-    mode: Mode,
-}
-
-/// 把模型常见的**形状走样**就地修回契约要的样子,返回修了哪几处(空 = 一处没动)。
-///
-/// 为什么值得单独修一次形状:小模型会把**单元素数组写成裸字符串** —— 实测 glm-4-flash 给
-/// 整份 spec 只有 `"keywords": "雨夜城市"` 这一处不对,别的字段一字不差,但契约要的是数组,
-/// `from_value` 直接报 `invalid type: string, expected a sequence`。而**重试救不了它**:把错误原样
-/// 丢回去让它重写一遍,它照抄原来那份(实测两次一模一样),白等 7 秒。所以先修形状再解析 —— 这次
-/// 往返省下来,而且改法完全确定,不是"猜着修 JSON"。
-///
-/// 只认**已经踩过**的这几种走样,不做通用容错:类型对不上的地方越多,说明模型越离谱,那该让它
-/// 重写、或者干脆降级,而不是本地越修越歪,把它的胡话修成一份看着正常的壁纸。
-fn repair_shape(spec: &mut serde_json::Value) -> Vec<String> {
-    let mut fixed = Vec::new();
-    let Some(map) = spec.as_object_mut() else {
-        return fixed;
-    };
-
-    // ① 单元素数组写成裸字符串
-    for key in ["keywords", "palette"] {
-        let text = match map.get(key) {
-            Some(serde_json::Value::String(text)) => text.clone(),
-            _ => continue,
-        };
-        let items = split_items(&text)
-            .into_iter()
-            .map(serde_json::Value::String)
-            .collect();
-        map.insert(key.to_string(), serde_json::Value::Array(items));
-        fixed.push(format!("{key}:字符串→数组"));
-    }
-
-    // ② 单个元素对象写成裸对象(elements 只有一项时容易这样)
-    if map.get("elements").is_some_and(|value| value.is_object()) {
-        if let Some(one) = map.remove("elements") {
-            map.insert("elements".to_string(), serde_json::Value::Array(vec![one]));
-            fixed.push("elements:对象→数组".to_string());
-        }
-    }
-
-    // ③ 数字写成字符串
-    numberify(map, "seed", &mut fixed);
-    if let Some(child) = map.get_mut("mood").and_then(serde_json::Value::as_object_mut) {
-        for key in ["calm", "focus", "energy"] {
-            numberify(child, key, &mut fixed);
-        }
-    }
-    if let Some(child) = map.get_mut("motion").and_then(serde_json::Value::as_object_mut) {
-        for key in ["intensity", "speed"] {
-            numberify(child, key, &mut fixed);
-        }
-    }
-    if let Some(child) = map
-        .get_mut("lighting")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        numberify(child, "keyLight", &mut fixed);
-        boolify(child, "followDesktopBrightness", &mut fixed);
-    }
-    if let Some(child) = map
-        .get_mut("overlay")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        boolify(child, "clock", &mut fixed);
-    }
-    // scene.params 整张表都是数,一个字符串值都不该有
-    let params = map
-        .get_mut("scene")
-        .and_then(|scene| scene.get_mut("params"))
-        .and_then(serde_json::Value::as_object_mut);
-    if let Some(params) = params {
-        let mut count = 0;
-        for value in params.values_mut() {
-            if let serde_json::Value::String(text) = value {
-                if let Some(number) = number_value(text) {
-                    *value = number;
-                    count += 1;
-                }
-            }
-        }
-        if count > 0 {
-            fixed.push(format!("scene.params:{count} 个字符串→数字"));
-        }
-    }
-
-    fixed
-}
-
-/// `"雨夜城市"` → `["雨夜城市"]`;顺便把挤成一行的多项拆开 —— 关键词那栏偶尔会把 2~5 个词写成
-/// 一个字符串(`"雨、夜、冷蓝"`),调色板也可能被写成 `"#0B1020, #1B2A4A, …"`,拆开才算真修好。
-fn split_items(text: &str) -> Vec<String> {
-    text.split(|c: char| c.is_whitespace() || matches!(c, ',' | '，' | '、' | ';' | '；'))
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-/// 把 `map[key]` 从字符串数字改成真数字(`"0.45"` → `0.45`);不是这回事就原样留着,交给后面的
-/// 报错路径去说。
-fn numberify(
-    map: &mut serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    fixed: &mut Vec<String>,
-) {
-    let Some(serde_json::Value::String(text)) = map.get(key) else {
-        return;
-    };
-    let Some(value) = number_value(text) else {
-        return;
-    };
-    map.insert(key.to_string(), value);
-    fixed.push(format!("{key}:字符串→数字"));
-}
-
-/// `"0.45"` → `0.45`,`"20261014"` → `20261014`(**整数**)。
-///
-/// 整数必须落成整数:`seed` 是 `u32`,给它塞个 `20261014.0` 进去,serde 会报
-/// `invalid type: floating point, expected u32` —— 修形状反而修出个新错(单测逮到的)。
-fn number_value(text: &str) -> Option<serde_json::Value> {
-    let number = text.trim().parse::<f64>().ok()?;
-    if number.fract() == 0.0 && number.abs() <= i64::MAX as f64 {
-        return Some(serde_json::Value::Number(serde_json::Number::from(
-            number as i64,
-        )));
-    }
-    Some(serde_json::Value::Number(serde_json::Number::from_f64(
-        number,
-    )?))
-}
-
-/// 同上,管 `"true"` / `"false"` 这种写成字符串的布尔。
-fn boolify(
-    map: &mut serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    fixed: &mut Vec<String>,
-) {
-    let Some(serde_json::Value::String(text)) = map.get(key) else {
-        return;
-    };
-    let value = match text.trim().to_ascii_lowercase().as_str() {
-        "true" => true,
-        "false" => false,
-        _ => return,
-    };
-    map.insert(key.to_string(), serde_json::Value::Bool(value));
-    fixed.push(format!("{key}:字符串→布尔"));
-}
-
 /// 从模型那段文本里抠出 JSON 对象。
 ///
 /// 提示词里写了"不要代码块",但免费模型经常还是裹一层 ```json —— 所以先拆围栏,再按
 /// **第一个 `{` 到最后一个 `}`** 截:前后那句"好的,这是你要的规格:"也就一起被剥掉了。
+///
+/// 这条路对**提示词那一步**是必须的:模型的 `motion` 字段偶尔会写成裸字符串,
+/// 整份 JSON 仍然是好的,所以"能抠出一个对象"就已经成功了一半。
 fn extract_json(text: &str) -> Result<&str> {
     let start = text.find('{').ok_or_else(|| anyhow!("回复里没有 JSON"))?;
     let end = text.rfind('}').ok_or_else(|| anyhow!("JSON 没有闭合"))?;
@@ -578,104 +637,6 @@ fn extract_json(text: &str) -> Result<&str> {
         return Err(anyhow!("JSON 结构不完整"));
     }
     Ok(&text[start..=end])
-}
-
-/// 本地降级:关键词挑预设 + 情绪词调参数(方案 3.4 的 L1/L2)。
-///
-/// 目的是"永不黑屏":用户敲了字,桌面得有反应。识别不出来的就沿用当前预设并只调氛围。
-fn fallback_spec(request: &str, current: &WallpaperSpec) -> WallpaperSpec {
-    let matched = match_preset(request);
-    let mut spec = match matched {
-        Some(preset) if preset != current.preset() => WallpaperSpec::from_preset(preset),
-        // 没有明确画面、或者就是当前这张:不换场景,只改氛围(L1)
-        _ => current.clone(),
-    };
-    let lower = request.to_lowercase();
-    if mentions(&lower, &["暗", "黑", "深", "夜", "dark"]) {
-        spec.motion.intensity = (spec.motion.intensity * 0.7).clamp(0.0, 1.0);
-    }
-    if mentions(&lower, &["静", "稳", "慢", "温柔", "calm"]) {
-        spec.motion.speed = (spec.motion.speed * 0.6).clamp(0.05, 1.0);
-    }
-    if mentions(&lower, &["动", "快", "活力", "energy", "赛博"]) {
-        spec.motion.speed = 1.0;
-        spec.motion.intensity = 1.0;
-    }
-    spec.title = title_from(request);
-    spec.keywords = keywords_from(request);
-    spec.source = Source::Conversation;
-    spec.normalize();
-    spec.id = spec.spec_hash();
-    spec
-}
-
-/// 关键词 → 预设。识别不出来返回 `None`(调用方沿用当前预设)。
-fn match_preset(request: &str) -> Option<Preset> {
-    let lower = request.to_lowercase();
-    let table: [(&[&str], Preset); 4] = [
-        (
-            &["雨", "夜", "城市", "窗", "rain", "city", "night"],
-            Preset::RainyWindowCity,
-        ),
-        (
-            &[
-                "星", "宇宙", "银河", "极光", "云", "space", "nebula", "galaxy",
-            ],
-            Preset::NebulaDrift,
-        ),
-        (
-            // 注意别写单字"纸":本行产品里"壁纸"两个字出现率最高,一个"纸"就把所有请求都
-            // 判成极简纸感(假模型自检时当场踩到),所以只认"纸感""纸张"这种成词的。
-            &[
-                "极简", "留白", "素色", "纸感", "纸张", "几何", "minimal", "paper",
-            ],
-            Preset::MinimalPaper,
-        ),
-        (
-            &[
-                "专注",
-                "网格",
-                "写代码",
-                "工作",
-                "学习",
-                "focus",
-                "grid",
-                "code",
-            ],
-            Preset::FocusGrid,
-        ),
-    ];
-    table
-        .into_iter()
-        .find(|(words, _)| mentions(&lower, words))
-        .map(|(_, preset)| preset)
-}
-
-fn mentions(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
-}
-
-/// 用用户那句话给壁纸起名:多空白折成一个空格,掐头 12 个字。
-fn title_from(request: &str) -> String {
-    let flat: String = request.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() > 12 {
-        format!("{}…", flat.chars().take(12).collect::<String>())
-    } else if flat.is_empty() {
-        "新的壁纸".to_string()
-    } else {
-        flat
-    }
-}
-
-/// 从一句话里抓几个关键词(降级路径用:这时没有模型给的 keywords)。
-fn keywords_from(request: &str) -> Vec<String> {
-    const MAX: usize = 5;
-    request
-        .split(|c: char| c.is_whitespace() || "，,。.、!！?？:：;；/|()（）「」".contains(c))
-        .filter(|word| !word.is_empty())
-        .take(MAX)
-        .map(|word| word.chars().take(12).collect::<String>())
-        .collect()
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -740,53 +701,137 @@ fn read_stored() -> Option<Stored> {
     }
 }
 
-/// 提示词:把"能填什么"讲死,把"怎么答"讲死,其余交给模型。
-fn system_prompt() -> String {
+/// 生图那条路的系统提示词。
+///
+/// **故意不用 `format!` 插值**:里面全是 JSON 示例的大括号,插值要写一屏的 `{{`/`}}`,
+/// 改一次错一次。动效清单写成字面量,由测试 `提示词里的动效清单和枚举一致` 盯着它别和枚举漂开。
+const PHOTO_SYSTEM_PROMPT: &str = "\
+你是「MC 壁纸」的画面导演。用户会用一句话说他想要一张什么样的桌面壁纸。\
+你要做两件事:把这句需求改写成一句**给文生图模型的提示词**,再给这张图配一套动效。\n\
+\n\
+只输出一个 JSON 对象,不要解释、不要 markdown 代码块、不要多余字段,结构:\n\
+{\n\
+\x20 \"reply\": \"对用户说的一句中文回复(30 字以内,说清楚你打算画什么)\",\n\
+\x20 \"title\": \"这张壁纸的短标题(6~12 字,别用书名号)\",\n\
+\x20 \"image_prompt\": \"给文生图模型的提示词,写法见下\",\n\
+\x20 \"motion\": { \"kind\": \"动效名\", \"intensity\": 0~1, \"zoom\": 0~1, \"pan\": 0~1, \"speed\": 0~1 }\n\
+}\n\
+\n\
+image_prompt 的写法(这一句直接决定出图质量,请认真写):\n\
+- 中文,40~90 字,**一个连贯的长句**,不要分点、不要换行、不要引号\n\
+- 必须交代清楚:主体 + 环境 + 光线 + 色调 + 构图 + 画风\n\
+- 画风往「高清数字插画 / 电影感摄影」这类稳的方向写,别写抽象概念和情绪词\n\
+- **绝对不要出现**:文字、字母、数字、水印、logo、人脸特写、人物主体 —— 壁纸会被图标压住,\n\
+\x20 出现文字和人脸只会让人觉得脏\n\
+- 构图往「开阔、地平线偏低、中间偏空」写,给桌面图标留地方\n\
+\n\
+motion.kind 只能取下面之一(按题材挑,拿不准就用 still):\n\
+- still  静帧呼吸:只是很慢地推近。**任何题材都安全,拿不准就选它**\n\
+- snow   落雪:雪景、冬天、寒冷、严寒\n\
+- rain   雨丝:下雨、城市夜景、潮湿、阴天\n\
+- fog    雾气:山、森林、清晨、朦胧、远处\n\
+- cloud  云影:天空、草原、旷野、开阔的户外\n\
+- glow   光晕:灯光、日落、暖色、室内\n\
+- ripple 水波:水面、湖泊、海底、倒影、雨后的水洼\n\
+\n\
+motion 的四个数都是 0~1:intensity 是效果强弱,zoom 是画面推近幅度,pan 是平移幅度,speed 是速度。\n\
+**宁可小不要大** —— 壁纸是背景,动得太明显会让人分心,而且推得越快越容易让人觉得晃。\n\
+推荐区间:intensity 0.4~0.6 / zoom 0.1~0.25 / pan 0.05~0.15 / speed 0.2~0.4。";
+
+/// 生图那条路的用户消息。带上当前壁纸是为了让"换成雪天的"这种话有上下文。
+fn photo_request(request: &str, current: Option<&Photo>) -> String {
+    match current {
+        Some(photo) => format!(
+            "【当前壁纸】\n标题:{}\n提示词:{}\n动效:{}\n\n【用户说】\n{}",
+            photo.title,
+            photo.prompt,
+            photo.motion.summary(),
+            request
+        ),
+        None => format!("【用户说】\n{request}"),
+    }
+}
+
+/// 降级用的提示词:用户原话 + 一段固定的画风与底线要求。
+///
+/// 直接把用户原话丢给生图模型也能出图(`cogview` 吃中文),只是构图和画风听天由命。
+/// 加上这一段,至少能把"不要文字、留白、画风"这三条底线兜住 —— 这三条恰恰是壁纸最容易翻车的地方。
+fn fallback_image_prompt(request: &str) -> String {
     format!(
-        "你是「MC 壁纸」的场景设计师。用户会用一句话描述想要的桌面氛围,你把它翻译成一份\
-         可以直接渲染的壁纸规格。\n\
-         \n\
-         **只输出一个 JSON 对象**,不要解释、不要 markdown 代码块、不要多余字段,结构:\n\
-         {{\n\
-         \x20 \"reply\": \"对用户说的一句中文回复(30 字以内,说清楚你做了什么)\",\n\
-         \x20 \"mode\": \"tweak\" 或 \"create\",\n\
-         \x20 \"image_prompt\": \"同一画面的中文描述(一句话,给以后的文生图用)\",\n\
-         \x20 \"spec\": {{ 壁纸规格,字段见下 }}\n\
-         }}\n\
-         \n\
-         spec 的字段(凡是「一串东西」的字段都得写成**数组**,别写成一个字符串):\n\
-         - title:中文短标题(6~12 字,别用书名号)\n\
-         - keywords:字符串数组,2~5 个中文关键词(如 [\"雨\", \"夜\", \"冷蓝\"])\n\
-         - mood:calm / focus / energy 三个 0~1 的数\n\
-         - palette:字符串数组,恰好 5 个 #RRGGBB 颜色,从深到浅(第一个是底色;桌面壁纸常年在图标下面,\
-         别用大面积纯白)\n\
-         - scene.preset:只能取下面目录里的 id\n\
-         - scene.params:只能填该预设声明的参数(key 必须一字不差),值必须落在给定范围内\n\
-         - motion.intensity / motion.speed:0~1\n\
-         - lighting.keyLight:0~1;lighting.followDesktopBrightness 建议 true\n\
-         - seed:任意整数。**它决定随机细节,保持不变就能复现同一张壁纸**\n\
-         \n\
-         mode 怎么定:\n\
-         - 用户在说\"暗一点 / 冷一点 / 别动那么快\"这类**改动**时,填 \"tweak\",其余字段尽量与\
-         【当前壁纸】保持一致,只动该动的那几个;\n\
-         - 用户在说\"换一张 / 生成一张 / 我要赛博朋克\"这类**新作品**时,填 \"create\"。\n\
-         \n\
-         <预设目录>\n\
-         {}\n\
-         </预设目录>\n\
-         \n\
-         规则:拿不准就给中间值,不要给极端值;字段缺失按默认值处理,但**不要发明新字段**。",
-        mcwp_spec::presets::catalog()
+        "{},高清数字插画,电影感光线,柔和色调,构图开阔,中间留白,无文字无水印无人脸",
+        request.trim()
     )
 }
 
-/// 第一轮的用户消息:要什么 + 现在是什么。
-fn first_prompt(request: &str, current: &WallpaperSpec) -> String {
-    format!(
-        "【当前壁纸】\n{}\n\n【用户说】\n{}",
-        current.canonical_json(),
-        request
-    )
+/// 模型该给出的"生图计划"。
+#[derive(Debug, Default)]
+struct PhotoPlan {
+    reply: String,
+    title: String,
+    image_prompt: String,
+    motion: MotionRecipe,
+}
+
+#[derive(Debug, Deserialize)]
+struct PhotoReply {
+    #[serde(default)]
+    reply: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    image_prompt: String,
+    /// 先当 `Value` 收着再单独解析:`motion` 是最容易写走样的一块
+    /// (整块写成一句 `"snow"` 之类),那样不该让整次调用白费。
+    #[serde(default)]
+    motion: serde_json::Value,
+}
+
+/// 解析生图那段回复。和 `parse_reply` 一个态度:**形状走样就地修,不靠重试**。
+fn parse_photo_reply(text: &str) -> Result<PhotoPlan> {
+    let json = extract_json(text)?;
+    let answer: PhotoReply = serde_json::from_str(json).context("不是约定的 JSON 结构")?;
+
+    let image_prompt = truncate(&answer.image_prompt, MAX_IMAGE_PROMPT_CHARS);
+    if image_prompt.is_empty() {
+        // 这一条是**唯一**不能就地修的:没有提示词就没有图可画
+        anyhow::bail!("image_prompt 是空的");
+    }
+
+    let mut motion = match answer.motion {
+        // 整块写成一句字符串(比如 "snow"):认得出动效名就认,认不出就回默认
+        serde_json::Value::String(kind) => MotionRecipe {
+            kind: MotionKind::from_id(&kind).unwrap_or_default(),
+            ..MotionRecipe::default()
+        },
+        serde_json::Value::Null => MotionRecipe::default(),
+        // 字段写错类型 / 缺字段:回默认,而不是把这一轮废掉
+        value => serde_json::from_value(value).unwrap_or_default(),
+    };
+    motion.normalize();
+
+    let title = {
+        let trimmed = answer.title.trim();
+        if trimmed.is_empty() {
+            mcwp_spec::photo::title_from_prompt(&image_prompt)
+        } else {
+            trimmed.chars().take(24).collect()
+        }
+    };
+    let reply = {
+        let trimmed = truncate(&answer.reply, MAX_REPLY_CHARS);
+        if trimmed.is_empty() {
+            format!("正在按「{title}」画一张。")
+        } else {
+            trimmed
+        }
+    };
+
+    Ok(PhotoPlan {
+        reply,
+        title,
+        image_prompt,
+        motion,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -861,65 +906,108 @@ struct ResponseMessage {
     content: String,
 }
 
-/// 模型该给出的那个 JSON 对象。
+/// 生图请求体。OpenAI 兼容的生图接口都是这个形状(`size` 是 `"宽x高"` 的字符串)。
+#[derive(Debug, Serialize)]
+struct ImageRequest<'a> {
+    model: &'a str,
+    prompt: &'a str,
+    size: String,
+}
+
+/// 生图响应。只有一个字段真的有用:`data[0].url`。
 #[derive(Debug, Deserialize)]
-struct ModelReply {
+struct ImageResponse {
     #[serde(default)]
-    reply: String,
+    data: Vec<ImageDatum>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageDatum {
     #[serde(default)]
-    mode: Mode,
-    #[serde(default)]
-    image_prompt: Option<String>,
-    /// 先当 `Value` 收着再单独解析:这样"外层对、spec 不对"能报出更准的错,重试时也说得清
-    spec: serde_json::Value,
+    url: String,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 实测踩到的那一份:glm-4-flash 只有 `keywords` 写成了字符串,别处一字不差。
+    /// 尺寸这条规则是**实测出来的**,不是猜的:服务商要求宽高都是 16 的倍数、各自 512~2880、
+    /// 总像素 ≤ 2²¹。`1920×1080` 会被直接拒绝(1080/16 = 67.5),这里钉住"折成合法的"。
     #[test]
-    fn 单元素数组写成字符串也能解析出规格() {
-        // 外层用 r## 包:里面全是 "#RRGGBB",`"#` 会把 r#"…"# 提前收掉
-        let text = r##"{
-            "reply": "已理解您的需求",
-            "mode": "tweak",
-            "image_prompt": "雨夜城市",
-            "spec": {
-                "title": "雨夜城市",
-                "keywords": "雨夜城市",
-                "palette": ["#0B1020", "#1B2A4A", "#4F7CFF", "#9BB8FF", "#E6ECFF"],
-                "scene": { "preset": "rainy_window_city", "params": { "blur": "0.35" } },
-                "motion": { "intensity": "0.45", "speed": 0.6 },
-                "seed": "20261014"
-            }
-        }"##;
-        let parsed = parse_reply(text, "你好?").expect("修完形状就该能解析");
-        assert_eq!(parsed.spec.keywords, vec!["雨夜城市"]);
-        assert_eq!(parsed.spec.motion.intensity, 0.45);
-        assert_eq!(parsed.spec.scene.params.get("blur"), Some(&0.35));
-        assert_eq!(parsed.spec.preset(), Preset::RainyWindowCity);
+    fn 生图尺寸总是十六的倍数且落在区间里() {
+        assert_eq!(fit_size(1920, 1080), (1920, 1088));
+        assert_eq!(fit_size(1600, 900), (1600, 896));
+        assert_eq!(fit_size(1024, 1024), (1024, 1024));
+
+        // 4K:两条上界(边长 2880、总像素 2²¹)都要被照顾到
+        for (width, height) in [(3840u32, 2160u32), (2560, 1440), (1280, 720), (800, 600)] {
+            let (width, height) = fit_size(width, height);
+            assert_eq!(width % 16, 0, "{width} 不是 16 的倍数");
+            assert_eq!(height % 16, 0, "{height} 不是 16 的倍数");
+            assert!((SIZE_MIN..=SIZE_MAX).contains(&width), "宽 {width} 越界");
+            assert!((SIZE_MIN..=SIZE_MAX).contains(&height), "高 {height} 越界");
+            assert!(
+                width as u64 * height as u64 <= SIZE_PIXEL_MAX,
+                "{width}×{height} 总像素超了"
+            );
+        }
     }
 
-    /// 挤成一行的多项要拆开,不然 `palette` 会变成"一个颜色"。
+    /// 小模型最常见的走样有两处:把 `motion` 整块写成一句字符串,以及干脆不写 `motion`。
+    /// 两种都必须在本地修好,不能让整次调用白费。
     #[test]
-    fn 挤成一行的多项会拆开() {
-        let mut spec = serde_json::json!({
-            "keywords": "雨、夜、冷蓝",
-            "palette": "#0B1020, #1B2A4A, #4F7CFF, #9BB8FF, #E6ECFF"
-        });
-        let fixed = repair_shape(&mut spec);
-        assert_eq!(fixed.len(), 2);
-        assert_eq!(spec["keywords"], serde_json::json!(["雨", "夜", "冷蓝"]));
-        assert_eq!(spec["palette"].as_array().map(Vec::len), Some(5));
+    fn 生图计划能修掉走样的动效字段() {
+        let text = r#"{
+            "reply": "给你画个雪夜",
+            "title": "雪夜暖灯",
+            "image_prompt": "雪夜里的木屋,窗内暖黄灯光,冷蓝雪地,远景松林,高清数字插画",
+            "motion": "snow"
+        }"#;
+        let plan = parse_photo_reply(text).expect("该能解析");
+        assert_eq!(plan.title, "雪夜暖灯");
+        assert_eq!(plan.motion.kind, MotionKind::Snow);
+        assert_eq!(plan.motion.zoom, MotionRecipe::default().zoom);
+
+        // 缺 motion:回默认,而不是报错
+        let plan = parse_photo_reply(r#"{ "image_prompt": "海面日出" }"#).unwrap();
+        assert_eq!(plan.motion.kind, MotionKind::Still);
+        assert_eq!(plan.title, "海面日出");
+        assert!(plan.reply.contains("海面日出"), "没写回复就用标题兜一句");
+
+        // 没给提示词:**这一条必须失败**(没提示词就没有图可画),交给重试
+        assert!(parse_photo_reply(r#"{ "reply": "好" }"#).is_err());
     }
 
-    /// 没走样就一处都别动 —— 修得越少,"本地瞎改"的风险越小。
+    /// 提示词里那份动效清单是手写的字面量,枚举改了它不会自己跟着改 —— 这个测试就是那道闸。
     #[test]
-    fn 没走样就不动它() {
-        let mut spec = serde_json::json!({ "keywords": ["雨"], "seed": 7, "elements": [] });
-        assert!(repair_shape(&mut spec).is_empty());
-        assert_eq!(spec["seed"], serde_json::json!(7));
+    fn 提示词里的动效清单和枚举一致() {
+        for kind in MotionKind::ALL {
+            assert!(
+                PHOTO_SYSTEM_PROMPT.contains(kind.id()),
+                "系统提示词里没有动效 {}",
+                kind.id()
+            );
+        }
+    }
+
+    /// 生图响应只认 `data[0].url`,但它真实的形状比这花哨得多,多一层嵌套不能把解析搞崩。
+    #[test]
+    fn 生图响应能挑出图片地址() {
+        let raw = r#"{"id":"task","created":1760000000,"data":[{"url":"https://example.com/a.png"}]}"#;
+        let parsed: ImageResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.data.len(), 1);
+        assert_eq!(parsed.data[0].url, "https://example.com/a.png");
+        // 没有 data 字段时是空数组,不是解析失败 —— 上层据此报"没给图片地址"
+        let empty: ImageResponse = serde_json::from_str(r#"{"error":"quota"}"#).unwrap();
+        assert!(empty.data.is_empty());
+    }
+
+    /// 降级提示词要把三条底线兜住(不要文字 / 留白 / 画风),不能只是用户原话。
+    #[test]
+    fn 降级提示词兜住了底线() {
+        let prompt = fallback_image_prompt("  我想要个安静点的桌面  ");
+        assert!(prompt.starts_with("我想要个安静点的桌面"), "开头就是用户原话");
+        assert!(prompt.contains("无文字"));
+        assert!(prompt.contains("留白"));
     }
 }

@@ -5,6 +5,8 @@ pub mod desktop;
 pub mod glass_window;
 /// 任务栏托盘图标与右键菜单。
 pub mod tray;
+/// 读当前桌面壁纸是哪张图(生图之前的兜底画源)。
+pub mod wallpaper;
 /// 桌面窗口层级诊断。只在启用 `dev-tools` 特性时编译,正式运行路径不依赖它。
 #[cfg(feature = "dev-tools")]
 pub mod diag;

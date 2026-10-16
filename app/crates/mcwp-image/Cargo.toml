@@ -1,0 +1,12 @@
+[package]
+name = "mcwp-image"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+# 只解 PNG / JPEG:生图服务商返回的不是 PNG 就是 JPEG,别的格式(webp / tiff / gif / avif /
+# hdr)全是白送的依赖体积和编译时间。`image` 默认把这一堆全开着,所以必须 default-features = false。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+tracing.workspace = true
