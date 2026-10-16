@@ -124,6 +124,90 @@ struct ActivePhoto {
     photo: Photo,
     /// 每帧只改 `time`,其余由照片与屏幕尺寸一次算好
     params: PhotoParams,
+    /// **视频壁纸才有**的播放状态。挂在这里而不是另开一份全局状态:
+    /// "现在屏幕上是什么"只有一个答案,分两处存就会出现"图换了、视频还在放"这种半拉状态。
+    video: Option<VideoPlayback>,
+}
+
+/// 正在放的视频。
+///
+/// 它是个**拉模式**的播放器(见 `mcwp_video::Player`):主循环每帧问它"该换下一帧了吗",
+/// 由它按视频自己的帧率回答。这么设计是因为壁纸的刷新率(60)和视频的帧率(31)对不上 ——
+/// 谁快谁慢还不一定,让任一方去驱动另一方都会出错。
+struct VideoPlayback {
+    player: mcwp_video::Player,
+    /// 距离"该换下一帧"还差多久(秒)。每帧减去这一帧的真实耗时
+    remaining: f32,
+}
+
+impl VideoPlayback {
+    /// 打开一段视频并把第一帧贴上去。
+    fn open(renderer: &mut Renderer, path: &std::path::Path, screen: (u32, u32)) -> Result<Self> {
+        let mut player = mcwp_video::Player::open(path, screen)
+            .with_context(|| format!("打开视频失败:{}", path.display()))?;
+        let info = player.info();
+        let first = player
+            .next_frame()
+            .context("解视频第一帧失败")?
+            .map(|pixels| pixels.to_vec())
+            .ok_or_else(|| anyhow::anyhow!("{} 里一帧画面都没有", path.display()))?;
+        renderer.set_video_frame(info.width, info.height, &first)?;
+        Ok(Self {
+            player,
+            remaining: 0.0,
+        })
+    }
+
+    /// 走一帧的时钟;该换帧了就把新的一帧贴上去。
+    ///
+    /// `delta` 是**这一帧实际过了多久**(不是"应该在多久之后")——暂停几分钟再继续时,
+    /// 这里会一次性收到一个很大的 delta,所以下面要把欠下的帧数夹住(见"落后就丢帧")。
+    fn tick(&mut self, renderer: &mut Renderer, delta: f32) -> Result<()> {
+        self.remaining += delta;
+        let step = self.player.frame_interval();
+        if self.remaining < step {
+            return Ok(());
+        }
+        // **落后就丢帧,不追**:卡一下没人看得出来,但一口气解十帧会把这一帧拉长十倍,
+        // 于是"卡一下"变成"卡一秒"。夹住上限之后,视频最多慢一点点,永远追得回来。
+        self.remaining = (self.remaining - step).min(step);
+
+        let info = self.player.info();
+        if let Some(pixels) = self.player.next_frame()? {
+            renderer.set_video_frame(info.width, info.height, pixels)?;
+            return Ok(());
+        }
+        // 放完了:**从头再来**。生图服务商给的只有五秒左右,循环播放才像一张壁纸;
+        // 停在最后一帧会让桌面看起来"死"了。
+        self.player.rewind()?;
+        if let Some(pixels) = self.player.next_frame()? {
+            renderer.set_video_frame(info.width, info.height, pixels)?;
+        }
+        Ok(())
+    }
+}
+
+/// 一轮「做成动态壁纸」跑完的产物。
+///
+/// 和 `PhotoPayload` 是**两件事**,不是一个东西加个字段:生图那轮的产物是"一张图的字节",
+/// 这轮的产物是"一段视频 + 它的封面"。混成一个结构就得给一半字段写"另一支不用"的注释,
+/// 而两边的失败处理也不一样(生图失败 = 没画出来,这条失败 = 静图还是好的,只是没变成视频)。
+struct VideoPayload {
+    /// 元数据(`kind` 已经是 `Video`)
+    photo: Photo,
+    /// 图生视频接口给的 mp4 原始字节
+    mp4: Vec<u8>,
+    /// 封面(视频第一帧)。入库时它是那条记录的"画面文件",也是缩略图的来源
+    cover: mcwp_image::Bitmap,
+}
+
+/// 后台线程把「做成动态壁纸」的结果送回主循环。理由和 `AiOutcome` 一样:
+/// 这条路要跑一分钟,不能占着 60fps 的主循环;而且它**比生图还长**,更等不起。
+struct VideoOutcome {
+    /// 第几轮。同一时刻只允许跑一轮(面板那颗钮会拦住),留它是为了万一
+    /// 以后放开并发时,旧结果能自己认出来被丢掉。
+    run: u64,
+    result: Result<Box<VideoPayload>, String>,
 }
 
 /// 当前 unix 秒。壁纸库靠它排序,也参与文件名。
@@ -249,7 +333,183 @@ fn show_photo(
     Ok(ActivePhoto {
         params: PhotoParams::from_photo(&photo, screen.0, screen.1, brightness),
         photo,
+        // 静图:上屏时把播放器丢掉 —— 它可能正是上一张动态壁纸留下来的
+        video: None,
     })
+}
+
+/// 换上一段视频(库里那条 `<id>.mp4`)。
+fn show_video(
+    renderer: &mut Renderer,
+    photo: Photo,
+    path: &std::path::Path,
+    screen: (u32, u32),
+    brightness: f32,
+) -> Result<ActivePhoto> {
+    let video = VideoPlayback::open(renderer, path, screen)?;
+    Ok(ActivePhoto {
+        // 参数用 `from_video`:关掉 Ken Burns 和效果层(见那里的说明)
+        params: PhotoParams::from_video(&photo, screen.0, screen.1, brightness),
+        photo,
+        video: Some(video),
+    })
+}
+
+/// 起一轮「做成动态壁纸」,返回一行给面板看的话。
+///
+/// 两个入口(库格子的右键菜单、库页工具栏那颗钮)都走这里:能不能跑、跑过了没、库里第几张,
+/// 这些判断只写一遍 —— 分散在两处的话,迟早出现"一个入口拦住了、另一个没拦"。
+fn start_video_run(
+    chat: &Option<mcwp_ai::Client>,
+    videos: &Option<mcwp_ai::Videos>,
+    library: &[LibraryEntry],
+    index: usize,
+    screen: (u32, u32),
+    tx: &Sender<VideoOutcome>,
+    run: &mut Option<u64>,
+    run_id: u64,
+) -> String {
+    let Some(animator) = videos.as_ref() else {
+        return "还没配图生视频的 key —— 它和生图是同一把,在「设置」里填上就能用".to_string();
+    };
+    // 同时只跑一条:它要一分钟、还要花钱,点两下就并排跑两条是纯浪费。
+    if run.is_some() {
+        return "正在做上一段动态壁纸,等它出来再说".to_string();
+    }
+    let Some(entry) = library.get(index) else {
+        return format!("壁纸库里没有第 {index} 张");
+    };
+    if entry.source.is_video() {
+        return "这一张已经是动态壁纸了".to_string();
+    }
+    let title = entry.source.photo.title.clone();
+    let source = entry.source.clone();
+    let chat = chat.clone();
+    let animator = animator.clone();
+    *run = Some(run_id);
+    // 和生图一样丢给后台线程:这条要跑一分钟,占着主循环整个桌面都会卡。
+    // 发送端要 clone 一份搬进线程(`Sender` 的 clone 很便宜,共享同一个队列)。
+    let sender = tx.clone();
+    std::thread::spawn(move || {
+        let result = animate_photo(chat.as_ref(), &animator, &source, screen)
+            .map(Box::new)
+            .map_err(|err| format!("{err:#}"));
+        let _ = sender.send(VideoOutcome { run: run_id, result });
+    });
+    format!("正在把「{title}」做成动态壁纸(约一分钟,期间可以接着聊)")
+}
+
+/// 把库里某一张(静图)做成动态壁纸。**在后台线程里跑**,产物从 `VideoOutcome` 回来。
+///
+/// 三步:
+/// 1. 让**文本模型**写一句"它该怎么动"(`plan_motion`)。生图那句说的是"画面里有什么",
+///    这一句说的是"它该怎么动",后者没人写过 —— 这正是第二个智能体存在的理由。
+/// 2. **图生视频**(一分钟左右)。
+/// 3. 把 mp4 落成临时文件、解出第一帧当封面。
+///
+/// 第 3 步为什么要绕一下:解码器是从**文件**读的(Media Foundation 没有"从内存解一段视频"
+/// 的现成路径),而封面必须在主线程入库之前就拿到(入库要连着封面一起写)。所以这里落一份
+/// 临时文件,解完**立刻删掉** —— 正式的 mp4 由主线程写进壁纸库。
+fn animate_photo(
+    chat: Option<&mcwp_ai::Client>,
+    videos: &mcwp_ai::Videos,
+    entry: &photos::Entry,
+    screen: (u32, u32),
+) -> Result<VideoPayload> {
+    let source = entry.photo.clone();
+    // 条件图用**库里那张原图的字节**,不重新编码(见 `mcwp_ai::image_data_url`)
+    let image_bytes = std::fs::read(&entry.image)
+        .with_context(|| format!("读不出这张图:{}", entry.image.display()))?;
+    let image_url = mcwp_ai::image_data_url(&image_bytes);
+    // 没配对话模型也要能跑:动效提示词退化成一句通用的运镜(见 `fallback_motion_prompt`)
+    let motion = match chat {
+        Some(chat) => chat.plan_motion(&source),
+        None => mcwp_ai::fallback_motion_prompt().to_string(),
+    };
+    let generated = videos.animate(&image_url, &motion)?;
+
+    let temp = std::env::temp_dir().join(format!("mcwp-animate-{}.mp4", source.id));
+    std::fs::write(&temp, &generated.bytes)
+        .with_context(|| format!("写临时视频失败:{}", temp.display()))?;
+    let decoded = mcwp_video::Player::open(&temp, screen).and_then(|mut player| {
+        let info = player.info();
+        let pixels = player
+            .next_frame()?
+            .map(|frame| frame.to_vec())
+            .ok_or_else(|| anyhow::anyhow!("这段视频一帧都解不出来"))?;
+        Ok((info, pixels))
+    });
+    // 解完就删。失败也删 —— 中间产物留在盘上,下次"文件被占着"的怪事就说不清了。
+    let _ = std::fs::remove_file(&temp);
+    let (info, pixels) = decoded.context("新视频解不出第一帧(这台机器的解码器没装上?)")?;
+
+    let cover = mcwp_image::Bitmap {
+        width: info.width,
+        height: info.height,
+        rgba: pixels,
+    };
+    let created = now_secs();
+    let mut photo = Photo {
+        title: source.title.clone(),
+        prompt: source.prompt.clone(),
+        // 记**解码出来的**尺寸:画面按 cover 裁,而视频和原图的尺寸不一定一样
+        width: info.width,
+        height: info.height,
+        kind: mcwp_spec::photo::PhotoKind::Video,
+        duration_ms: info.duration.as_millis() as u32,
+        // 动效配方照抄原图那份:视频这条路上它用不上(见 `PhotoParams::from_video`),
+        // 但哪天解码器不可用、只能把封面当静图放时,它还派得上用场。
+        motion: source.motion,
+        palette: mcwp_spec::palette_from_rgba(&cover.rgba, cover.width, cover.height),
+        seed: (created & 0xffff_ffff) as u32,
+        created,
+        ..Photo::default()
+    };
+    // **id 必须重新生成**:接着用原图那个 id 的话,这条视频的封面(`<id>.png`)
+    // 会把原图那张画面文件盖掉 —— 库里就再也找不到那张静图了。
+    photo.normalize();
+    Ok(VideoPayload {
+        photo,
+        mp4: generated.bytes,
+        cover,
+    })
+}
+
+/// 一段刚出炉的视频落地:入库 → 上屏。
+///
+/// 和 `adopt_photo` 的顺序**不一样**,这是被解码器逼的:播放器是从**文件**读的,
+/// 所以必须先有 mp4 落在盘上才有得放。补偿的办法是把"写不进库"这条退路留在手上 ——
+/// 写不进去就写 `%TEMP%`,用户等了十分钟,不能因为库目录只读就什么都不给。
+fn adopt_video(
+    renderer: &mut Renderer,
+    library: &mut Vec<LibraryEntry>,
+    payload: VideoPayload,
+    screen: (u32, u32),
+    brightness: f32,
+) -> Result<ActivePhoto> {
+    let VideoPayload {
+        photo,
+        mp4,
+        cover,
+    } = payload;
+    match photos::save_video(&photo, &mp4, &cover) {
+        Ok(entry) => {
+            tracing::info!("新动态壁纸已入库:{}", entry.meta.display());
+            *library = scan_library();
+            let path = entry
+                .video
+                .clone()
+                .unwrap_or_else(|| entry.image.clone());
+            show_video(renderer, entry.photo.clone(), &path, screen, brightness)
+        }
+        Err(err) => {
+            tracing::warn!("动态壁纸入库失败(照常上屏):{err:?}");
+            let path = std::env::temp_dir().join(format!("mcwp-animate-{}.mp4", photo.id));
+            std::fs::write(&path, &mp4)
+                .with_context(|| format!("连临时视频都写不下:{}", path.display()))?;
+            show_video(renderer, photo, &path, screen, brightness)
+        }
+    }
 }
 
 /// 从库里换一张(点卡片 / 托盘"换一张"都走这里)。
@@ -266,6 +526,12 @@ fn switch_to_photo(
     let entry = library
         .get(index)
         .ok_or_else(|| anyhow::anyhow!("壁纸库里没有第 {index} 张"))?;
+    // 视频条目交给播放器。它那张 `<id>.png` 只是封面(第一帧),
+    // 当成静图放也能看,但那正是"点了动态壁纸却不动"的那种 bug。
+    if let Some(path) = entry.source.video.clone() {
+        let photo = entry.source.photo.clone();
+        return show_video(renderer, photo, &path, screen, brightness);
+    }
     let bitmap = entry
         .source
         .read_image()
@@ -433,6 +699,8 @@ fn ai_config_state() -> mcwp_ui::AiConfigState {
         image_base_url: stored.image_base_url,
         image_model: stored.image_model,
         image_api_key: stored.image_api_key,
+        // 同理原样给:空串 = 用内置默认(`cogvideox-3`)
+        video_model: stored.video_model,
         thinking: mcwp_ui::ThinkingChoice::from_option(stored.thinking),
         env_override: mcwp_ai::Config::env_override(),
     }
@@ -446,6 +714,7 @@ fn save_ai_config(
     stored: &mcwp_ai::Stored,
     ai: &mut Option<mcwp_ai::Client>,
     images: &mut Option<mcwp_ai::Images>,
+    videos: &mut Option<mcwp_ai::Videos>,
 ) -> String {
     if let Err(err) = mcwp_ai::Config::save(stored) {
         tracing::error!("写 ai.json 失败:{err:?}");
@@ -453,7 +722,7 @@ fn save_ai_config(
     }
     // 两个客户端一起按新配置重建。分开重建的话,"改的往往就是同一把 key"这件事会让用户
     // 觉得"生图要重启才生效" —— 而这类设置页最容易挨骂的就是"配完还得重启"。
-    let describe = rebuild_clients(ai, images);
+    let describe = rebuild_clients(ai, images, videos);
     if mcwp_ai::Config::env_override() {
         // 环境变量优先级更高:写得进去,但不生效。不说明白,用户只会觉得"保存没反应"。
         return "已写入 ai.json · 但环境变量在生效,实际用的是它们".to_string();
@@ -468,6 +737,7 @@ fn save_ai_config(
 fn rebuild_clients(
     ai: &mut Option<mcwp_ai::Client>,
     images: &mut Option<mcwp_ai::Images>,
+    videos: &mut Option<mcwp_ai::Videos>,
 ) -> String {
     *ai = match mcwp_ai::Config::load() {
         Ok(cfg) => {
@@ -489,6 +759,17 @@ fn rebuild_clients(
         }
         Err(err) => {
             tracing::warn!("没配生图:{err}");
+            None
+        }
+    };
+    *videos = match mcwp_ai::VideosConfig::load() {
+        Ok(cfg) => {
+            let animator = mcwp_ai::Videos::new(cfg);
+            tracing::info!("图生视频:{}", animator.describe());
+            Some(animator)
+        }
+        Err(err) => {
+            tracing::warn!("没配图生视频:{err}");
             None
         }
     };
@@ -603,6 +884,60 @@ fn run_images_selftest(request: &str, screen: (u32, u32)) -> Result<()> {
     Ok(())
 }
 
+/// `--video-selftest <mp4>`:把一段 mp4 解一遍,原样摊开。
+///
+/// 为什么要它:视频这条路上最容易坏的恰恰是**解码这一段**(MF 的初始化、格式协商、
+/// 这台机器上装不装得上那个色彩转换器),而它坏掉的表现只有一句"画面是黑的" ——
+/// 那种时候从"库、渲染器、AI 客户端"里找是白费劲。所以这里只解一个文件:
+/// 不解库、不建窗口、不碰网络,把"解出来多少帧、每帧多大、像素大概什么样"直接打出来。
+fn run_video_selftest(path: &str, screen: (u32, u32)) -> Result<()> {
+    let started = Instant::now();
+    let mut player = mcwp_video::Player::open(std::path::Path::new(path), screen)?;
+    println!("打开用了 {:.0}ms", started.elapsed().as_secs_f32() * 1000.0);
+    let info = player.info();
+    println!(
+        "信息:{}×{} · {:.0}fps · {:.2}s",
+        info.width,
+        info.height,
+        info.fps,
+        info.duration.as_secs_f32()
+    );
+    let begin = Instant::now();
+    let mut frames = 0usize;
+    let mut frame_bytes = 0usize;
+    while let Some(frame) = player.next_frame()? {
+        frames += 1;
+        frame_bytes = frame.len();
+        if frames <= 3 {
+            // 抽样均值能一眼看出"是不是全黑"。另外第四字节恒为 255:要是均值贴着 255,
+            // 说明读到的是 alpha 那一列 —— 那是 stride 用错了。
+            let sampled = frame.len() / 997 + 1;
+            let sum: u64 = frame.iter().step_by(997).map(|byte| *byte as u64).sum();
+            println!(
+                "第 {frames} 帧:{} KB · 采样均值 {:.1}",
+                frame.len() / 1024,
+                sum as f64 / sampled as f64
+            );
+        }
+    }
+    let elapsed = begin.elapsed().as_secs_f64().max(0.001);
+    println!(
+        "共 {frames} 帧 · 每帧 {} KB · 解码 {elapsed:.2}s({:.0} 帧/s)",
+        frame_bytes / 1024,
+        frames as f64 / elapsed
+    );
+    // 倒回开头再解一帧:循环播放全靠这一步,而它在 MF 上是最容易"静默不生效"的一处
+    player.rewind()?;
+    println!(
+        "倒回开头后再解一帧:{}",
+        player
+            .next_frame()?
+            .map(|frame| format!("{} KB", frame.len() / 1024))
+            .unwrap_or_else(|| "没有".to_string())
+    );
+    Ok(())
+}
+
 /// 面板要显示的「当前壁纸」。
 ///
 /// 从 `Photo` 派生出面板要的那几个字段(标题 / 短提示 / 动效摘要 / 调色板 / 身份串),
@@ -636,12 +971,24 @@ impl CurrentWallpaper {
             title: photo.title.clone(),
             // 提示词就是这张壁纸的"关键词";截成短标题,不然会撑破卡片上那一行
             hint: mcwp_spec::photo::title_from_prompt(&photo.prompt),
-            summary: photo.motion.summary(),
+            summary: photo_summary(photo),
             palette: photo.palette.clone(),
             // 面板上那串"指纹"用库里的身份:和文件名、库目录里看到的那串字符是同一个
             fingerprint: photo.id.clone(),
         }
     }
+}
+
+/// 一条记录在面板上那句摘要。
+///
+/// 静图写的是动效配方(Ken Burns 推拉多少、速度多少),而视频要说的只有"多长" ——
+/// 视频的动效是模型画的,没有参数可讲,拿静图那套去描述只会显示成
+/// "静帧呼吸 · 推近 12%"(而它根本不是靠推拉在动)。
+fn photo_summary(photo: &Photo) -> String {
+    if photo.kind.is_video() {
+        return format!("动态壁纸 · {:.1} 秒", photo.duration_ms as f32 / 1000.0);
+    }
+    photo.motion.summary()
 }
 
 /// 把「当前壁纸 + 壁纸库 + 会话」拼成面板的初始状态。
@@ -718,7 +1065,8 @@ fn library_entry(source: photos::Entry) -> LibraryEntry {
         title: photo.title.clone(),
         // 提示词限长:`hint` 是卡片上那行小字,长提示词会把卡片撑到两行
         hint: mcwp_spec::photo::title_from_prompt(&photo.prompt),
-        summary: photo.motion.summary(),
+        summary: photo_summary(photo),
+        video: source.is_video(),
         // 卡片的主色用照片自己提出来的强调色 —— 面板玻璃也跟着它染色,
         // 所以切壁纸的时候整个面板的色调会一起变,而不是只有壁纸变了
         accent: mcwp_ui::glass_colors(&photo.palette).accent(),
@@ -811,6 +1159,11 @@ struct Args {
     adopt: bool,
     /// 只跑一遍生图链路、打印结果就退出(不建窗口)
     images_selftest: Option<String>,
+    /// 把库里某一张(静图)**做成动态壁纸**,跑完整条链路再上屏(不建面板)
+    animate: Option<String>,
+    /// 只解一段 mp4、打印几帧的统计就退出(不建窗口)—— 视频解码那条路唯一的自检入口。
+    /// 它解的是**任意 mp4 文件**,不是库里的条目:解码器坏了和库坏了是两件事,分开测。
+    video_selftest: Option<String>,
     stats_interval: Duration,
 }
 
@@ -833,6 +1186,8 @@ impl Args {
             photo_id: None,
             adopt: false,
             images_selftest: None,
+            animate: None,
+            video_selftest: None,
             stats_interval: Duration::from_secs(5),
         };
         let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -912,6 +1267,14 @@ impl Args {
                     args.images_selftest = value.cloned();
                     i += 2;
                 }
+                "--animate" => {
+                    args.animate = value.cloned();
+                    i += 2;
+                }
+                "--video-selftest" => {
+                    args.video_selftest = value.cloned();
+                    i += 2;
+                }
                 "--attach" => {
                     match value.and_then(|v| AttachMode::parse(v)) {
                         Some(mode) => args.attach_mode = mode,
@@ -947,7 +1310,8 @@ fn main() -> Result<()> {
         || args.dump
         || args.gdi_only
         || args.selftest
-        || args.images_selftest.is_some();
+        || args.images_selftest.is_some()
+        || args.video_selftest.is_some();
     if !is_diagnostic_run && !claim_single_instance() {
         return Ok(());
     }
@@ -956,6 +1320,12 @@ fn main() -> Result<()> {
     if let Some(request) = args.images_selftest.as_deref() {
         // 还不知道真实屏幕尺寸(窗口还没建),但生图尺寸只影响出图分辨率,不影响链路
         run_images_selftest(request, (1920, 1080))?;
+        return Ok(());
+    }
+    // 「只解一段视频」同理:不建窗口、不占桌面,接解码那条路时唯一需要的调试入口。
+    if let Some(path) = args.video_selftest.as_deref() {
+        // 屏幕尺寸在这里只用来定"解出来缩到多大" —— 还不知道真实屏幕,按 1080p 给
+        run_video_selftest(path, (1920, 1080))?;
         return Ok(());
     }
     #[cfg(not(feature = "dev-tools"))]
@@ -1028,13 +1398,23 @@ fn main() -> Result<()> {
     // 生图是**独立的一套配置**:同一把 key 默认共用,也可以指向另一家(见 `ImagesConfig`)。
     // 它和对话客户端分开建,是因为超时差一个数量级(45 s vs 180 s)、地址也不同。
     let mut images: Option<mcwp_ai::Images> = None;
-    rebuild_clients(&mut ai, &mut images);
+    // 图生视频同理:地址和 key 跟着生图那组走,单独建客户端是因为它是**两段式**的
+    // (提交 → 轮询),而且一条要跑一分钟(见 `Videos` 的说明)。
+    let mut videos: Option<mcwp_ai::Videos> = None;
+    rebuild_clients(&mut ai, &mut images, &mut videos);
     // 请求跑在后台线程,结果从这里回到主循环
     let (ai_tx, ai_rx) = std::sync::mpsc::channel::<AiOutcome>();
+    // 「做成动态壁纸」走**自己的一条通道**:它不属于任何会话(是按钮触发的,不是聊天),
+    // 也不参与"暂停 / 继续"那一套,混进 `AiOutcome` 只会让那边的轮次判断多一堆分支。
+    let (video_tx, video_rx) = std::sync::mpsc::channel::<VideoOutcome>();
     // 当前这一轮(在跑 / 被暂停 / 没有)。`run_id` 只增不减:每起一轮换一个,结果回来时拿它对
     // 暗号 —— 暂停之后、或者又发了新的一句之后,旧请求的结果会晚一步回来,对不上就丢掉。
     let mut run: Option<Run> = None;
     let mut run_id: u64 = 0;
+    // 正在做的那一段视频的轮次(没在做就是 `None`)。同一时刻只允许跑一轮:
+    // 它要一分钟、还要花钱,点两下就并排跑两条是纯粹的浪费。
+    let mut video_run: Option<u64> = None;
+    let mut video_id: u64 = 0;
 
     // —— 控制面板 ——
     // 面板跑在自己的线程和自己的 Slint 事件循环里;这里只保留一个事件队列,
@@ -1048,7 +1428,8 @@ fn main() -> Result<()> {
     tracing::info!("壁纸库里有 {} 张壁纸", library.len());
 
     // —— 起手那张壁纸 ——
-    // 优先级:`--gen`(现场生成)> `--photo`(点库里的一张)> 抬桌面上那张 > 库里最新的一张。
+    // 优先级:`--gen`(现场生成)> `--animate`(把库里那张做成动态壁纸)> `--photo`(点库里的一张)
+    // > 抬桌面上那张 > 库里最新的一张。
     if let Some(request) = args.generate.clone() {
         match (ai.as_ref(), images.as_ref()) {
             (Some(chat), Some(painter)) => {
@@ -1067,10 +1448,33 @@ fn main() -> Result<()> {
             }
             _ => tracing::warn!("`--gen` 需要先配好模型与生图 key,这次跳过"),
         }
+    } else if let Some(id) = args.animate.clone() {
+        match photos::load(&id) {
+            Ok(entry) => match videos.as_ref() {
+                Some(animator) => {
+                    tracing::info!("`--animate`:把「{}」做成动态壁纸(约一分钟)", entry.photo.title);
+                    let payload =
+                        animate_photo(ai.as_ref(), animator, &entry, screen).context("`--animate` 失败")?;
+                    active = Some(adopt_video(
+                        &mut renderer,
+                        &mut library,
+                        payload,
+                        screen,
+                        brightness,
+                    )?);
+                }
+                None => tracing::warn!("`--animate` 需要先配好图生视频的 key(和生图同一把)"),
+            },
+            Err(err) => tracing::warn!("`--animate {id}` 在库里找不到那张图:{err:?}"),
+        }
     } else if let Some(id) = args.photo_id.clone() {
-        match photos::load(&id).and_then(|entry| {
-            let bitmap = entry.read_image()?;
-            show_photo(&mut renderer, entry.photo, &bitmap, screen, brightness)
+        match photos::load(&id).and_then(|entry| match entry.video.clone() {
+            // 视频条目:放的是**那段视频**,不是它那张封面静图
+            Some(path) => show_video(&mut renderer, entry.photo, &path, screen, brightness),
+            None => {
+                let bitmap = entry.read_image()?;
+                show_photo(&mut renderer, entry.photo, &bitmap, screen, brightness)
+            }
         }) {
             Ok(photo) => {
                 tracing::info!("`--photo`:已换上 {}", photo.photo.title);
@@ -1423,6 +1827,54 @@ fn main() -> Result<()> {
                         }
                     }
                 }
+                // 「做成动态壁纸」:库格子的右键菜单带下标,库页工具栏那颗钮认**当前那张**。
+                mcwp_ui::UiEvent::MakeVideo(index) => {
+                    video_id += 1;
+                    let status = start_video_run(
+                        &ai,
+                        &videos,
+                        &library,
+                        index,
+                        screen,
+                        &video_tx,
+                        &mut video_run,
+                        video_id,
+                    );
+                    tracing::info!("做成动态壁纸(库第 {index} 张):{status}");
+                    if let Some(handle) = &panel {
+                        handle.set_status(status);
+                    }
+                }
+                mcwp_ui::UiEvent::MakeVideoFromCurrent => {
+                    // 「当前这张」得先在库里找到它的位置 —— 找不到就没得做:
+                    // 图生视频要的是库里那张**原图的字节**,而"当前这张"可能才刚抬进来、
+                    // 还没进库(那种情况下连它在盘上哪儿都不知道)。
+                    let index = active.as_ref().and_then(|it| {
+                        library
+                            .iter()
+                            .position(|entry| entry.source.photo.id == it.photo.id)
+                    });
+                    let status = match index {
+                        Some(index) => {
+                            video_id += 1;
+                            start_video_run(
+                                &ai,
+                                &videos,
+                                &library,
+                                index,
+                                screen,
+                                &video_tx,
+                                &mut video_run,
+                                video_id,
+                            )
+                        }
+                        None => "这一张还不在壁纸库里,先去库页点它一下再回来".to_string(),
+                    };
+                    tracing::info!("做成动态壁纸(当前这张):{status}");
+                    if let Some(handle) = &panel {
+                        handle.set_status(status);
+                    }
+                }
                 // 设置页点了保存:写 ai.json + 就地重建客户端,不用重启程序。
                 mcwp_ui::UiEvent::SaveAiConfig {
                     base_url,
@@ -1432,6 +1884,7 @@ fn main() -> Result<()> {
                     image_base_url,
                     image_model,
                     image_api_key,
+                    video_model,
                 } => {
                     // **先从盘上现读一份**再覆盖这七个字段:直接构造一个 `Stored` 会把盘上
                     // 这一版还不认识的字段(以后加的)悄悄抹掉 —— 那种丢失没有报错、没有提示,
@@ -1444,8 +1897,9 @@ fn main() -> Result<()> {
                     stored.image_base_url = image_base_url.trim().to_string();
                     stored.image_model = image_model.trim().to_string();
                     stored.image_api_key = image_api_key.trim().to_string();
+                    stored.video_model = video_model.trim().to_string();
                     stored.thinking = thinking.to_option();
-                    let status = save_ai_config(&stored, &mut ai, &mut images);
+                    let status = save_ai_config(&stored, &mut ai, &mut images, &mut videos);
                     if let Some(handle) = &panel {
                         // 回填一次:trim 之后的值要显示回来,用户才知道真存进去的是什么
                         handle.refresh_ai(ai_config_state());
@@ -1532,6 +1986,49 @@ fn main() -> Result<()> {
         // (发消息 + 切会话),这里只落最后一次;`flush` 自己会看有没有改过。
         sessions.flush();
 
+        // —— 动态壁纸的结果落地 ——
+        // 和生图那边同一个套路:主循环只收结果,不等。这一段跑的时候用户可能已经切走、
+        // 甚至把库翻了个遍 —— 所以成功之后一律刷新面板(库多了一条新的)。
+        while let Ok(outcome) = video_rx.try_recv() {
+            let VideoOutcome { run: outcome_run, result } = outcome;
+            // 认轮次:理论上同一时刻只有一轮(起跑前拦过),但这条通道将来要是放开了并发,
+            // 这一步就是"旧结果别把新的一轮盖掉"的唯一保障。
+            if video_run != Some(outcome_run) {
+                tracing::info!("丢掉过期的动态壁纸结果(第 {outcome_run} 轮)");
+                continue;
+            }
+            video_run = None;
+            let status = match result {
+                Ok(payload) => {
+                    let title = payload.photo.title.clone();
+                    let seconds = payload.photo.duration_ms as f32 / 1000.0;
+                    match adopt_video(&mut renderer, &mut library, *payload, screen, brightness) {
+                        Ok(photo) => {
+                            tracing::info!("动态壁纸已上屏:{title} · {seconds:.1}s");
+                            active = Some(photo);
+                            format!("已换上动态壁纸「{title}」({seconds:.1} 秒,循环播放)")
+                        }
+                        Err(err) => {
+                            tracing::error!("动态壁纸出来了但上不了屏:{err:?}");
+                            format!("视频做出来了但上不了屏:{}", brief(&format!("{err:#}")))
+                        }
+                    }
+                }
+                Err(reason) => {
+                    tracing::warn!("做成动态壁纸失败:{reason}");
+                    format!("没做成动态壁纸:{}", brief(&reason))
+                }
+            };
+            if let Some(handle) = &panel {
+                handle.refresh(panel_state(
+                    active.as_ref().map(|it| &it.photo),
+                    &sessions,
+                    &library,
+                ));
+                handle.set_status(status);
+            }
+        }
+
         // —— 托盘菜单的落地 ——
         let mut quitting = false;
         for action in tray::drain_actions() {
@@ -1608,11 +2105,26 @@ fn main() -> Result<()> {
 
         let frame_start = Instant::now();
         if !paused {
-            clock += (frame_start - last_tick).as_secs_f32();
+            // 这一帧**实际**过了多久。视频要拿它算"该换下一帧了吗" ——
+            // 用"应该在多久之后"去推进时钟,掉帧的时候视频会偷偷跑快。
+            let delta = (frame_start - last_tick).as_secs_f32();
+            clock += delta;
             // 有照片就画照片。**没有可画的东西时一帧都不画**:`Renderer::new` 已经铺过一块
             // 认得出是"还没画"的占位色,继续重画同一帧只是白烧 GPU 和电。
             if let Some(photo) = &mut active {
                 photo.params.time = clock;
+                // 视频:该换帧了就把新的一帧贴上去(`tick` 自己按视频帧率判断)。
+                // 它和"每帧都画一次"是两件事 —— 桌面 60fps,视频只有 31fps。
+                let failure = match photo.video.as_mut() {
+                    Some(video) => video.tick(&mut renderer, delta).err(),
+                    None => None,
+                };
+                if let Some(err) = failure {
+                    // 放到一半出错(文件被删了、被别的程序占住了)不该让整个程序退出:
+                    // 丢掉播放器,画面停在最后一帧。用户想换一张就右键换一张。
+                    tracing::warn!("视频放不下去了({err:?}),先停在当前这一帧");
+                    photo.video = None;
+                }
                 renderer.render(&photo.params)?;
                 frames_in_window += 1;
                 rendered_total += 1;

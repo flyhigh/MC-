@@ -145,6 +145,21 @@ impl PhotoParams {
             _pad: [0.0; 2],
         }
     }
+
+    /// 视频壁纸的参数:**只留收尾那几样**(亮度 / 调色 / 暗角 / 颗粒),把 Ken Burns 推拉
+    /// 和效果层全关掉。
+    ///
+    /// 为什么:那段视频**自己就在动**,而且动效是模型按画面写好的 —— 再叠一层推拉等于把画面推两遍
+    /// (画框边缘会露出来),再叠一层雪或雾更是雪上加霜(图生视频的模型本来就把雪画进画面了)。
+    /// 收尾那几样是"别让桌面图标糊进高对比花纹里"的通用处理,和动效无关,所以留着。
+    pub fn from_video(photo: &Photo, width: u32, height: u32, desktop_brightness: f32) -> Self {
+        let mut params = Self::from_photo(photo, width, height, desktop_brightness);
+        params.zoom = 0.0;
+        params.pan = 0.0;
+        params.intensity = 0.0;
+        params.effect = 0.0;
+        params
+    }
 }
 
 /// `MotionKind` → `photo.wgsl` 里那个 `effect` 编号。
@@ -176,6 +191,9 @@ pub struct Renderer {
     /// 纹理本体。**必须和 `photo_texture_bind` 一起活到同一个生命周期**:
     /// bind group 里的 texture view 是它的借用,纹理先没了 view 就悬空。
     photo_texture: wgpu::Texture,
+    /// 当前那张纹理的尺寸。视频那条路靠它判断"能不能复用" —— 尺寸没变就只写内容,
+    /// 不重建纹理和 bind group(见 `set_video_frame`)。
+    photo_texture_size: (u32, u32),
     /// 跳过的帧数(被遮挡 / 超时 / 需要重新配置),用于健康度上报
     pub skipped_frames: u64,
     /// 上一帧的三个阶段耗时(毫秒):取帧 / 编码提交 / 呈现
@@ -453,6 +471,9 @@ impl Renderer {
             photo_texture_layout,
             photo_sampler,
             photo_texture,
+            // 占位纹理是 1×1 的(见上面那段说明),尺寸要跟着记账,
+            // 否则第一段视频会被误判成"尺寸没变"而写进那张 1×1 的纹理
+            photo_texture_size: (1, 1),
             skipped_frames: 0,
             last_acquire_ms: 0.0,
             last_submit_ms: 0.0,
@@ -489,7 +510,56 @@ impl Renderer {
     /// 参数收 `&[u8]` 而不是某个位图结构:渲染器**不该认识 PNG** —— 解码、缩放全在
     /// `mcwp-image`,这里只要"行优先、无 padding 的 RGBA 字节",这样渲染 crate 的依赖树
     /// 里永远不会有解码器。
+    ///
+    /// **视频走 `set_video_frame`,不走这里**:那条路要的是"换内容、不换纹理"。
     pub fn set_photo(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<()> {
+        self.validate_photo(width, height, rgba)?;
+        let texture = self.create_photo_texture(width, height);
+        self.upload_photo(&texture, width, height, rgba)?;
+        self.bind_photo(texture, width, height);
+        Ok(())
+    }
+
+    /// 贴一段视频的**一帧**。和 `set_photo` 只差一件事:**尺寸没变就复用同一张纹理**,
+    /// 只往里写内容,不重建纹理和 bind group。
+    ///
+    /// 为什么必须分开写:视频一秒 25~31 帧,每帧都新建纹理 + bind group 等于每秒新建三十次
+    /// GPU 资源 —— 帧率会掉、显存会抖,而那些旧纹理要等 GPU 用完才释放。复用之后每帧只剩一次
+    /// `write_texture`(1080p 一帧 8 MB,PCIe 完全吃得下)。
+    ///
+    /// 尺寸变了才重建:换了一条视频、或者换了分辨率(比如从 1080p 屏挪到 4K 屏)。
+    pub fn set_video_frame(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<()> {
+        if self.photo_texture_size == (width, height) {
+            self.upload_photo(&self.photo_texture, width, height, rgba)?;
+            return Ok(());
+        }
+        self.validate_photo(width, height, rgba)?;
+        let texture = self.create_photo_texture(width, height);
+        self.upload_photo(&texture, width, height, rgba)?;
+        self.bind_photo(texture, width, height);
+        Ok(())
+    }
+
+    /// 建一张照片纹理(尺寸照抄屏幕那张的用法:一张、一层、sRGB)。
+    fn create_photo_texture(&self, width: u32, height: u32) -> wgpu::Texture {
+        self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("mcwp-photo"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: PHOTO_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        })
+    }
+
+    /// 尺寸和字节数的检查。**必须在建纹理之前做**:建了才发现字节不够,就白建一张。
+    fn validate_photo(&self, width: u32, height: u32, rgba: &[u8]) -> Result<()> {
         if width == 0 || height == 0 {
             return Err(anyhow!("照片尺寸是 0"));
         }
@@ -506,26 +576,25 @@ impl Renderer {
                 rgba.len()
             ));
         }
+        Ok(())
+    }
 
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("mcwp-photo"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: PHOTO_FORMAT,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        // `write_texture` 没有 256 字节行对齐的要求(那是 `copy_buffer_to_texture` 的规矩),
-        // 所以整块一次写进去就行,不用按行补齐 —— 1080p 上省掉一次 8 MB 的中转。
+    /// 把一块 RGBA 写进纹理。
+    ///
+    /// `write_texture` 没有 256 字节行对齐的要求(那是 `copy_buffer_to_texture` 的规矩),
+    /// 所以整块一次写进去就行,不用按行补齐 —— 1080p 上省掉一次 8 MB 的中转。
+    fn upload_photo(
+        &self,
+        texture: &wgpu::Texture,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Result<()> {
+        self.validate_photo(width, height, rgba)?;
+        let needed = width as usize * height as usize * 4;
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &texture,
+                texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -542,7 +611,11 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
         );
+        Ok(())
+    }
 
+    /// 把一张纹理挂成当前画面(重建 bind group 并接管所有权)。
+    fn bind_photo(&mut self, texture: wgpu::Texture, width: u32, height: u32) {
         let view = texture.create_view(&Default::default());
         self.photo_texture_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mcwp-photo-texture-bind"),
@@ -559,7 +632,7 @@ impl Renderer {
             ],
         });
         self.photo_texture = texture;
-        Ok(())
+        self.photo_texture_size = (width, height);
     }
 
     /// 渲染一帧壁纸。返回 `false` 表示这一帧被跳过(仍需继续循环)。

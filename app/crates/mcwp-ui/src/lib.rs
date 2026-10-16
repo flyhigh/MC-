@@ -88,6 +88,8 @@ pub enum UiEvent {
         image_base_url: String,
         image_model: String,
         image_api_key: String,
+        /// 图生视频的模型名;留空 = 用内置默认
+        video_model: String,
     },
     /// 对话进行中点「暂停」:这一轮的请求作废(结果回来会被丢掉)。
     PauseRun,
@@ -97,6 +99,13 @@ pub enum UiEvent {
     OpenWallpaper(usize),
     /// 库那一格的右键菜单:删掉第 `index` 张
     DeleteWallpaper(usize),
+    /// 把第 `index` 张静图「做成动态壁纸」(图生视频)。
+    ///
+    /// 和别的库操作一样,面板只递下标:那张是不是静图、够不够额度、结果往哪儿放,
+    /// 全是壁纸侧的事。
+    MakeVideo(usize),
+    /// 同一件事,对象是**当前挂着的那张**(库页工具栏那颗钮)。
+    MakeVideoFromCurrent,
     /// 「用当前壁纸」:把桌面上原来那张抬进来当作库里的新一张
     AdoptWallpaper,
     /// 面板窗口被关掉了
@@ -136,6 +145,9 @@ pub struct LibraryEntryView {
     pub hint: String,
     pub summary: String,
     pub accent: slint::Color,
+    /// 这一条是不是「动态壁纸」(视频)。面板靠它在格子角上画一个「动」标 ——
+    /// 库里两种东西混着放,没有这个标就得点开才知道。
+    pub video: bool,
     /// (宽, 高, RGBA8 像素)。**必须和宽高对得上**,不然贴出来是花的。
     pub thumb: (u32, u32, Vec<u8>),
 }
@@ -155,6 +167,9 @@ pub struct AiConfigState {
     pub image_base_url: String,
     pub image_model: String,
     pub image_api_key: String,
+    /// 图生视频的模型名。**留空是合法的**:空 = 用内置默认(`cogvideox-3`)。
+    /// 地址和 Key 不在这儿 —— 图生视频和生图基本总是同一家,那两个跟着生图那组走。
+    pub video_model: String,
     /// 「深度思考」选的哪一档
     pub thinking: ThinkingChoice,
     /// 有 `MCWP_AI_*` 环境变量在生效:界面上要提醒一句,不然用户改完发现没反应。
@@ -535,7 +550,7 @@ fn build(state: &PanelState, events: Sender<UiEvent>) -> Result<Panel> {
     {
         // 设置页的「保存」。面板只把四个值原样递出去 —— 校验、落盘、重建客户端都在壁纸侧。
         let tx = events.clone();
-        ui.on_save_ai_config(move |base_url, model, api_key, thinking, image_base_url, image_model, image_api_key| {
+        ui.on_save_ai_config(move |base_url, model, api_key, thinking, image_base_url, image_model, image_api_key, video_model| {
             let _ = tx.send(UiEvent::SaveAiConfig {
                 base_url: base_url.to_string(),
                 model: model.to_string(),
@@ -544,7 +559,21 @@ fn build(state: &PanelState, events: Sender<UiEvent>) -> Result<Panel> {
                 image_base_url: image_base_url.to_string(),
                 image_model: image_model.to_string(),
                 image_api_key: image_api_key.to_string(),
+                video_model: video_model.to_string(),
             });
+        });
+    }
+
+    {
+        // 「做成动态壁纸」:面板只递下标 / 一个"就是当前这张"的意思,
+        // 真正要不要跑、跑多久、结果怎么落库都是壁纸侧的事。
+        let tx = events.clone();
+        ui.on_make_video(move |index| {
+            let _ = tx.send(UiEvent::MakeVideo(index.max(0) as usize));
+        });
+        let tx = events.clone();
+        ui.on_make_video_current(move || {
+            let _ = tx.send(UiEvent::MakeVideoFromCurrent);
         });
     }
 
@@ -770,6 +799,7 @@ fn apply_library(ui: &Panel, library: Vec<LibraryEntryView>, current: String) {
                 hint: entry.hint.into(),
                 summary: entry.summary.into(),
                 accent: entry.accent,
+                video: entry.video,
                 thumb: slint::Image::from_rgba8(buffer),
             }
         })
@@ -786,6 +816,7 @@ fn apply_ai(ui: &Panel, ai: &AiConfigState) {
     ui.set_ai_image_base_url(ai.image_base_url.clone().into());
     ui.set_ai_image_model(ai.image_model.clone().into());
     ui.set_ai_image_key(ai.image_api_key.clone().into());
+    ui.set_ai_video_model(ai.video_model.clone().into());
     ui.set_ai_thinking(ai.thinking.index());
     ui.set_ai_env_override(ai.env_override);
 }

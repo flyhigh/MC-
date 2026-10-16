@@ -177,6 +177,39 @@ impl MotionRecipe {
     }
 }
 
+/// 这张壁纸是**一张静图**,还是**一段视频**(由某张图生成的动态壁纸)。
+///
+/// 为什么要有这个字段,而不是"看目录里有没有 `.mp4` 就够了":
+/// - 面板上两者的显示不一样(视频那格有个「动」标、摘要那一行写时长而不是推拉幅度);
+/// - 渲染那条路上,"每帧只改参数"和"每帧换纹理"是两条路(见 `main.rs` 的 `VideoPlayback`);
+/// - 元数据是要给人看的(手改 JSON、拷给别人),而"文件在不在"是**另一个**问题。
+///
+/// 但它**不是**唯一真相:扫库时以 `<id>.mp4` 在不在为准(见 `photos::read_entry`),
+/// 免得出"文件删了、JSON 还写着 video"这种半拉状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhotoKind {
+    /// 一张图:生图出来的,或者从桌面壁纸抬进来的
+    #[default]
+    Image,
+    /// 一段视频:图生视频出来的
+    Video,
+}
+
+impl PhotoKind {
+    pub fn is_video(self) -> bool {
+        matches!(self, PhotoKind::Video)
+    }
+
+    /// 给用户看的名字。
+    pub fn label(self) -> &'static str {
+        match self {
+            PhotoKind::Image => "静图",
+            PhotoKind::Video => "动态壁纸",
+        }
+    }
+}
+
 /// 一张照片壁纸。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -197,6 +230,10 @@ pub struct Photo {
     pub seed: u32,
     /// 生成时间(unix 秒),面板按它排序
     pub created: u64,
+    /// 这是静图还是视频(见 `PhotoKind`)
+    pub kind: PhotoKind,
+    /// 视频多长(毫秒)。静图恒为 0 —— 面板上那一行"5.1 秒"就来自它。
+    pub duration_ms: u32,
 }
 
 impl Default for Photo {
@@ -212,6 +249,8 @@ impl Default for Photo {
             palette: Vec::new(),
             seed: 0,
             created: 0,
+            kind: PhotoKind::Image,
+            duration_ms: 0,
         }
     }
 }
@@ -263,6 +302,10 @@ impl Photo {
         }
         if self.id.trim().is_empty() {
             self.id = Self::new_id(&self.prompt, self.created);
+        }
+        // 静图不该带时长:留着它会让面板显示"静图 · 5.1 秒"这种自相矛盾的话
+        if !self.kind.is_video() {
+            self.duration_ms = 0;
         }
     }
 

@@ -12,6 +12,7 @@ mcwp-platform = { path = "../mcwp-platform" }
 mcwp-render = { path = "../mcwp-render" }
 mcwp-spec = { path = "../mcwp-spec" }
 mcwp-ui = { path = "../mcwp-ui" }
+mcwp-video = { path = "../mcwp-video" }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

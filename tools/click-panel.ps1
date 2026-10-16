@@ -6,6 +6,7 @@ param(
 )
 
 Add-Type -Namespace Tab -Name M -MemberDefinition @"
+[DllImport("user32.dll", SetLastError=true)] public static extern bool SetProcessDpiAwarenessContext(System.IntPtr value);
 [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
 [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, System.IntPtr e);
 [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
@@ -16,6 +17,11 @@ public delegate bool EnumProc(System.IntPtr h, System.IntPtr p);
 public struct POINT { public int X, Y; }
 public struct RECT { public int L, T, R, B; }
 "@
+ 
+# -4 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2。**必须**设置:否则 150% 缩放下
+# GetWindowRect 拿到的是虚拟化后的坐标、SetCursorPos 也会被再换算一次,点哪儿都不对
+# (截图工具已经是 DPI 感知的,两个工具的坐标系必须一致才能对着截图点)。
+[Tab.M]::SetProcessDpiAwarenessContext([IntPtr]::new(-4)) | Out-Null
 
 $script:found = [IntPtr]::Zero
 $cb = [Tab.M+EnumProc]{ param($h,$p)

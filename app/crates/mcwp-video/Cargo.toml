@@ -1,0 +1,10 @@
+[package]
+name = "mcwp-video"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+windows.workspace = true

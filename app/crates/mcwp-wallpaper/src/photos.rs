@@ -1,11 +1,12 @@
 //! MC 壁纸 · 照片壁纸的本地库 —— `%APPDATA%\MC壁纸\photos` 的读写。
 //!
-//! 一张壁纸 = **三个文件**,平铺在一个目录里(不建子目录 —— 一张才两三个文件,
+//! 一张壁纸 = **三个文件**(视频是四个),平铺在一个目录里(不建子目录 —— 一张才两三个文件,
 //! 一层目录用资源管理器就能手工救):
 //! ```text
-//! <id>.json        元数据(标题 / 提示词 / 动效配方 / 调色板 / 尺寸 / 生成时间)
-//! <id>.png|jpg|bin 画面本身,生图接口原样返回的字节
+//! <id>.json        元数据(标题 / 提示词 / 动效配方 / 调色板 / 尺寸 / 生成时间 / 是不是视频)
+//! <id>.png|jpg|bin 画面本身,生图接口原样返回的字节(视频这里放的是**封面**那一帧)
 //! <id>.thumb.png   缩略图,入库时顺手缩好的
+//! <id>.mp4         视频壁纸才有:图生视频返回的整段视频
 //! ```
 //!
 //! 为什么不是"把元数据塞进 PNG 的 tEXt 块"、为什么不是"一个 JSON 存全部":
@@ -28,6 +29,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use mcwp_image::Bitmap;
+use mcwp_spec::photo::PhotoKind;
 use mcwp_spec::Photo;
 
 /// 缩略图的尺寸上限(16:9)。面板那一格是 168 × 94,按 2 倍给,够清楚也不占地方;
@@ -45,6 +47,7 @@ pub fn root() -> Result<PathBuf> {
 }
 
 /// 库里的一条:元数据 + 三个文件各自的位置。
+#[derive(Clone)]
 pub struct Entry {
     pub photo: Photo,
     /// 画面文件(`<id>.png` / `<id>.jpg` / `<id>.bin`)
@@ -54,9 +57,17 @@ pub struct Entry {
     /// 缩略图(`<id>.thumb.png`)。**可能不存在** —— 手工拷进来的条目就没有,
     /// 那时 `read_thumb` 会拿原图现缩一张(见那里)。
     pub thumb: PathBuf,
+    /// 视频壁纸才有:`<id>.mp4`。**它是"这条是视频"的唯一真相** ——
+    /// 元数据里的 `kind` 只是拿来给人看 / 给面板用的,文件在不在才是真的(见 `read_entry`)。
+    pub video: Option<PathBuf>,
 }
 
 impl Entry {
+    /// 这条是视频吗(真相在文件上,不在元数据里)。
+    pub fn is_video(&self) -> bool {
+        self.video.is_some()
+    }
+
     /// 解码画面。这是**唯一**会把 1080p 图读进内存的地方。
     pub fn read_image(&self) -> Result<Bitmap> {
         Bitmap::decode_file(&self.image)
@@ -107,6 +118,9 @@ pub fn save(photo: &Photo, bytes: &[u8], bitmap: &Bitmap) -> Result<Entry> {
         .with_context(|| format!("创建壁纸库目录失败:{}", dir.display()))?;
 
     let mut stored = photo.clone();
+    // 走这条路的都是静图(video 那条走 `save_video`),把形态钉死,
+    // 免得调用方不小心把一条 kind=Video 的元数据塞进"只有一张图"的目录里
+    stored.kind = PhotoKind::Image;
     stored.normalize();
     let image = dir.join(format!("{}.{}", stored.id, extension_of(bytes)));
     let meta = dir.join(format!("{}.json", stored.id));
@@ -114,38 +128,94 @@ pub fn save(photo: &Photo, bytes: &[u8], bitmap: &Bitmap) -> Result<Entry> {
 
     std::fs::write(&image, bytes)
         .with_context(|| format!("写入图片失败:{}", image.display()))?;
-    // 缩略图失败**不致命**:面板那边会回落到"读原图现缩",只是慢一点
-    match bitmap.thumbnail(THUMB_WIDTH, THUMB_HEIGHT).encode_png() {
-        Ok(bytes) => {
-            if let Err(err) = std::fs::write(&thumb, &bytes) {
-                tracing::warn!("写缩略图失败({}):{err}", thumb.display());
-            }
-        }
-        Err(err) => tracing::warn!("缩略图编不出来:{err}"),
-    }
-    // 元数据走"临时文件 + 改名"(和会话 / 模型配置一个态度):半截 JSON 比没有 JSON 难查得多
-    let temp = meta.with_extension("json.tmp");
-    std::fs::write(&temp, stored.to_pretty_json())
-        .with_context(|| format!("写入元数据失败:{}", temp.display()))?;
-    std::fs::rename(&temp, &meta)
-        .with_context(|| format!("替换元数据失败:{}", meta.display()))?;
+    write_thumb(&thumb, bitmap);
+    write_meta(&meta, &stored)?;
 
     Ok(Entry {
         photo: stored,
         image,
         meta,
         thumb,
+        video: None,
     })
 }
 
-/// 删掉一条(画面 + 元数据 + 缩略图)。
+/// 存一段**视频**壁纸(图生视频的产物)。
+///
+/// 形态是四个文件:`<id>.mp4`(画面本体)+ `<id>.png`(封面 = 视频第一帧)+ `<id>.thumb.png`
+/// + `<id>.json`。为什么封面要单独留一张 PNG,而不是"要缩略图时从 mp4 现解一帧":
+/// - 面板刷一屏库是几十张,现解 mp4 意味着每张都要起一次**解码器**(几十毫秒起步),
+///   而这张 PNG 是现成的;
+/// - 它还是**兜底**:哪台机器上解码器装不起来(或者哪天 MF 的格式支持变了),库里那张封面还在,
+///   用户至少看得见"是哪张",而不是面对一个空白格子。
+///
+/// 写入顺序和 `save` 一致,**元数据放最后**:中途挂掉最多留下"文件在、库里没这条"
+/// (手写一个 JSON 就能救回来);反过来就是"库里有一条指向空气的记录"。
+pub fn save_video(photo: &Photo, video: &[u8], cover: &Bitmap) -> Result<Entry> {
+    let dir = root()?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("创建壁纸库目录失败:{}", dir.display()))?;
+
+    let mut stored = photo.clone();
+    stored.kind = PhotoKind::Video;
+    stored.normalize();
+    let mp4 = dir.join(format!("{}.mp4", stored.id));
+    let image = dir.join(format!("{}.png", stored.id));
+    let meta = dir.join(format!("{}.json", stored.id));
+    let thumb = dir.join(format!("{}.thumb.png", stored.id));
+
+    std::fs::write(&mp4, video).with_context(|| format!("写入视频失败:{}", mp4.display()))?;
+    // 封面原样编成 PNG(第一帧,和视频同尺寸)。重编码一次不划算的只有"生图原图"那一路;
+    // 这里是解码器给的裸像素,本来就得编一次才落得下去。
+    let cover_png = cover.encode_png().context("封面编不成 PNG")?;
+    std::fs::write(&image, &cover_png)
+        .with_context(|| format!("写入封面失败:{}", image.display()))?;
+
+    write_thumb(&thumb, cover);
+    write_meta(&meta, &stored)?;
+
+    Ok(Entry {
+        photo: stored,
+        image,
+        meta,
+        thumb,
+        video: Some(mp4),
+    })
+}
+
+/// 缩略图(**失败不致命**:面板那边会回落到"读原图现缩",只是慢一点)。
+fn write_thumb(thumb: &Path, bitmap: &Bitmap) {
+    match bitmap.thumbnail(THUMB_WIDTH, THUMB_HEIGHT).encode_png() {
+        Ok(bytes) => {
+            if let Err(err) = std::fs::write(thumb, &bytes) {
+                tracing::warn!("写缩略图失败({}):{err}", thumb.display());
+            }
+        }
+        Err(err) => tracing::warn!("缩略图编不出来({}):{err}", thumb.display()),
+    }
+}
+
+/// 元数据走"临时文件 + 改名"(和会话 / 模型配置一个态度):半截 JSON 比没有 JSON 难查得多。
+fn write_meta(meta: &Path, photo: &Photo) -> Result<()> {
+    let temp = meta.with_extension("json.tmp");
+    std::fs::write(&temp, photo.to_pretty_json())
+        .with_context(|| format!("写入元数据失败:{}", temp.display()))?;
+    std::fs::rename(&temp, meta).with_context(|| format!("替换元数据失败:{}", meta.display()))
+}
+
+/// 删掉一条(画面 + 元数据 + 缩略图 + 视频,有哪个删哪个)。
 ///
 /// **故意只按这条记录自己记着的三个路径删**,不去按 id 通配:`id` 里出现过 `.` 或别的
 /// 通配字符的话,通配符就删到别人头上去了。少一个文件不报错(本来就可能没有缩略图),
-/// 但三个都删不掉要报出来 —— 那说明目录只读或者文件被占着,用户得知道。
+/// 但全都删不掉要报出来 —— 那说明目录只读或者文件被占着,用户得知道。
 pub fn remove(entry: &Entry) -> Result<()> {
     let mut failed = Vec::new();
-    for path in [&entry.image, &entry.meta, &entry.thumb] {
+    let mut paths = vec![&entry.image, &entry.meta, &entry.thumb];
+    // 视频那一段是**大头**(几百 KB 到几 MB),漏掉它等于"删了两次还在"
+    if let Some(video) = &entry.video {
+        paths.push(video);
+    }
+    for path in paths {
         match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -200,15 +270,34 @@ pub fn scan() -> Vec<Entry> {
 /// 读一条元数据,并确认配套的图片真的在。读不出 / 图片不在都返回 `Err`,由调用方决定是跳过还是报给用户。
 pub fn read_entry(meta: &Path) -> Result<Entry> {
     let text = std::fs::read_to_string(meta).context("读元数据失败")?;
-    let photo = Photo::parse(&text).context("解析元数据失败")?;
+    let mut photo = Photo::parse(&text).context("解析元数据失败")?;
     let dir = meta.parent().unwrap_or(Path::new("."));
     let image = image_for(dir, &photo.id)
         .ok_or_else(|| anyhow::anyhow!("找不到 {} 对应的图片文件", photo.id))?;
+    // **"是不是视频"以文件为准**,不是以元数据里的 `kind` 为准:手工把 mp4 删了、
+    // 或者手工拷了一段 mp4 进来,两种情况下 JSON 都不会自己改。这里就地把它掰正 ——
+    // 于是"文件删了但 JSON 还写着 video"不会让程序去开一个不存在的文件。
+    let video = dir.join(format!("{}.mp4", photo.id));
+    let video = video.is_file().then_some(video);
+    if photo.kind.is_video() != video.is_some() {
+        tracing::warn!(
+            "{} 的元数据写着 {:?},但 mp4 {} —— 按文件为准",
+            photo.id,
+            photo.kind,
+            if video.is_some() { "在" } else { "不在" }
+        );
+    }
+    photo.kind = if video.is_some() {
+        PhotoKind::Video
+    } else {
+        PhotoKind::Image
+    };
     Ok(Entry {
         thumb: dir.join(format!("{}.thumb.png", photo.id)),
         photo,
         image,
         meta: meta.to_path_buf(),
+        video,
     })
 }
 

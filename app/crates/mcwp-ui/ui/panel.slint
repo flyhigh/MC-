@@ -109,6 +109,9 @@ export struct LibraryItem {
     summary: string,
     accent: color,
     thumb: image,
+    // 这一条是「动态壁纸」(视频)吗。格子角上那个「动」标就看它 ——
+    // 库里两种东西混在一起,没有这个标就得靠"这张是不是在动"去分辨,一眼看不出来。
+    video: bool,
 }
 // 玻璃上的「胶囊」按钮。主操作是 tinted(染色玻璃),次操作是普通玻璃。
 component Pill inherits Rectangle {
@@ -454,6 +457,7 @@ component LibraryCell inherits Rectangle {
     in property <image> thumb;
     in property <string> heading: "";
     in property <bool> selected: false;
+    in property <bool> video: false;
     in property <color> accent: #0A84FF;
 
     callback picked();
@@ -476,6 +480,28 @@ component LibraryCell inherits Rectangle {
         height: 94px;
         source: root.thumb;
         image-fit: cover;
+    }
+
+    // 「动」标:视频那一格才画。位置挑在缩略图右上角 —— 右下角是生图水印的地盘,
+    // 左下角压着画面主体,右上角最空。底色用当前壁纸的强调色玻璃,和面板整体一致。
+    if root.video : Rectangle {
+        x: parent.width - 40px;
+        y: 12px;
+        width: 28px;
+        height: 16px;
+        border-radius: 8px;
+        background: root.accent.with-alpha(0.82);
+
+        Text {
+            width: parent.width;
+            height: parent.height;
+            text: "动";
+            color: #FFFFFFFF;
+            font-size: 10px;
+            font-weight: 600;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
     }
 
     Text {
@@ -506,18 +532,23 @@ component LibraryCell inherits Rectangle {
     }
 }
 
-// 壁纸库那一格的右键菜单:换上这一张 / 删除这一张。
+// 壁纸库那一格的右键菜单:换上这一张 / 做成动态壁纸 / 删除这一张。
 //
-// 只有两项,所以比会话菜单矮(93 而不是 143):面板那侧各存了一份尺寸,
+// 只有三项,所以比会话菜单矮(123 而不是 143):面板那侧各存了一份尺寸,
 // 菜单得知道自己多大才能贴着窗口边收住(布局撑出来的高度面板读不到)。
 component LibraryMenu inherits Rectangle {
     in property <color> plate: #161B28;
+    // 这一格是视频吗。是的话不画「做成动态壁纸」(它已经是动态的了)。
+    in property <bool> is-video: false;
 
     callback apply-picked();
+    callback animate-picked();
     callback delete-picked();
 
     width: 176px;
-    height: 93px;
+    // 高度跟着"有没有「做成动态壁纸」那一项"走:给视频那条少一行。
+    // 面板那侧 `lib-menu-h` 也照这个规则算,两边必须一致 —— 它靠这个数把菜单收在窗口内。
+    height: root.is-video ? 93px : 123px;
     border-radius: 10px;
     // 实色(不是玻璃):菜单要压住底下的缩略图读字
     background: plate;
@@ -532,6 +563,12 @@ component LibraryMenu inherits Rectangle {
         spacing: 0px;
 
         MenuRow { text: "换上这一张"; picked => { root.apply-picked(); } }
+        // 「做成动态壁纸」只对静图有意义。已经在动的那一张不画这一项 ——
+        // 画出来再点一下就报"这张已经是动态壁纸了",不如干脆不要出现。
+        if !root.is-video : MenuRow {
+            text: "做成动态壁纸";
+            picked => { root.animate-picked(); }
+        }
 
         Rectangle {
             height: 11px;
@@ -846,6 +883,9 @@ export component Panel inherits Window {
     in-out property <string> ai-image-base-url: "";
     in-out property <string> ai-image-model: "";
     in-out property <string> ai-image-key: "";
+    // 图生视频的模型名。地址和 key 都跟生图那组走(同一家服务商的同一个接口域),
+    // 所以这里只留一个模型名 —— 多两个输入框只会让人不知道该填哪个(见 `VideosConfig::load`)。
+    in-out property <string> ai-video-model: "";
     // 深度思考:0 = 不发这个字段(服务商默认)/ 1 = 发 enabled / 2 = 发 disabled。
     // 三态不是偷懒 —— 面板把它原样交给 Rust,由 Rust 决定 `Stored::thinking` 落 None/true/false。
     in-out property <int> ai-thinking: 0;
@@ -895,8 +935,13 @@ export component Panel inherits Window {
     // 两边共用一套坐标本来也行("同时只开一个"),但那样两处 `if` 会一起命中,
     // 两个菜单叠在同一处画出来。分开存变量的代价只是两对坐标,换来的是不必推理"谁先关谁"。
     private property <int> lib-menu-row: -1;
-    // 库菜单比会话菜单矮(只有两项),所以尺寸也分开存
-    private property <length> lib-menu-h: 93px;
+    // 这一格是不是视频。是视频就不显示「做成动态壁纸」,菜单也因此矮一行 ——
+    // 所以它既要喂给菜单(`is-video`),也要参与算高度。在 `open-lib-menu` 里定,
+    // 那里一定能拿到一个合法的行号(只有格子会调它),不必担心越界读模型。
+    private property <bool> lib-menu-video: false;
+    // 库菜单比会话菜单矮,而且**自己也会变**:视频那条少一项(见 `LibraryMenu`)。
+    // Rust 侧不用管这个数,它只在窗口内收住菜单时用。
+    private property <length> lib-menu-h: root.lib-menu-video ? 93px : 123px;
 
     callback close-requested();
     callback drag-start();
@@ -923,10 +968,14 @@ export component Panel inherits Window {
     callback refresh-library();
     // 壁纸库那一格的右键菜单:删掉第 `index` 张
     callback delete-wallpaper(int);
+    // 「做成动态壁纸」:把第 `index` 张静图交给图生视频(跑几十秒,结果回来再上屏)
+    callback make-video(int);
+    // 同一件事,但对象是**当前挂着的那张**(库页工具栏上那颗钮;不用先去网格里找它)
+    callback make-video-current();
     // 把「现在桌面上那张壁纸」抬进来当作一张新的(生图之前先有东西可看)
     callback adopt-wallpaper();
     // 设置页:保存模型配置(接口地址 / 模型名 / API Key / 深度思考那一档的下标)
-    callback save-ai-config(string, string, string, int, string, string, string);
+    callback save-ai-config(string, string, string, int, string, string, string, string);
 
     title: "MC 壁纸 · 控制面板";
     // 任务栏 / Alt-Tab 的窗口图标。`@image-url` 走的还是 build.rs 的 EmbedFiles,所以图标
@@ -970,6 +1019,7 @@ export component Panel inherits Window {
 
     function open-lib-menu(row: int, at-x: length, at-y: length) {
         root.lib-menu-row = row;
+        root.lib-menu-video = root.library[row].video;
         root.menu-x = max(8px, min(at-x, root.width - root.menu-w - 8px));
         root.menu-y = max(8px, min(at-y, root.height - root.lib-menu-h - 8px));
     }
@@ -1446,6 +1496,15 @@ export component Panel inherits Window {
                             VerticalLayout {
                                 alignment: center;
                                 Pill {
+                                    text: "做成动态壁纸";
+                                    accent: root.accent;
+                                    clicked => { root.make-video-current(); }
+                                }
+                            }
+
+                            VerticalLayout {
+                                alignment: center;
+                                Pill {
                                     text: "用当前壁纸";
                                     accent: root.accent;
                                     clicked => { root.adopt-wallpaper(); }
@@ -1496,6 +1555,7 @@ export component Panel inherits Window {
                                     thumb: item.thumb;
                                     heading: item.title;
                                     selected: item.id == root.library-current;
+                                    video: item.video;
                                     accent: item.accent;
 
                                     picked => { root.open-wallpaper(i); }
@@ -1612,6 +1672,18 @@ export component Panel inherits Window {
                             value <=> root.ai-image-key;
                             accent: root.accent;
                         }
+                        FieldRow {
+                            label: "视频模型名";
+                            placeholder: "留空 = cogvideox-3";
+                            value <=> root.ai-video-model;
+                            accent: root.accent;
+                        }
+                        Text {
+                            text: "「做成动态壁纸」用的模型:拿一张图生成 5 秒左右的短视频。地址和 Key 都跟上面生图那组走;想换别的视频模型(比如 cogvideox-flash)才需要改这里。";
+                            color: Glass.label-3;
+                            font-size: 10px;
+                            wrap: word-wrap;
+                        }
 
                         HorizontalLayout {
                             spacing: 10px;
@@ -1630,7 +1702,8 @@ export component Panel inherits Window {
                                             root.ai-thinking,
                                             root.ai-image-base-url,
                                             root.ai-image-model,
-                                            root.ai-image-key
+                                            root.ai-image-key,
+                                            root.ai-video-model
                                         );
                                     }
                                 }
@@ -1794,9 +1867,14 @@ export component Panel inherits Window {
             x: root.menu-x;
             y: root.menu-y;
             plate: root.caption-plate.brighter(0.06);
+            is-video: root.lib-menu-video;
 
             apply-picked => {
                 root.open-wallpaper(root.lib-menu-row);
+                root.close-lib-menu();
+            }
+            animate-picked => {
+                root.make-video(root.lib-menu-row);
                 root.close-lib-menu();
             }
             delete-picked => {

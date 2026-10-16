@@ -55,6 +55,26 @@ pub const DEFAULT_IMAGE_BASE_URL: &str = DEFAULT_BASE_URL;
 /// 默认生图模型。`cogview-3-flash` 是智谱的免费档 —— 想换 `cogview-3` / `cogview-4` 直接改配置。
 pub const DEFAULT_IMAGE_MODEL: &str = "cogview-3-flash";
 
+/// 默认的「图生视频」模型。
+///
+/// `cogvideox-3` 实测(2026-10-16):提交 200、**约 61 s 出片**、1080×1080、5.13 s、31 fps、带水印,
+/// mp4 828 KB(H.264)。另有一个 `cogvideox-flash` 的名字,但**当前一直回 429**
+/// (错误码 1305「该模型当前访问量过大」),所以默认不选它 —— 想试就改配置。
+///
+/// 它产出的 mp4 **地址只有 24 小时有效**(生图那批是 7 天),所以和生图一样:
+/// 拿到就当场下载,绝不只存地址。
+pub const DEFAULT_VIDEO_MODEL: &str = "cogvideox-3";
+
+/// 轮询那条异步接口的间隔。它一次要跑几十秒,查得太密没有意义,太疏又会让"好了"晚到几秒。
+const VIDEO_POLL_INTERVAL: Duration = Duration::from_secs(8);
+
+/// 一条视频最多等多久。实测 61 s,给到 6 分钟 —— 到点就报错,
+/// 而不是让面板上那颗「做成动态壁纸」永远转下去。
+const VIDEO_WAIT_TIMEOUT: Duration = Duration::from_secs(360);
+
+/// 动效提示词最长多少字。图生视频那句**只描述"怎么动"**,不需要长;太长反而会被当成分镜。
+const MAX_MOTION_PROMPT_CHARS: usize = 200;
+
 /// 生图接口对尺寸的硬要求(智谱 CogView 实测):宽高都得是 **16 的整数倍**、各自落在
 /// 512~2880,且总像素不超过 2²¹。
 ///
@@ -136,6 +156,15 @@ pub struct Stored {
     pub image_model: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub image_api_key: String,
+    /// 「图生视频」那一套。它和生图**基本总是同一家**(同一把 key 的同一个接口域下),
+    /// 所以这里只留一个模型名:地址和 key 都从生图 / 对话那两组继承下来(见 `VideosConfig::load`)。
+    /// 真要用另一家,再补字段不迟 —— 现在多两个输入框只会让人不知道该填哪个。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub video_model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub video_base_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub video_api_key: String,
 }
 
 impl Config {
@@ -436,6 +465,311 @@ impl Images {
     }
 }
 
+/// 「图生视频」这一套配置。
+///
+/// 优先级:环境变量 > `ai.json` 的 `video_*` > `ai.json` 的 `image_*` > `ai.json` 的对话字段 > 内置默认。
+/// 中间那两层是**故意的**:图生视频和生图在智谱是同一个接口域、同一把 key,
+/// 已经填过生图那组的人不该再填一遍。
+#[derive(Debug, Clone)]
+pub struct VideosConfig {
+    pub base_url: String,
+    pub model: String,
+    pub api_key: String,
+}
+
+impl VideosConfig {
+    pub fn load() -> Result<Self> {
+        let raw = read_stored().unwrap_or_default();
+        let env = |key: &str| {
+            std::env::var(key)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        };
+        let base_url = env("MCWP_VIDEO_BASE_URL")
+            .or_else(|| non_empty(&raw.video_base_url))
+            .or_else(|| non_empty(&raw.image_base_url))
+            .or_else(|| non_empty(&raw.base_url))
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        let model = env("MCWP_VIDEO_MODEL")
+            .or_else(|| non_empty(&raw.video_model))
+            .unwrap_or_else(|| DEFAULT_VIDEO_MODEL.to_string());
+        let Some(api_key) = env("MCWP_VIDEO_KEY")
+            .or_else(|| non_empty(&raw.video_api_key))
+            .or_else(|| non_empty(&raw.image_api_key))
+            .or_else(|| env("MCWP_AI_KEY"))
+            .or_else(|| non_empty(&raw.api_key))
+        else {
+            return Err(anyhow!("{}", missing_image_key_hint()));
+        };
+        Ok(Self {
+            base_url,
+            model,
+            api_key,
+        })
+    }
+}
+
+/// 一条视频生成到哪一步了。
+#[derive(Debug, Clone, PartialEq)]
+pub enum VideoProgress {
+    /// 还在跑(服务商那边)
+    Running,
+    /// 出来了:视频地址 + 封面图地址(封面是它的第一帧,存下来当缩略图)
+    Done { video_url: String, cover_url: String },
+    /// 服务商说这条失败了
+    Failed(String),
+}
+
+/// 一次图生视频的产物。和 `GeneratedImage` 同一套路:地址留着(日志 / 排查用),
+/// 字节才是真正要落盘的东西 —— 地址 24 小时后就没了。
+pub struct GeneratedVideo {
+    pub url: String,
+    pub bytes: Vec<u8>,
+}
+
+/// 「图生视频」接口的客户端。
+///
+/// 和 `Images` 分开建的理由,与生图和对话分开的理由**不完全一样**,值得说清楚:
+/// - **它是两段式**:提交拿任务号 → 轮询异步结果。轮询那条路有自己的节奏(见 `VIDEO_POLL_INTERVAL`),
+///   硬塞进"一次请求一次结果"的 `Images` 里,超时和重试都无从谈起。
+/// - **它慢一个数量级**:生图十几秒,这个一分钟起步;超时给到 6 分钟,不能和生图共用一个。
+/// - **它的请求体可能很大**:图片是用 base64 塞进 `image_url` 的(见 `image_data_url`),
+///   那张图有几兆,请求体就有几兆 —— 这也是"别和别的调用共用一个 agent"的理由之一。
+///
+/// 一个**反直觉的坑**:轮询那条路会返回 HTTP 400,而 body 里其实是一条完全正常的任务状态
+/// (实测踩到过 `{"task_status":"SUCCESS",...}` 配 400)。所以 `poll` 判成功**看 body 里的
+/// `task_status`,不看 HTTP 码** —— 只看 HTTP 码会把已经出片的任务当成失败扔掉。
+#[derive(Clone)]
+pub struct Videos {
+    cfg: VideosConfig,
+    agent: ureq::Agent,
+}
+
+impl Videos {
+    pub fn new(cfg: VideosConfig) -> Self {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            // 一次请求最多等 6 分钟(轮询那条每次都是小请求,真正会慢的是下载视频),
+            // 和"整条路最多等多久"是两回事,后者在 `animate` 里管
+            .timeout_global(Some(Duration::from_secs(600)))
+            .http_status_as_error(false)
+            // 理由同 `Client::new`:不显式挑 native-tls,ureq 会在 https 上直接 panic
+            .tls_config(
+                TlsConfig::builder()
+                    .provider(TlsProvider::NativeTls)
+                    .build(),
+            )
+            .build()
+            .into();
+        Self { cfg, agent }
+    }
+
+    /// 给人看的服务商 / 模型标识,写进日志和状态行。
+    pub fn describe(&self) -> String {
+        let host = self
+            .cfg
+            .base_url
+            .split("//")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or(&self.cfg.base_url);
+        format!("{host} · {}", self.cfg.model)
+    }
+
+    /// 配置里那条地址的**根部**。写成完整 endpoint 也认:那样就把子路径摘掉,
+    /// 因为提交和轮询两条路挂的是同一个根(见 `submit` / `poll`)。
+    fn root(&self) -> String {
+        let base = self.cfg.base_url.trim_end_matches('/').to_string();
+        base.strip_suffix("/videos/generations")
+            .map(|trimmed| trimmed.to_string())
+            .unwrap_or(base)
+    }
+
+    /// 提交一条图生视频任务,拿回任务号。
+    pub fn submit(&self, image_url: &str, prompt: &str) -> Result<String> {
+        let body = serde_json::to_string(&VideoRequest {
+            model: self.cfg.model.as_str(),
+            prompt,
+            image_url,
+        })?;
+        let mut response = self
+            .agent
+            .post(&format!("{}/videos/generations", self.root()))
+            .header("Content-Type", "application/json")
+            .header("Authorization", &format!("Bearer {}", self.cfg.api_key))
+            .send(body.as_str())
+            .map_err(|err| anyhow!("提交图生视频失败:{err}"))?;
+        let status = response.status();
+        let raw = response
+            .body_mut()
+            .read_to_string()
+            .context("读图生视频响应失败")?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "图生视频接口返回 {}:{}",
+                status.as_u16(),
+                truncate(&raw, 300)
+            ));
+        }
+        let task: VideoTask = serde_json::from_str(&raw)
+            .with_context(|| format!("图生视频响应里没有任务号:{}", truncate(&raw, 200)))?;
+        if task.id.trim().is_empty() {
+            return Err(anyhow!("图生视频接口没给任务号:{}", truncate(&raw, 200)));
+        }
+        tracing::info!("图生视频任务已提交:{}", task.id);
+        Ok(task.id)
+    }
+
+    /// 问一次任务跑到哪了(见 `Videos` 的说明:判成功看 body,不看 HTTP 码)。
+    pub fn poll(&self, id: &str) -> Result<VideoProgress> {
+        let mut response = self
+            .agent
+            .get(&format!("{}/async-result/{}", self.root(), id))
+            .header("Authorization", &format!("Bearer {}", self.cfg.api_key))
+            .call()
+            .map_err(|err| anyhow!("查询图生视频结果失败:{err}"))?;
+        let status = response.status();
+        let raw = response.body_mut().read_to_string().context("读查询响应失败")?;
+        let task: VideoTask = match serde_json::from_str(&raw) {
+            Ok(task) => task,
+            Err(err) => {
+                // 解析不出任务形状时,HTTP 码才有意义(它多半是个真正的错误响应)
+                return Err(anyhow!(
+                    "查询图生视频结果失败(HTTP {}):{}",
+                    status.as_u16(),
+                    truncate(&raw, 300)
+                ))
+                .with_context(|| format!("{err}"));
+            }
+        };
+        match task.task_status.as_str() {
+            "SUCCESS" => {
+                let video_url = task
+                    .video_result
+                    .first()
+                    .map(|entry| entry.url.clone())
+                    .unwrap_or_default();
+                if video_url.trim().is_empty() {
+                    return Err(anyhow!("服务商说成功了,但没给视频地址"));
+                }
+                Ok(VideoProgress::Done {
+                    video_url,
+                    cover_url: task
+                        .video_result
+                        .first()
+                        .map(|entry| entry.cover_image_url.clone())
+                        .unwrap_or_default(),
+                })
+            }
+            "FAIL" => Ok(VideoProgress::Failed(truncate(&raw, 200))),
+            // PROCESSING 是实测见到的;别的状态一律当"还在跑"—— 宁可多等一轮,
+            // 也不要把一个未知状态当成失败把任务扔掉(它可能已经把额度花了)。
+            other => {
+                tracing::debug!("图生视频还在跑:{other}");
+                Ok(VideoProgress::Running)
+            }
+        }
+    }
+
+    /// 整条路:提交 → 轮询到出片 → **当场下载**。
+    pub fn animate(&self, image_url: &str, prompt: &str) -> Result<GeneratedVideo> {
+        let id = self.submit(image_url, prompt)?;
+        let started = std::time::Instant::now();
+        loop {
+            match self.poll(&id)? {
+                VideoProgress::Running => {
+                    if started.elapsed() > VIDEO_WAIT_TIMEOUT {
+                        return Err(anyhow!(
+                            "等了 {:.0} 分钟还没出片(任务 {id} 可能还在排队),先别管它,过会儿再试",
+                            VIDEO_WAIT_TIMEOUT.as_secs_f32() / 60.0
+                        ));
+                    }
+                    std::thread::sleep(VIDEO_POLL_INTERVAL);
+                }
+                VideoProgress::Done { video_url, .. } => {
+                    let bytes = self.download(&video_url)?;
+                    tracing::info!(
+                        "图生视频完成:{} KB · 耗时 {:.1}s",
+                        bytes.len() / 1024,
+                        started.elapsed().as_secs_f32()
+                    );
+                    return Ok(GeneratedVideo {
+                        url: video_url,
+                        bytes,
+                    });
+                }
+                VideoProgress::Failed(reason) => {
+                    return Err(anyhow!("服务商说这条视频没生成出来:{reason}"));
+                }
+            }
+        }
+    }
+
+    /// 把视频抓成字节。走同一个 agent(超时和 TLS 配置都现成)。
+    fn download(&self, url: &str) -> Result<Vec<u8>> {
+        let mut response = self
+            .agent
+            .get(url)
+            .call()
+            .map_err(|err| anyhow!("下载视频失败:{err}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow!("下载视频返回 {}:{}", status.as_u16(), truncate(url, 120)));
+        }
+        let bytes = response.body_mut().read_to_vec().context("读视频字节失败")?;
+        if bytes.is_empty() {
+            return Err(anyhow!("下载到的视频是空的:{}", truncate(url, 120)));
+        }
+        Ok(bytes)
+    }
+}
+
+/// 把一张图的字节包成 `data:` URL(base64 内联)。
+///
+/// 为什么非要内联,而不是把服务商返回的那个图片地址丢给它:
+/// - 生图返回的地址**只有 7 天**,视频那条更短(**24 小时**)。而库里的图是要长期留着的 ——
+///   存地址等于存一个"过几天就打不开"的入口,于是"把上周生成的那张做成动态壁纸"就永远做不到。
+/// - 内联之后**库里任意一张图**都能做视频,和它是哪天生成的、链接过期没有,完全无关。
+///
+/// 实测:2 MB 的请求体(1920×1088 的 PNG)照收,所以原图直接发,不缩也不重编码 ——
+/// 重压一次只会让画面更糊,而这是**图生视频的条件图**,糊了整段视频都跟着糊。
+pub fn image_data_url(bytes: &[u8]) -> String {
+    // 只认这两种:服务商给的图不是 PNG 就是 JPEG(和 `photos.rs` 认扩展名同一个口径)
+    let mime = if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else {
+        "image/png"
+    };
+    format!("data:{mime};base64,{}", base64(bytes))
+}
+
+/// 标准 base64(带 `=` 补齐)。
+///
+/// 自己写而不是引一个依赖:算法就是下面这二十行,而这里已经用测试把它钉住了
+/// (`base64_编码和已知向量一致`)。为了一处调用往依赖树里加一个 crate,不划算。
+fn base64(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let first = chunk[0] as u32;
+        let second = chunk.get(1).copied().unwrap_or(0) as u32;
+        let third = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (first << 16) | (second << 8) | third;
+        out.push(TABLE[(triple >> 18) as usize & 0x3F] as char);
+        out.push(TABLE[(triple >> 12) as usize & 0x3F] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(triple >> 6) as usize & 0x3F] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[triple as usize & 0x3F] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// 把"屏幕分辨率"折成服务商能接受的尺寸(规则见 `SIZE_MIN` 那段)。
 ///
 /// 步骤:等比缩到总像素上限内 → 夹到 512~2880 → 四舍五入到 16 的倍数 → 再保一次总像素。
@@ -578,6 +912,38 @@ impl Client {
             motion: MotionRecipe::default(),
             degraded: true,
             calls,
+        }
+    }
+
+    /// 图生视频这条路的第一跳:一张**已经生好的图** → **一句"它该怎么动"的提示词**。
+    ///
+    /// 为什么还要过一次文本模型:图生视频的提示词和生图的提示词**不是一回事**。
+    /// 生图那句说的是"画面里有什么"(`Photo::prompt` 里已经有了),而这条要说的是
+    /// "它该怎么动" —— 镜头推拉、云在飘、水面起波纹、光影在变。这中间的翻译还是只能由
+    /// 懂语言的那一方做:让模型看一眼那张图的描述再写一句,比在代码里硬套
+    /// "slow camera push in" 贴题得多,而这一次调用很便宜(一句几十字)。
+    ///
+    /// 和 `plan_photo` 一样**绝不返回 Err**:用户点的是「做成动态壁纸」,
+    /// 不能因为一句话没写出来就什么都不做 —— 写不出来就用 `fallback_motion_prompt`。
+    pub fn plan_motion(&self, photo: &Photo) -> String {
+        let messages = vec![
+            Message::system(MOTION_SYSTEM_PROMPT.to_string()),
+            Message::user(motion_request(photo)),
+        ];
+        match self.chat(&messages) {
+            Ok(text) => {
+                let prompt = clean_motion_reply(&text);
+                if prompt.is_empty() {
+                    tracing::warn!("模型回的动效提示词是空的,用通用运镜");
+                    return fallback_motion_prompt().to_string();
+                }
+                tracing::info!("动效提示词:{prompt}");
+                prompt
+            }
+            Err(err) => {
+                tracing::warn!("动效提示词没写出来({err:#}),用通用运镜");
+                fallback_motion_prompt().to_string()
+            }
         }
     }
 
@@ -739,6 +1105,66 @@ motion 的四个数都是 0~1:intensity 是效果强弱,zoom 是画面推近幅�
 推荐区间:intensity 0.4~0.6 / zoom 0.1~0.25 / pan 0.05~0.15 / speed 0.2~0.4。";
 
 /// 生图那条路的用户消息。带上当前壁纸是为了让"换成雪天的"这种话有上下文。
+/// 写「动效提示词」用的系统提示词。
+///
+/// 和生图那份一样,**把底线写在提示词里而不是写在代码里**:图生视频的模型不认识我们的数据结构,
+/// 它只听得到这句话。所以这里要说清楚三件事:写的是"怎么动"不是"画了什么"、只写一句、
+/// 以及一串"绝对不要出现"的东西(文字 / 水印 / 分镜切换,都是这一段喂出来的视频常见的翻车点)。
+const MOTION_SYSTEM_PROMPT: &str = "\
+你在为「图生视频」写提示词。用户会给你一张**已经画好的图**的描述,你要写的不是画面里有什么\
+(那个模型已经看得见了),而是**它该怎么动**。\n\
+只写一句话,不超过 60 字,内容只允许落在下面三类里:\n\
+1. 镜头:缓慢推近 / 缓慢拉远 / 左右平移 / 轻微环绕 / 固定机位\n\
+2. 画面内的自然运动:云在飘、水面泛起波纹、雾气缓缓流动、树叶轻晃、光影缓慢变化\n\
+3. 节奏:整体缓慢、平稳\n\
+**绝对不要出现**:画面里有什么东西、文字、字母、数字、水印、logo、人脸特写、人物主体、\
+分镜切换、剧烈缩放、闪烁。\n\
+只输出这一句话本身:不要解释、不要加引号、不要 JSON、不要 markdown、不要换行。";
+
+/// 交给模型的"这张图是什么"。
+fn motion_request(photo: &Photo) -> String {
+    format!(
+        "这张壁纸叫「{}」,画面描述是:{}\n请写一句它该怎么动的提示词。",
+        photo.title, photo.prompt
+    )
+}
+
+/// 模型没答上来时用的通用运镜。**必须是一句真能用的话**:这条路是兜底,
+/// 用户点完按钮总得有东西动起来,而不是弹一句"模型没接上"。
+/// 公开出去是因为调用方也可能直接用它:没配对话模型时,图生视频那条路照样要能跑。
+pub fn fallback_motion_prompt() -> &'static str {
+    "镜头缓慢推近,画面里的云与雾缓缓流动、水面有细微波纹、光影轻微变化,整体平稳自然的慢镜头"
+}
+
+/// 把模型那句回复收干净:去围栏、去引号、只留第一行、限长。
+///
+/// 免费模型很爱加一层 ``` 或者"提示词:"这样的前缀;而 `image_url` 那一侧只吃一句话,
+/// 多出来的字会变成视频里莫名其妙的东西,所以宁可在本地削干净。
+fn clean_motion_reply(text: &str) -> String {
+    // 逐行看:跳过围栏那一行、摘掉"提示词:"这类前缀,取**第一行还有内容**的当正文。
+    // 不能只 `find` "不以提示词开头的行" —— 正文和前缀写在同一行是很常见的返法。
+    const PREFIXES: [&str; 6] = ["提示词:", "提示词：", "输出:", "输出：", "Prompt:", "prompt:"];
+    let mut picked = String::new();
+    for raw in text.lines() {
+        let mut line = raw.trim().trim_start_matches(['#', '*', '-']).trim();
+        if line.starts_with("```") {
+            continue;
+        }
+        for prefix in PREFIXES {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                line = rest.trim();
+                break;
+            }
+        }
+        let line = line.trim_matches(['"', '\u{201c}', '\u{201d}']).trim();
+        if !line.is_empty() {
+            picked = line.to_string();
+            break;
+        }
+    }
+    truncate(&picked, MAX_MOTION_PROMPT_CHARS)
+}
+
 fn photo_request(request: &str, current: Option<&Photo>) -> String {
     match current {
         Some(photo) => format!(
@@ -906,6 +1332,40 @@ struct ResponseMessage {
     content: String,
 }
 
+/// 图生视频的请求体。**只有三个字段**,而且每个都是必需的:
+/// `image_url` 是那张图(base64 内联,见 `image_data_url`),`prompt` 是"它该怎么动"。
+/// 服务商那边还有尺寸 / 时长 / 音轨这些可选参数,但它们都由模型自己定 —— 壁纸不需要挑,
+/// 多写两个字段只会多两处会过期的假设。
+#[derive(Debug, Serialize)]
+struct VideoRequest<'a> {
+    model: &'a str,
+    prompt: &'a str,
+    image_url: &'a str,
+}
+
+/// 任务状态。**提交和轮询返回的是同一个形状**(实测:提交回 `PROCESSING`,轮询回 `SUCCESS` +
+/// `video_result`),所以两边共用一份,不写两遍。
+#[derive(Debug, Deserialize)]
+struct VideoTask {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    task_status: String,
+    #[serde(default)]
+    video_result: Vec<VideoResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VideoResult {
+    #[serde(default)]
+    url: String,
+    /// 第一帧的图。**我们不用它**:封面是自己从 mp4 里解出来的(省一次下载,
+    /// 也省得依赖另一个 24 小时后就会失效的地址),留着只是因为它是响应的一部分。
+    #[serde(default)]
+    #[allow(dead_code)]
+    cover_image_url: String,
+}
+
 /// 生图请求体。OpenAI 兼容的生图接口都是这个形状(`size` 是 `"宽x高"` 的字符串)。
 #[derive(Debug, Serialize)]
 struct ImageRequest<'a> {
@@ -1009,5 +1469,76 @@ mod tests {
         assert!(prompt.starts_with("我想要个安静点的桌面"), "开头就是用户原话");
         assert!(prompt.contains("无文字"));
         assert!(prompt.contains("留白"));
+    }
+
+    /// base64 是手写的(见 `base64` 的说明),拿 RFC 4648 那几条已知向量钉住 ——
+    /// 三个字节 → 四个字符、两个字节补一个 `=`、一个字节补两个 `=` 这三种情况都要覆盖,
+    /// 因为"补齐"这一支写错的概率最高,而错了之后服务商只会回一句莫名其妙的 400。
+    #[test]
+    fn base64_编码和已知向量一致() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        // 二进制里的高位字节(0x80 / 0xFF)不能被当成符号位处理
+        assert_eq!(base64(&[0x80, 0xFF, 0x00]), "gP8A");
+    }
+
+    /// 内联那张图的 MIME 得按**文件头**认:认错了服务商那边是"图片解析失败",
+    /// 而报错信息里根本不会提到我们给错了类型。
+    #[test]
+    fn 内联图片按文件头认类型() {
+        assert!(image_data_url(&[0x89, b'P', b'N', b'G']).starts_with("data:image/png;base64,"));
+        assert!(image_data_url(&[0xFF, 0xD8, 0xFF, 0xE0]).starts_with("data:image/jpeg;base64,"));
+    }
+
+    /// 轮询那条路返回的形状(实测样本),三种状态都要认出来:
+    /// 跑着 / 出来了 / 失败了。**注意它可能配着 HTTP 400 回来** —— 所以状态只从 body 里读。
+    #[test]
+    fn 视频任务状态能认出来() {
+        let running: VideoTask =
+            serde_json::from_str(r#"{"id":"task-1","task_status":"PROCESSING"}"#).unwrap();
+        assert_eq!(running.task_status, "PROCESSING");
+        assert!(running.video_result.is_empty());
+
+        let done: VideoTask = serde_json::from_str(
+            r#"{"id":"task-1","task_status":"SUCCESS","video_result":[
+                 {"url":"https://example.com/a.mp4","cover_image_url":"https://example.com/a.png"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(done.video_result.len(), 1);
+        assert_eq!(done.video_result[0].url, "https://example.com/a.mp4");
+        assert_eq!(done.video_result[0].cover_image_url, "https://example.com/a.png");
+
+        let failed: VideoTask =
+            serde_json::from_str(r#"{"id":"task-1","task_status":"FAIL"}"#).unwrap();
+        assert_eq!(failed.task_status, "FAIL");
+    }
+
+    /// 模型那句"怎么动"要能被收干净:围栏、"提示词:"前缀、引号、后面跟着的解释都得去掉。
+    /// 这些字多留一个,就会变成视频里莫名其妙的东西。
+    #[test]
+    fn 动效提示词会被收干净() {
+        assert_eq!(
+            clean_motion_reply("```\n镜头缓慢推近,云在飘\n```"),
+            "镜头缓慢推近,云在飘"
+        );
+        assert_eq!(
+            clean_motion_reply("提示词:镜头缓慢推近,水面泛起波纹"),
+            "镜头缓慢推近,水面泛起波纹"
+        );
+        assert_eq!(
+            clean_motion_reply("“镜头缓慢拉远,雾气流动”"),
+            "镜头缓慢拉远,雾气流动"
+        );
+        // 只有围栏、没有正文时返回空串,由调用方回退到通用运镜
+        assert!(clean_motion_reply("```json\n```").is_empty());
+        // 太长会截断(`truncate` 会在尾巴上加一个省略号,所以是 max + 1)
+        let long = clean_motion_reply(&"推".repeat(500));
+        assert!(long.ends_with('…'));
+        assert!(long.chars().count() <= MAX_MOTION_PROMPT_CHARS + 1);
     }
 }

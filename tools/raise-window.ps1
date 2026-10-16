@@ -22,8 +22,9 @@ foreach ($p in Get-Process -Name $ProcessName -ErrorAction SilentlyContinue) {
 }
 if (-not $target) { "没找到窗口: $ProcessName"; exit 1 }
 
+# 9 = SW_RESTORE:窗口被最小化过时,SW_SHOW(5) 只是让它"保持最小化",得用 RESTORE 才拉得回来。
 $h = $target.MainWindowHandle
-[Mcwp.Win]::ShowWindow($h, 5) | Out-Null
+[Mcwp.Win]::ShowWindow($h, 9) | Out-Null
 [Mcwp.Win]::SetWindowPos($h, $HWND_TOPMOST, 0, 0, 0, 0, ($SWP_NOMOVE -bor $SWP_NOSIZE -bor $SWP_SHOWWINDOW)) | Out-Null
 [Mcwp.Win]::SetForegroundWindow($h) | Out-Null
 "raised: pid=$($target.Id) title='$($target.MainWindowTitle)'"
