@@ -1,7 +1,12 @@
 ﻿# 面板回归探针:把面板临时提到最前,按脚本点击 / 截图,结束后恢复 z 序。
 #
 # 为什么需要它:单纯 SetCursorPos + mouse_event 会点到压在面板上面的窗口上,
-# 页面状态就会"莫名其妙"没变。这里先 HWND_TOPMOST 保证面板在最前。
+# 页面状态就会"莫名其妙"没变。这里先把面板排到 z 序最前。
+#
+# **用 `HWND_TOP`,不用 `HWND_TOPMOST`**:后者留下的是持久样式 `WS_EX_TOPMOST`,脚本退出
+# 也不消失(2026-10-16 的"面板总在最上层"就是这么来的,详见 raise-window.ps1 与方案 §11.19)。
+#
+# 开头那次 `HWND_NOTOPMOST` 是清历史遗留 —— 老版本脚本钉上去的状态,由这里顺手解开。
 #
 # 用法:
 #   tools\panel-probe.ps1 -Actions 'click:470,78','shot:tab-1.png','click:171,78','shot:tab-back.png'
@@ -42,12 +47,13 @@ $cb = [Pp.W+EnumProc]{ param($h,$p)
 $h = $script:found
 if ($h -eq [IntPtr]::Zero) { Write-Error "no panel window matching '$MatchTitle'"; exit 1 }
 
-$HWND_TOPMOST = [IntPtr]::new(-1)
+$HWND_TOP = [IntPtr]::Zero
 $HWND_NOTOPMOST = [IntPtr]::new(-2)
 $SWP = 0x0001 -bor 0x0002 -bor 0x0040   # NOSIZE | NOMOVE | SHOWWINDOW
 
 [void][Pp.W]::ShowWindow($h, 5)
-[void][Pp.W]::SetWindowPos($h, $HWND_TOPMOST, 0, 0, 0, 0, $SWP)
+[void][Pp.W]::SetWindowPos($h, $HWND_NOTOPMOST, 0, 0, 0, 0, $SWP)
+[void][Pp.W]::SetWindowPos($h, $HWND_TOP, 0, 0, 0, 0, $SWP)
 [void][Pp.W]::SetForegroundWindow($h)
 Start-Sleep -Milliseconds 250
 
@@ -115,5 +121,5 @@ foreach ($a in $Actions) {
     else { Write-Warning "unknown action: $a" }
 }
 
-[void][Pp.W]::SetWindowPos($h, $HWND_NOTOPMOST, 0, 0, 0, 0, $SWP)
+# z 序不用"还原":`HWND_TOP` 只改了这一次的前后顺序,没给窗口留下任何样式。
 [void][Pp.W]::SetCursorPos($orig.X, $orig.Y)
