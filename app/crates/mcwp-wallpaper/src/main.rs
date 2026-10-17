@@ -29,23 +29,23 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use mcwp_platform::desktop::{
-    memory_mb, primary_monitor_rect, set_per_monitor_dpi_awareness, AttachMode, HostStyle,
-    HostWindow,
+    AttachMode, HostStyle, HostWindow, memory_mb, primary_monitor_rect,
+    set_per_monitor_dpi_awareness,
 };
-use mcwp_platform::tray::{self, Tray, TrayAction};
 #[cfg(feature = "dev-tools")]
 use mcwp_platform::desktop::{candidate_report, invalidate_window, set_gdi_background_paint};
 #[cfg(feature = "dev-tools")]
 use mcwp_platform::diag;
+use mcwp_platform::tray::{self, Tray, TrayAction};
 use mcwp_render::{PhotoParams, Renderer};
 use mcwp_spec::Photo;
 use tracing_subscriber::EnvFilter;
-use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{GetLastError, SetLastError, ERROR_ALREADY_EXISTS, ERROR_SUCCESS};
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, SetLastError};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    FindWindowW, SW_RESTORE, SetForegroundWindow, ShowWindow,
 };
+use windows::core::{PCWSTR, w};
 
 mod photos;
 mod sessions;
@@ -129,8 +129,8 @@ struct ActivePhoto {
     /// **视频壁纸才有**的播放状态。挂在这里而不是另开一份全局状态:
     /// "现在屏幕上是什么"只有一个答案,分两处存就会出现"图换了、视频还在放"这种半拉状态。
     video: Option<VideoPlayback>,
-    /// 用户/桌面定下来的那个亮度(不含曝光校正)。每帧的 `params.brightness` 是它乘上
-    /// 视频当前的曝光增益算出来的 —— 单存一份"最终亮度"的话,校正一变就没法还原基准。
+    /// 用户/桌面定下来的那个亮度。视频的曝光校正已经烘进帧像素,不再走这里;
+    /// 单存一份基准,面板/托盘改亮度时才不会被上一帧的校正值污染。
     base_brightness: f32,
 }
 
@@ -148,24 +148,44 @@ struct VideoPlayback {
     elapsed: f32,
     /// 这段多长(秒),来自解码器。
     duration: f32,
-    /// **第一帧**的像素。循环点的"淡回第一帧"要淡到它身上(见 `LOOP_FADE_SECS`)。
+    /// **第一帧**的像素。循环点两端都向它收口(见 `LOOP_FADE_SECS`)。
     first: Vec<u8>,
     /// 混合用的缓冲。只在接缝那一小段用到 —— 复用同一个 `Vec`,
     /// 别每帧再 `to_vec()` 一次(1080p 一帧 8 MB,一秒 30 次就是 250 MB/s 的无谓分配)。
     scratch: Vec<u8>,
-    /// 这一段该校的**曝光增益**(1.0 = 不校)。入库时量好存进 `Photo`,这里只是拿来用。
-    seam_gain: f32,
+    /// 整段统一乘的曝光增益(1.0 = 不校)。
+    ///
+    /// 它来自**原图 vs 视频首帧**的亮度差,不是首末帧的差。旧版把 `seam_gain`
+    /// (末帧/首帧)摊到整段,遇到"片头暗、后面亮"的片子会把整段压暗,用户看到的
+    /// 就是"动图怎么这么暗"。这里只做一件事:把视频拉回原图的曝光,绝不压暗。
+    display_gain: f32,
+    /// 片头要跳过的帧数(片头从黑场淡入时不为 0)。
+    skip_frames: usize,
 }
 
-/// 循环点前后多长一段用来"淡回第一帧"。
+/// 循环点前后各用多长一段向第一帧收口。
 ///
 /// 为什么非要有这一段:模型给的头尾**不可能一模一样**(哪怕首尾帧都喂了同一张图 ——
 /// 它是"尽力绕回去",不是"保证绕回去"),而硬切回去就是那一下肉眼可见的跳。
-/// 有了它,循环点上那点差异被摊在 0.8 秒里抹平。
+/// 结尾淡回首帧只解决一半:回到开头后,第一帧和第一个视频帧之间仍可能有一大步
+/// (实测森林那条片子平均差 5.1,是整段最大的单帧跳变)。所以开头也用同样的窗口
+/// 从首帧慢慢展开到视频画面,循环点才真正两头闭合。
 ///
 /// 为什么是 0.8 秒:短了盖不住,长了能看出"画面在往回并"(运动明显变慢)。
-/// 视频短于 3.2 秒时按 1/4 收窄(`tail_alpha` 里夹住)—— 整段都在淡等于整段都不对劲。
+/// 视频短于 3.2 秒时按 1/4 收窄(两个 alpha 函数里各自夹住)—— 整段都在淡等于整段都不对劲。
 const LOOP_FADE_SECS: f32 = 0.8;
+
+/// 首尾帧引导默认关闭。
+///
+/// 2026-10-17 的同图实测:首尾帧光流约 0.06,单图 `quality` 约 2.92、`speed` 约 8.79。
+/// 首尾帧会把"最后一帧落到第二张图"当成硬目标,模型于是把中间运动压到几乎静止。
+/// 动态壁纸默认走单图首帧;首尾帧只在明确需要"循环锁定/转场"时再打开。
+const GUIDED_FRAMES_ENABLED: bool = false;
+
+/// 片头淡入的探测窗口。图生视频常常从黑场淡入(实测森林那条前 0.7 秒从 31 爬到 44),
+/// 如果直接拿第 0 帧当循环基准,每次循环都会先暗半秒。这里在开头扫一小段:
+/// 亮度明显爬升就跳过这段淡入,拿稳定后的那帧当首帧。
+const VIDEO_START_SCAN_SECS: f32 = 0.8;
 
 impl VideoPlayback {
     /// 打开一段视频并把第一帧贴上去。
@@ -173,39 +193,28 @@ impl VideoPlayback {
         renderer: &mut Renderer,
         path: &std::path::Path,
         screen: (u32, u32),
-        seam_gain: f32,
+        target_mean: Option<f32>,
     ) -> Result<Self> {
         let mut player = mcwp_video::Player::open(path, screen)
             .with_context(|| format!("打开视频失败:{}", path.display()))?;
         let info = player.info();
-        let first = player
-            .next_frame()
-            .context("解视频第一帧失败")?
-            .map(|pixels| pixels.to_vec())
-            .ok_or_else(|| anyhow::anyhow!("{} 里一帧画面都没有", path.display()))?;
+        let step = player.frame_interval().max(0.001);
+        let (frame, skip_frames) = first_display_frame(&mut player, info.duration.as_secs_f32())?;
+        let first_mean = rgb_mean(&frame);
+        let display_gain = display_gain_for(target_mean, first_mean);
+        let first = scale_rgb(&frame, display_gain);
         renderer.set_video_frame(info.width, info.height, &first)?;
+        let duration = (info.duration.as_secs_f32() - skip_frames as f32 * step).max(step);
         Ok(Self {
             player,
             remaining: 0.0,
             elapsed: 0.0,
-            duration: info.duration.as_secs_f32(),
+            duration,
             first,
             scratch: Vec::new(),
-            seam_gain,
+            display_gain,
+            skip_frames,
         })
-    }
-
-    /// 这一帧该乘的曝光增益:开头照原样(1.0),到末尾线性走到 `seam_gain`。
-    ///
-    /// 为什么摊在整段、而不是只在接缝那一小段:`seam_gain` 说的是"末帧比首帧亮多少"。
-    /// 只在最后 0.8 秒里补,那 0.8 秒就会变成一段明显的忽明忽暗;摊到十秒里,
-    /// 每帧只差千分之几,看不出在动,而接缝上两边正好对平。
-    fn exposure_gain(&self) -> f32 {
-        if self.duration <= 0.0 || !self.seam_gain.is_finite() {
-            return 1.0;
-        }
-        let progress = (self.elapsed / self.duration).clamp(0.0, 1.0);
-        1.0 + (self.seam_gain - 1.0) * progress
     }
 
     /// 走一帧的时钟;该换帧了就把新的一帧贴上去。
@@ -225,7 +234,12 @@ impl VideoPlayback {
         let info = self.player.info();
         // 强度按**这一帧的时间**算,然后时间往后走一帧:刚开头那一帧的时间是 0(强度也是 0),
         // 一循环完立刻归零,不会在接缝上多算一帧。
-        let alpha = loop_fade_alpha(self.elapsed, self.duration);
+        // 结尾向首帧收、开头从首帧展开。两个窗口不会同时出现(短片会按 1/4 收窄),
+        // 取较大的那个即可:在两端都是 alpha=1,离开端点后平滑衰减到 0。
+        let alpha = loop_fade_alpha(self.elapsed, self.duration)
+            .max(loop_intro_alpha(self.elapsed, self.duration));
+        let gain = self.display_gain;
+        let skip_frames = self.skip_frames;
         self.elapsed = (self.elapsed + step).min(self.duration);
         // 借用要拆开:`next_frame` 会把 `player` 借走,而贴帧还要用 `first` / `scratch`。
         let mut restarted = false;
@@ -236,19 +250,39 @@ impl VideoPlayback {
             ..
         } = self;
         match player.next_frame()? {
-            Some(pixels) => {
-                present_frame(renderer, info.width, info.height, pixels, alpha, first, scratch)?
-            }
+            Some(pixels) => present_frame(
+                renderer,
+                info.width,
+                info.height,
+                pixels,
+                alpha,
+                gain,
+                first,
+                scratch,
+            )?,
             // 放完了:**从头再来**。生图服务商给的只有十秒左右,循环播放才像一张壁纸;
             // 停在最后一帧会让桌面看起来"死"了。最后那几帧已经淡回第一帧(见 `LOOP_FADE_SECS`),
             // 所以这一次重头开始是**接得上**的 —— 原来这里是一记硬切,用户看到的就是那一下跳。
             None => {
                 player.rewind()?;
                 restarted = true;
-                if let Some(pixels) = player.next_frame()? {
-                    // 新一轮的第一帧:强度恒为 0,别把第一帧和它自己混一遍
-                    present_frame(renderer, info.width, info.height, pixels, 0.0, first, scratch)?;
+                // 回到片头后同样跳过淡入段。`first` 已经是**校正过曝光**的基准帧,
+                // 所以这里直接贴它,不再乘一次增益 —— 接缝两边才是同一个像素值。
+                for _ in 0..skip_frames.max(1) {
+                    if player.next_frame()?.is_none() {
+                        break;
+                    }
                 }
+                present_frame(
+                    renderer,
+                    info.width,
+                    info.height,
+                    first,
+                    0.0,
+                    1.0,
+                    first,
+                    scratch,
+                )?;
             }
         }
         if restarted {
@@ -256,6 +290,79 @@ impl VideoPlayback {
         }
         Ok(())
     }
+}
+
+/// 找出第一帧该拿哪一帧:片头明显从黑场淡入时,跳过淡入段。
+///
+/// 返回 `(帧像素, 跳过的帧数)`。跳过的帧数会存进 `VideoPlayback`,每次循环回到
+/// 片头都按同样的数量再跳一次 —— 否则第一轮是亮的,第二轮又从黑场开始。
+fn first_display_frame(player: &mut mcwp_video::Player, duration: f32) -> Result<(Vec<u8>, usize)> {
+    let step = player.frame_interval().max(0.001);
+    let scan_secs = VIDEO_START_SCAN_SECS.min(duration.max(0.0) * 0.25);
+    let scan = ((scan_secs / step).round() as usize).clamp(1, 60);
+    let total = (duration / step).floor() as usize;
+    let mut first = None;
+    let mut last = None;
+    let mut consumed = 0usize;
+    for _ in 0..scan {
+        let Some(pixels) = player.next_frame()? else {
+            break;
+        };
+        let frame = pixels.to_vec();
+        if first.is_none() {
+            first = Some(frame.clone());
+        }
+        last = Some(frame);
+        consumed += 1;
+    }
+    let first = first.ok_or_else(|| anyhow::anyhow!("视频里一帧画面都没有"))?;
+    let last = last.unwrap_or_else(|| first.clone());
+    let (first_mean, last_mean) = (rgb_mean(&first), rgb_mean(&last));
+    if consumed > 1
+        && total > consumed + 1
+        && first_mean.is_finite()
+        && last_mean.is_finite()
+        && last_mean > first_mean * 1.08
+    {
+        return Ok((last, consumed));
+    }
+    player.rewind()?;
+    let frame = player
+        .next_frame()?
+        .map(|pixels| pixels.to_vec())
+        .ok_or_else(|| anyhow::anyhow!("视频里一帧画面都没有"))?;
+    Ok((frame, 0))
+}
+
+/// 原图亮度 → 视频首帧亮度,算一个**只提不压**的曝光增益。
+///
+/// 旧版拿首末帧的比值摊到整段,片头暗、后面亮的片子会被压暗 25% —— 这正是
+/// 用户看到的"动图这么暗"。这里只把视频拉回原图的曝光;原图更暗时保持原样,
+/// 因为把已经够亮的画面压暗没有任何收益。
+fn display_gain_for(target_mean: Option<f32>, first_mean: f32) -> f32 {
+    let Some(target) = target_mean else {
+        return 1.0;
+    };
+    if !target.is_finite() || !first_mean.is_finite() || target <= 1.0 || first_mean <= 1.0 {
+        return 1.0;
+    }
+    let gain = (target / first_mean).clamp(1.0, 1.35);
+    if (gain - 1.0).abs() < 0.02 { 1.0 } else { gain }
+}
+
+/// 对整帧的 RGB 乘一个增益(alpha 通道不动)。
+fn scale_rgb(pixels: &[u8], gain: f32) -> Vec<u8> {
+    if !gain.is_finite() || (gain - 1.0).abs() <= 0.002 {
+        return pixels.to_vec();
+    }
+    let gain = gain.clamp(0.5, 2.0);
+    let mut out = pixels.to_vec();
+    for pixel in out.chunks_exact_mut(4) {
+        for channel in 0..3 {
+            pixel[channel] = (pixel[channel] as f32 * gain).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
 }
 
 /// 循环点的混合强度:0 = 照原样,1 = 完全是第一帧。
@@ -277,33 +384,92 @@ fn loop_fade_alpha(elapsed: f32, duration: f32) -> f32 {
     u * u * (3.0 - 2.0 * u)
 }
 
-/// 贴一帧:接缝那一小段先和第一帧混一下,再上屏。
+/// 开头的收口强度:1 = 完全是第一帧,0 = 已经是视频自己的画面。
+///
+/// 和 `loop_fade_alpha` 对称,只是方向反过来。没有它,循环回到开头时第一帧到第二帧
+/// 仍然会硬跳一下 —— 结尾淡回首帧只把"末帧→首帧"接上了,没接"首帧→视频"。
+fn loop_intro_alpha(elapsed: f32, duration: f32) -> f32 {
+    let fade = LOOP_FADE_SECS.min(duration * 0.25);
+    if fade <= 0.0 || duration <= fade {
+        return 0.0;
+    }
+    let u = 1.0 - elapsed / fade;
+    if u <= 0.0 {
+        return 0.0;
+    }
+    let u = u.min(1.0);
+    u * u * (3.0 - 2.0 * u)
+}
+
+/// 贴一帧:先把曝光校正烘进这一帧,再和第一帧做接缝混合,最后上屏。
+///
+/// 曝光校正**必须在混合之前做**。之前走的是渲染器的全局亮度,结果是:最后一帧已经
+/// 淡成了第一帧(alpha = 1),却又被乘了一次 0.75 的曝光增益,循环点就从"首帧"硬跳到
+/// "首帧 × 0.75"。把增益放进像素处理里,alpha = 1 时结果严格等于首帧,接缝才真的闭合。
 fn present_frame(
     renderer: &mut Renderer,
     width: u32,
     height: u32,
     pixels: &[u8],
     alpha: f32,
+    gain: f32,
     first: &[u8],
     scratch: &mut Vec<u8>,
 ) -> Result<()> {
-    // 长度对不上就别混了(换分辨率 / 换解码器实现时可能出现),照原样贴更安全。
-    if alpha <= 0.0 || pixels.len() != first.len() {
+    if compose_video_frame(pixels, first, alpha, gain, scratch) {
+        renderer.set_video_frame(width, height, scratch)?;
+    } else {
         renderer.set_video_frame(width, height, pixels)?;
-        return Ok(());
+    }
+    Ok(())
+}
+
+/// 曝光校正 + 接缝混合。返回 `false` 表示这一帧不用改,直接贴原像素。
+///
+/// 单独拆出来是为了能单测最关键的一条:**alpha = 1 时,输出必须严格等于第一帧**,
+/// 不管曝光增益是多少。循环点之所以会跳,就是这条曾经不成立。
+fn compose_video_frame(
+    pixels: &[u8],
+    first: &[u8],
+    alpha: f32,
+    gain: f32,
+    scratch: &mut Vec<u8>,
+) -> bool {
+    let gain = if gain.is_finite() {
+        gain.clamp(0.5, 2.0)
+    } else {
+        1.0
+    };
+    let alpha = if alpha.is_finite() {
+        alpha.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let blend = alpha > 0.0 && pixels.len() == first.len();
+    let correct = (gain - 1.0).abs() > 0.002;
+    // 不用混、也不用校 → 直接贴原帧,别为看不出的变化多拷一份 1080p 像素。
+    if !blend && !correct {
+        return false;
     }
     scratch.clear();
     scratch.extend_from_slice(pixels);
-    // 只混 RGB —— alpha 通道这一路恒为 255,混它没意义
-    for (dst, src) in scratch.chunks_exact_mut(4).zip(first.chunks_exact(4)) {
+    // 只动 RGB —— alpha 通道这一路恒为 255,混它没意义。
+    // 先乘增益,再按 alpha 向首帧靠;alpha = 1 时无论增益是多少,结果都是首帧原像素。
+    for (index, dst) in scratch.chunks_exact_mut(4).enumerate() {
+        let target = if blend {
+            Some(&first[index * 4..index * 4 + 4])
+        } else {
+            None
+        };
         for channel in 0..3 {
-            let value = dst[channel] as f32;
-            let target = src[channel] as f32;
-            dst[channel] = (value + (target - value) * alpha) as u8;
+            let mut value = dst[channel] as f32 * gain;
+            if let Some(target) = target {
+                value += (target[channel] as f32 - value) * alpha;
+            }
+            dst[channel] = value.round().clamp(0.0, 255.0) as u8;
         }
     }
-    renderer.set_video_frame(width, height, scratch)?;
-    Ok(())
+    true
 }
 
 /// 一轮「做成动态壁纸」跑完的产物。
@@ -326,7 +492,18 @@ struct VideoOutcome {
     /// 第几轮。同一时刻只允许跑一轮(面板那颗钮会拦住),留它是为了万一
     /// 以后放开并发时,旧结果能自己认出来被丢掉。
     run: u64,
-    result: Result<Box<VideoPayload>, String>,
+    result: Result<Box<VideoPayload>, VideoFailure>,
+}
+
+/// 一轮「做成动态壁纸」失败时带回来的现场。
+///
+/// `task_id` 是关键:提交成功之后才失败的那条任务,服务商那边**已经计过费**,
+/// 任务号能让用户点「免费取回」把成片捡回来。`source_id` 是那张静图的 id,
+/// 主循环靠它把任务号写回会话里对应的消息。
+struct VideoFailure {
+    message: String,
+    task_id: Option<String>,
+    source_id: String,
 }
 
 /// 当前 unix 秒。壁纸库靠它排序,也参与文件名。
@@ -460,6 +637,20 @@ fn show_photo(
 }
 
 /// 换上一段视频(库里那条 `<id>.mp4`)。
+///
+/// 曝光基准尽量用**原图**:图生视频的成片常常比原图暗一截,播放时按原图的平均亮度
+/// 把整段提亮回来。原图找不到(手工导入的视频)就保持 1.0,不乱猜。
+fn source_mean_for(photo: &Photo) -> Option<f32> {
+    let origin = photo.origin_id.trim();
+    if origin.is_empty() {
+        return None;
+    }
+    let entry = photos::load(origin).ok()?;
+    let bitmap = entry.read_image().ok()?;
+    let mean = rgb_mean(&bitmap.rgba);
+    (mean.is_finite() && mean > 1.0).then_some(mean)
+}
+
 fn show_video(
     renderer: &mut Renderer,
     photo: Photo,
@@ -467,7 +658,7 @@ fn show_video(
     screen: (u32, u32),
     brightness: f32,
 ) -> Result<ActivePhoto> {
-    let video = VideoPlayback::open(renderer, path, screen, photo.seam_gain)?;
+    let video = VideoPlayback::open(renderer, path, screen, source_mean_for(&photo))?;
     Ok(ActivePhoto {
         // 参数用 `from_video`:关掉 Ken Burns 和效果层(见那里的说明)
         params: PhotoParams::from_video(&photo, screen.0, screen.1, brightness),
@@ -506,6 +697,7 @@ fn start_video_run(
     }
     let title = entry.source.photo.title.clone();
     let source = entry.source.clone();
+    let source_id = source.photo.id.clone();
     let chat = chat.clone();
     let animator = animator.clone();
     *run = Some(run_id);
@@ -513,10 +705,25 @@ fn start_video_run(
     // 发送端要 clone 一份搬进线程(`Sender` 的 clone 很便宜,共享同一个队列)。
     let sender = tx.clone();
     std::thread::spawn(move || {
-        let result = animate_photo(chat.as_ref(), &animator, &source, screen)
-            .map(Box::new)
-            .map_err(|err| format!("{err:#}"));
-        let _ = sender.send(VideoOutcome { run: run_id, result });
+        let result = match animate_photo(chat.as_ref(), &animator, &source, screen) {
+            Ok(payload) => Ok(Box::new(payload)),
+            Err(err) => {
+                // 把任务号从结构化错误里拿出来;没有就说明还没提交成功,
+                // 那种失败不该给「免费取回」(也没有东西可取)。
+                let task_id = err
+                    .downcast_ref::<mcwp_ai::VideoTaskFailure>()
+                    .map(|failure| failure.task_id.clone());
+                Err(VideoFailure {
+                    message: format!("{err:#}"),
+                    task_id,
+                    source_id,
+                })
+            }
+        };
+        let _ = sender.send(VideoOutcome {
+            run: run_id,
+            result,
+        });
     });
     // 别说"约一分钟":实测能从一分钟拉到十几分钟(排队),说短了用户会以为它卡死了
     format!("正在把「{title}」做成动态壁纸(要几分钟,高峰会更久;期间可以接着聊)")
@@ -545,7 +752,10 @@ fn start_video_run_visible(
 ) -> String {
     let status = start_video_run(chat, videos, library, index, screen, tx, run, run_id);
     if *run == Some(run_id) {
-        if let Some(id) = library.get(index).map(|entry| entry.source.photo.id.clone()) {
+        if let Some(id) = library
+            .get(index)
+            .map(|entry| entry.source.photo.id.clone())
+        {
             *target = Some(id.clone());
             if let Some(panel) = panel {
                 panel.set_animating(id);
@@ -555,14 +765,307 @@ fn start_video_run_visible(
     status
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TailWarp {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    dx: f32,
+    dy: f32,
+    wave: bool,
+    phase: f32,
+    cloud_like_only: bool,
+}
+
+/// 尾帧的局部引导位移:只在会动的元素区域里挪动几个像素,**画面构图、相机位置和静态物体都不动**。
+///
+/// 首尾帧服务商需要一个明确的终点。尾帧如果和首帧一模一样,模型会选择"保持静止";如果尾帧
+/// 让画面整体缩放,那就是推镜。这里的做法是把首帧复制一份,只对天空、草地、树叶等区域做
+/// 很小的局部形变 —— 模型看到了元素在动,同时被两端一致的构图钉住镜头。
+fn motion_guide_bitmap(
+    bitmap: &mcwp_image::Bitmap,
+    plan: &mcwp_spec::MotionPlan,
+) -> (mcwp_image::Bitmap, usize, f32) {
+    let warps = motion_guide_warps(bitmap.width, bitmap.height, plan);
+    if warps.is_empty() || bitmap.is_empty() {
+        return (bitmap.clone(), 0, 0.0);
+    }
+
+    let width = bitmap.width as usize;
+    let height = bitmap.height as usize;
+    let mut rgba = vec![0u8; bitmap.rgba.len()];
+    let mut max_shift = 0.0f32;
+    for y in 0..height {
+        let ny = (y as f32 + 0.5) / height as f32;
+        for x in 0..width {
+            let nx = (x as f32 + 0.5) / width as f32;
+            let offset = (y * width + x) * 4;
+            let pixel = &bitmap.rgba[offset..offset + 4];
+            let mut sx = x as f32;
+            let mut sy = y as f32;
+            for warp in &warps {
+                let mut mask = warp_mask(nx, ny, warp);
+                if mask <= 0.0 {
+                    continue;
+                }
+                if warp.cloud_like_only {
+                    mask *= cloud_like_weight(pixel);
+                }
+                if mask <= 0.0 {
+                    continue;
+                }
+                let phase = std::f32::consts::TAU * (ny * 2.6 + nx * 0.6) + warp.phase;
+                let wave = if warp.wave { phase.sin() } else { 1.0 };
+                let cross = if warp.wave { (phase * 0.8).cos() } else { 1.0 };
+                sx += warp.dx * mask * wave;
+                sy += warp.dy * mask * cross;
+                max_shift = max_shift.max((warp.dx * mask).abs().max((warp.dy * mask).abs()));
+            }
+            let sampled = sample_bilinear(bitmap, sx, sy);
+            rgba[offset..offset + 4].copy_from_slice(&sampled);
+        }
+    }
+    (
+        mcwp_image::Bitmap {
+            width: bitmap.width,
+            height: bitmap.height,
+            rgba,
+        },
+        warps.len(),
+        max_shift,
+    )
+}
+
+fn motion_guide_warps(width: u32, height: u32, plan: &mcwp_spec::MotionPlan) -> Vec<TailWarp> {
+    let mut warps = Vec::new();
+    let mut seen: Vec<&'static str> = Vec::new();
+    for (index, element) in plan.elements.iter().enumerate() {
+        let kind = element.kind.to_ascii_lowercase();
+        let class = tail_kind_class(&kind);
+        if class == "light" || seen.contains(&class) {
+            continue;
+        }
+        seen.push(class);
+        let words = format!("{} {}", element.action, element.sentence).to_ascii_lowercase();
+        let direction = if words.contains("left") {
+            -1.0
+        } else if words.contains("right") {
+            1.0
+        } else if index % 2 == 0 {
+            -1.0
+        } else {
+            1.0
+        };
+        let phase = 0.7 + index as f32 * 1.9;
+        // 位移按 1080p 给足:**旧值是 7~13 px,视频模型基本当成静帧**(实测光流
+        // 0.06~0.12,肉眼看不出元素在动)。现在草地/蕨类约 30 px、树叶约 19 px、
+        // 天空约 38 px —— 只有会动的元素在动,树干、路面和构图仍然像素级不动。
+        let (dx, dy, wave, cloud_like_only) = match class {
+            "sky" => (width as f32 * 0.020, 0.0, false, true),
+            "water" => (width as f32 * 0.014, height as f32 * 0.0030, true, false),
+            "ground" => (width as f32 * 0.016, height as f32 * 0.0035, true, false),
+            "foliage" => (width as f32 * 0.010, height as f32 * 0.0020, true, false),
+            "traffic" => (width as f32 * 0.020, 0.0, false, false),
+            "creature" => (
+                width as f32 * 0.010,
+                -(height as f32) * 0.0025,
+                false,
+                false,
+            ),
+            "soft" => (width as f32 * 0.012, 0.0, true, false),
+            _ => (width as f32 * 0.010, height as f32 * 0.0015, true, false),
+        };
+        if class == "ground" {
+            for (left, right, side) in [(0.0, 0.45, -1.0), (0.55, 1.0, 1.0)] {
+                warps.push(TailWarp {
+                    left,
+                    top: 0.48,
+                    right,
+                    bottom: 1.0,
+                    dx: dx * side,
+                    dy,
+                    wave,
+                    phase: phase + left,
+                    cloud_like_only,
+                });
+            }
+        } else {
+            let (left, top, right, bottom) = tail_area_bounds(&element.area, class);
+            warps.push(TailWarp {
+                left,
+                top,
+                right,
+                bottom,
+                dx: dx * direction,
+                dy,
+                wave,
+                phase,
+                cloud_like_only,
+            });
+        }
+    }
+    warps.truncate(6);
+    warps
+}
+
+fn tail_kind_class(kind: &str) -> &'static str {
+    if [
+        "sun",
+        "sunlight",
+        "sunset",
+        "sunrise",
+        "glow",
+        "light",
+        "shadow",
+        "exposure",
+        "brightness",
+        "color",
+        "colour",
+        "flare",
+    ]
+    .iter()
+    .any(|word| kind.contains(word))
+    {
+        return "light";
+    }
+    if ["cloud", "fog", "mist", "smoke", "haze", "sky"]
+        .iter()
+        .any(|word| kind.contains(word))
+    {
+        return "sky";
+    }
+    if ["water", "river", "lake", "sea", "ocean", "wave", "ripple"]
+        .iter()
+        .any(|word| kind.contains(word))
+    {
+        return "water";
+    }
+    if ["grass", "fern", "flower", "bush", "plant", "moss"]
+        .iter()
+        .any(|word| kind.contains(word))
+    {
+        return "ground";
+    }
+    if ["leaf", "leaves", "tree", "branch", "canopy", "forest"]
+        .iter()
+        .any(|word| kind.contains(word))
+    {
+        return "foliage";
+    }
+    if ["car", "traffic", "vehicle", "truck", "bus", "train"]
+        .iter()
+        .any(|word| kind.contains(word))
+    {
+        return "traffic";
+    }
+    if ["bird", "insect", "butterfly"]
+        .iter()
+        .any(|word| kind.contains(word))
+    {
+        return "creature";
+    }
+    if ["fabric", "cloth", "curtain", "hair", "clothing", "clothes"]
+        .iter()
+        .any(|word| kind.contains(word))
+    {
+        return "soft";
+    }
+    "other"
+}
+
+fn tail_area_bounds(area: &str, class: &str) -> (f32, f32, f32, f32) {
+    let area = area.trim().to_ascii_lowercase();
+    match area.as_str() {
+        "左上" => (0.0, 0.0, 0.34, 0.34),
+        "上中" => (0.33, 0.0, 0.67, 0.34),
+        "右上" => (0.66, 0.0, 1.0, 0.34),
+        "左中" => (0.0, 0.33, 0.34, 0.67),
+        "正中" => (0.33, 0.33, 0.67, 0.67),
+        "右中" => (0.66, 0.33, 1.0, 0.67),
+        "左下" => (0.0, 0.66, 0.34, 1.0),
+        "下中" => (0.33, 0.66, 0.67, 1.0),
+        "右下" => (0.66, 0.66, 1.0, 1.0),
+        "全图" => (0.0, 0.0, 1.0, 1.0),
+        _ if area.contains("sky") || area.contains("upper") || area.contains("background") => {
+            (0.0, 0.0, 1.0, 0.46)
+        }
+        _ if area.contains("foreground") || area.contains("front") || area.contains("lower") => {
+            (0.0, 0.46, 1.0, 1.0)
+        }
+        _ if area.contains("midground") || area.contains("middle") || area.contains("center") => {
+            (0.0, 0.14, 1.0, 0.84)
+        }
+        _ if area.contains("left") => (0.0, 0.14, 0.5, 0.9),
+        _ if area.contains("right") => (0.5, 0.14, 1.0, 0.9),
+        _ if class == "sky" => (0.0, 0.0, 1.0, 0.46),
+        _ if class == "ground" || class == "water" || class == "traffic" => (0.0, 0.46, 1.0, 1.0),
+        _ => (0.0, 0.14, 1.0, 0.84),
+    }
+}
+
+fn warp_mask(nx: f32, ny: f32, warp: &TailWarp) -> f32 {
+    let feather_x = ((warp.right - warp.left) * 0.30).max(0.02);
+    let feather_y = ((warp.bottom - warp.top) * 0.30).max(0.02);
+    smooth01((nx - warp.left) / feather_x)
+        * smooth01((warp.right - nx) / feather_x)
+        * smooth01((ny - warp.top) / feather_y)
+        * smooth01((warp.bottom - ny) / feather_y)
+}
+
+fn smooth01(value: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    value * value * (3.0 - 2.0 * value)
+}
+
+fn cloud_like_weight(pixel: &[u8]) -> f32 {
+    let r = pixel[0] as f32 / 255.0;
+    let g = pixel[1] as f32 / 255.0;
+    let b = pixel[2] as f32 / 255.0;
+    let luma = r * 0.2126 + g * 0.7152 + b * 0.0722;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let saturation = if max <= 1e-5 { 0.0 } else { (max - min) / max };
+    smooth01((luma - 0.34) / 0.34) * (1.0 - smooth01((saturation - 0.18) / 0.28))
+}
+
+fn sample_bilinear(bitmap: &mcwp_image::Bitmap, x: f32, y: f32) -> [u8; 4] {
+    let width = bitmap.width as i32;
+    let height = bitmap.height as i32;
+    let x = x.clamp(0.0, (width - 1) as f32);
+    let y = y.clamp(0.0, (height - 1) as f32);
+    let x0 = x.floor() as i32;
+    let y0 = y.floor() as i32;
+    let x1 = (x0 + 1).min(width - 1);
+    let y1 = (y0 + 1).min(height - 1);
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+    let at = |px: i32, py: i32| {
+        let offset = ((py * width + px) * 4) as usize;
+        &bitmap.rgba[offset..offset + 4]
+    };
+    let p00 = at(x0, y0);
+    let p10 = at(x1, y0);
+    let p01 = at(x0, y1);
+    let p11 = at(x1, y1);
+    let mut out = [0u8; 4];
+    for channel in 0..4 {
+        let top = p00[channel] as f32 * (1.0 - fx) + p10[channel] as f32 * fx;
+        let bottom = p01[channel] as f32 * (1.0 - fx) + p11[channel] as f32 * fx;
+        out[channel] = (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8;
+    }
+    out
+}
+
 /// 把库里某一张(静图)做成动态壁纸。**在后台线程里跑**,产物从 `VideoOutcome` 回来。
 ///
 /// 四步:
 /// 1. **看图**(免费视觉模型)写一份**元素级**方案:灯在哪儿怎么闪、车流朝哪边走(`plan_motion_vision`)。
 ///    这一步是"画面真的活起来"和"整张图被推近"之间的分水岭 —— 看不到画面的模型只会写万能运镜。
 /// 2. 把方案拼成**图生视频那句提示词**(`video_prompt`);方案是空的就退回老路(文本模型 / 通用运镜)。
-/// 3. **图生视频**:只把这张图当**首帧** + 10 秒(见 `mcwp_ai::animate`)。
-///    不再把同一张图当尾帧:实测首尾同图会把运动锁死成近乎静帧(见 §11.31)。
+/// 3. **图生视频**:默认只发原图当首帧,让模型自己找实体运动。首尾帧引导只在
+///    `GUIDED_FRAMES_ENABLED` 打开时启用(见 `motion_guide_bitmap` /
+///    `mcwp_ai::animate_frames`)—— 实测它会把运动压成静帧,不适合做默认路径。
 /// 4. 把 mp4 落成临时文件、解出第一帧当封面。
 ///
 /// 第 4 步为什么要绕一下:解码器是从**文件**读的(Media Foundation 没有"从内存解一段视频"
@@ -584,12 +1087,84 @@ fn animate_photo(
         // 只复用**带 caption 的**新方案。老资产里只有 elements,那正是"只动光影"的旧提示词,
         // 拿它继续出片等于把已经修掉的毛病又跑一遍;视觉模型免费,重新看一次更划算。
         Some(_) if source.motion_plan.has_caption() => source.motion_plan.clone(),
-        Some(chat) => chat.plan_motion_vision(&source, &image_bytes),
+        Some(chat) => {
+            // 看图这一步是**免费**的,但它偶尔会超时/返回空方案。以前空方案会悄悄退回
+            // 通用提示词,然后照样提交那条要花 1 元的视频 —— 用户拿到的是一段没有
+            // 元素运动的片子,还不知道钱花在了哪儿。这里先免费重试一次;仍然空就直接
+            // 报错,不提交视频。
+            let first = chat.plan_motion_vision(&source, &image_bytes);
+            if !first.is_empty() {
+                first
+            } else {
+                tracing::warn!("第一次看图没认出会动的实体,免费重试一次");
+                let second = chat.plan_motion_vision(&source, &image_bytes);
+                if second.is_empty() {
+                    anyhow::bail!(
+                        "这次没从画面里认出会动的实体,先不提交视频(避免白花 1 元)。稍后再点一次「生成动图」。"
+                    );
+                }
+                second
+            }
+        }
         None => mcwp_spec::MotionPlan::default(),
     };
-    // 2 · 拼提示词。
-    // 没配对话模型也要能跑:动效提示词退化成一句通用的运镜(见 `fallback_motion_prompt`)
-    let motion = if plan.is_empty() {
+    // 方案**写回原图那一份**:它的主人是这张图(见 `photos::save_motion_plan`)。
+    // 只在这张图还没有方案时写 —— 库里已经有一份就说明是"拿来用"的那条路,不用重复写。
+    if !plan.is_empty() && !source.motion_plan.has_caption() {
+        if let Err(err) = photos::save_motion_plan(entry, &plan) {
+            // 写不进去不该让整条链路失败:方案已经在内存里,片子照样能做
+            tracing::warn!("动效方案没写回库里那张({err:#})");
+        }
+    }
+    // 3 · **默认单图首帧**。让模型自己找实体运动;首尾帧引导只在
+    //     `GUIDED_FRAMES_ENABLED` 打开时才生成局部位移尾帧。实测首尾帧会把运动
+    //     压到光流 0.06 左右,单图 quality/speed 分别是 2.92/8.79。
+    //     播放器仍在接缝处淡回首帧(见 `LOOP_FADE_SECS`)。
+    //
+    // 3.5 · 提交前把图收拾成"服务商自己推得动"的比例:它按"短边 1080 × 图片比例、向下取整"推
+    //       成片尺寸,推出奇数长边时 H.264 编不出来。**这不是 2026-10-16 那几次 FAIL 的病根**
+    //       (裁成 1920×1080 之后照样失败,见 `mcwp_ai::VIDEO_SIZES` 的更正),它只是一份便宜的
+    //       保险:比值本来就安全的图**原样发**(不重编码 —— 这是条件图,糊了整段都糊),不安全的才裁。
+    let mut bitmap = mcwp_image::Bitmap::decode(&image_bytes)
+        .with_context(|| format!("解不开这张图:{}", entry.image.display()))?;
+    let mut reencoded = false;
+    if let Some((target_width, target_height)) =
+        mcwp_ai::video_image_fix((source.width, source.height))
+    {
+        let original = (bitmap.width, bitmap.height);
+        let derived = mcwp_ai::derived_video_size(original);
+        bitmap = bitmap.crop_to_ratio(target_width, target_height);
+        reencoded = true;
+        tracing::info!(
+            "条件图裁成 {}×{}(原 {}×{};不裁的话服务商会推 {}×{},长边奇数就 FAIL) · 目标比例 {}:{}",
+            bitmap.width,
+            bitmap.height,
+            original.0,
+            original.1,
+            derived.0,
+            derived.1,
+            target_width,
+            target_height
+        );
+    }
+    let submit_bytes = if reencoded {
+        bitmap.encode_jpeg(92)?
+    } else {
+        image_bytes.clone()
+    };
+    let image_url = mcwp_ai::image_data_url(&submit_bytes);
+    let (guide, guide_warps, max_shift) = if GUIDED_FRAMES_ENABLED {
+        let (guide, warps, max_shift) = motion_guide_bitmap(&bitmap, &plan);
+        (Some(guide), warps, max_shift)
+    } else {
+        (None, 0, 0.0)
+    };
+    // 2 · 拼提示词。默认是单图版本;只有显式打开首尾帧引导时才用
+    //     `video_prompt_for_frames`。没配对话模型也要能跑:方案为空时退化成
+    //     通用描述(见 `fallback_motion_prompt`)。
+    let motion = if guide_warps > 0 {
+        mcwp_ai::video_prompt_for_frames(&plan)
+    } else if plan.is_empty() {
         match chat {
             Some(chat) => chat.plan_motion(&source),
             None => mcwp_ai::fallback_motion_prompt().to_string(),
@@ -599,7 +1174,9 @@ fn animate_photo(
     };
     tracing::info!(
         "这一轮的动效提示词({}):{motion}",
-        if plan.is_empty() {
+        if guide_warps > 0 {
+            "首尾帧"
+        } else if plan.is_empty() {
             "通用"
         } else if plan.has_caption() {
             "caption"
@@ -607,47 +1184,18 @@ fn animate_photo(
             "元素级兜底"
         }
     );
-    // 方案**写回原图那一份**:它的主人是这张图(见 `photos::save_motion_plan`)。
-    // 只在这张图还没有方案时写 —— 库里已经有一份就说明是"拿来用"的那条路,不用重复写。
-    if !plan.is_empty() && !source.motion_plan.has_caption() {
-        if let Err(err) = photos::save_motion_plan(entry, &plan) {
-            // 写不进去不该让整条链路失败:方案已经在内存里,片子照样能做
-            tracing::warn!("动效方案没写回库里那张({err:#})");
-        }
-    }
-    // 3 · **只发首帧**。曾经的"首尾帧都给同一张图"听起来最稳,实测却把模型锁成近乎静帧:
-    //     首尾一模一样,它只要把画面保持住就能交差,草和树叶根本不动(光流均值 0.06)。
-    //     多轮对照(同一张图,提示词都要求实体运动):单图 quality 档 2.92、speed 档 8.79,
-    //     首尾同图 0.06 —— 这是把"元素真的动"救回来的关键一步。
-    //     循环接缝交给播放器的 0.8 秒淡回第一帧(见 `LOOP_FADE_SECS`)。
-    //
-    // 3.5 · 提交前把图收拾成"服务商自己推得动"的比例:它按"短边 1080 × 图片比例、向下取整"推
-    //       成片尺寸,推出奇数长边时 H.264 编不出来。**这不是 2026-10-16 那几次 FAIL 的病根**
-    //       (裁成 1920×1080 之后照样失败,见 `mcwp_ai::VIDEO_SIZES` 的更正),它只是一份便宜的
-    //       保险:比值本来就安全的图**原样发**(不重编码 —— 这是条件图,糊了整段都糊),不安全的才裁。
-    let submit_bytes = match mcwp_ai::video_image_fix((source.width, source.height)) {
-        None => image_bytes.clone(),
-        Some((target_width, target_height)) => {
-            let bitmap = mcwp_image::Bitmap::decode(&image_bytes)
-                .with_context(|| format!("裁图前解不开这张图:{}", entry.image.display()))?;
-            let cropped = bitmap.crop_to_ratio(target_width, target_height);
-            let derived = mcwp_ai::derived_video_size((bitmap.width, bitmap.height));
+    let generated = match guide.as_ref() {
+        Some(guide) if guide_warps > 0 => {
             tracing::info!(
-                "条件图裁成 {}×{}(原 {}×{};不裁的话服务商会推 {}×{},长边奇数就 FAIL) · 目标比例 {}:{}",
-                cropped.width,
-                cropped.height,
-                bitmap.width,
-                bitmap.height,
-                derived.0,
-                derived.1,
-                target_width,
-                target_height
+                "动效尾帧:{} 个局部引导区 · 最大位移 {:.1}px · 构图与首帧一致",
+                guide_warps,
+                max_shift
             );
-            cropped.encode_jpeg(92)?
+            let guide_url = mcwp_ai::image_data_url(&guide.encode_jpeg(92)?);
+            videos.animate_frames(&image_url, &guide_url, &motion, screen)?
         }
+        _ => videos.animate(&image_url, &motion, screen)?,
     };
-    let image_url = mcwp_ai::image_data_url(&submit_bytes);
-    let generated = videos.animate(&image_url, &motion, screen)?;
     video_payload_from_bytes(&source, plan, generated.bytes, screen)
 }
 
@@ -663,14 +1211,12 @@ fn video_payload_from_bytes(
     screen: (u32, u32),
 ) -> Result<VideoPayload> {
     let temp = std::env::temp_dir().join(format!("mcwp-animate-{}.mp4", source.id));
-    std::fs::write(&temp, &bytes)
-        .with_context(|| format!("写临时视频失败:{}", temp.display()))?;
+    std::fs::write(&temp, &bytes).with_context(|| format!("写临时视频失败:{}", temp.display()))?;
     let decoded = mcwp_video::Player::open(&temp, screen).and_then(|mut player| {
         let info = player.info();
-        let pixels = player
-            .next_frame()?
-            .map(|frame| frame.to_vec())
-            .ok_or_else(|| anyhow::anyhow!("这段视频一帧都解不出来"))?;
+        // 封面和播放器用同一帧:片头从黑场淡入时,封面不能是一张黑图。
+        let (pixels, _) = first_display_frame(&mut player, info.duration.as_secs_f32())
+            .context("这段视频一帧都解不出来")?;
         // 顺手把**整段解一遍**,量出末尾比开头亮多少。它只在这里量一次,多花几秒,
         // 而这一步本来就在等几分钟的出片;换来的播放侧每帧都能拿它把曝光拉回一致。
         let first = pixels.clone();
@@ -682,7 +1228,8 @@ fn video_payload_from_bytes(
     });
     // 解完就删。失败也删 —— 中间产物留在盘上,下次"文件被占着"的怪事就说不清了。
     let _ = std::fs::remove_file(&temp);
-    let (info, pixels, seam_gain) = decoded.context("新视频解不出第一帧(这台机器的解码器没装上?)")?;
+    let (info, pixels, seam_gain) =
+        decoded.context("新视频解不出第一帧(这台机器的解码器没装上?)")?;
 
     let cover = mcwp_image::Bitmap {
         width: info.width,
@@ -736,19 +1283,12 @@ fn adopt_video(
     screen: (u32, u32),
     brightness: f32,
 ) -> Result<ActivePhoto> {
-    let VideoPayload {
-        photo,
-        mp4,
-        cover,
-    } = payload;
+    let VideoPayload { photo, mp4, cover } = payload;
     match photos::save_video(&photo, &mp4, &cover) {
         Ok(entry) => {
             tracing::info!("新动态壁纸已入库:{}", entry.meta.display());
             *library = scan_library();
-            let path = entry
-                .video
-                .clone()
-                .unwrap_or_else(|| entry.image.clone());
+            let path = entry.video.clone().unwrap_or_else(|| entry.image.clone());
             show_video(renderer, entry.photo.clone(), &path, screen, brightness)
         }
         Err(err) => {
@@ -1010,7 +1550,8 @@ fn import_photo(
     screen: (u32, u32),
     brightness: f32,
 ) -> Result<ActivePhoto> {
-    let bytes = std::fs::read(path).with_context(|| format!("读不到这个文件:{}", path.display()))?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("读不到这个文件:{}", path.display()))?;
     let bitmap = mcwp_image::Bitmap::decode(&bytes)
         .with_context(|| format!("这张图解不开(只认 PNG / JPEG):{}", path.display()))?;
 
@@ -1084,7 +1625,9 @@ fn ai_config_state() -> mcwp_ui::AiConfigState {
         image_model: stored.image_model,
         image_api_key: stored.image_api_key,
         image_quality: stored.image_quality,
-        image_watermark: stored.image_watermark.unwrap_or(mcwp_ai::DEFAULT_IMAGE_WATERMARK),
+        image_watermark: stored
+            .image_watermark
+            .unwrap_or(mcwp_ai::DEFAULT_IMAGE_WATERMARK),
         // 同理原样给:空串 = 用内置默认(`cogvideox-3`)
         video_model: stored.video_model,
         thinking: mcwp_ui::ThinkingChoice::from_option(stored.thinking),
@@ -1268,7 +1811,11 @@ fn run_plan_selftest(request: &str, current_id: Option<&str>) -> Result<()> {
         "耗时:{:.1}s · 调用 {} 次 · 降级:{}",
         started.elapsed().as_secs_f32(),
         plan.calls,
-        if plan.degraded { "是(退化成拿原话去画)" } else { "否" }
+        if plan.degraded {
+            "是(退化成拿原话去画)"
+        } else {
+            "否"
+        }
     );
     println!("回复:{}", plan.reply);
     println!("标题:{}", plan.title);
@@ -1298,8 +1845,13 @@ fn run_motion_selftest(id: &str) -> Result<()> {
     println!("耗时:{:.1}s", started.elapsed().as_secs_f32());
     println!("{}", serde_json::to_string_pretty(&plan)?);
 
+    // 默认出片走**单图首帧**这条路,所以这里展示单图版本;首尾帧只在显式打开
+    // `GUIDED_FRAMES_ENABLED` 时使用。
     let prompt = mcwp_ai::video_prompt(&plan);
-    println!("\n---- 这一步之后会发给图生视频的提示词({} 字)----", prompt.chars().count());
+    println!(
+        "\n---- 单图出片实际会发的提示词({} 字)----",
+        prompt.chars().count()
+    );
     println!("{prompt}");
     println!(
         "\n(真要出片还得花 1 元/次:「{}」+ 单图首帧 + quality 档 + 10 秒)",
@@ -1335,12 +1887,32 @@ fn run_animate_save(id: &str, screen: (u32, u32)) -> Result<()> {
     Ok(())
 }
 
+/// 照任务号取回一条**已经提交过**的视频,并做成入库载荷。
+///
+/// 它是 CLI 的 `--video-fetch` 和面板上那颗「免费取回」共用的那一段:
+/// **不提交、不再花钱**,只做"查询 + 下载 + 解封面"。
+fn fetch_video_payload(
+    videos: &mcwp_ai::Videos,
+    entry: &photos::Entry,
+    task_id: &str,
+    screen: (u32, u32),
+) -> Result<VideoPayload> {
+    let generated = videos.fetch(task_id)?;
+    // 动效方案沿用库里存的那份(分析过就有,没有就是空方案):取回一条已经算好的视频,
+    // 不该再花掉一次看图 —— 何况这一次的成片早就生成了,再看图也改不了它。
+    video_payload_from_bytes(
+        &entry.photo,
+        entry.photo.motion_plan.clone(),
+        generated.bytes,
+        screen,
+    )
+}
+
 /// `--video-fetch <任务号> <库 id>`:把一条**已经提交过**的视频取回来入库。
 ///
 /// 为什么要留这么一条路:出片那一步是花钱的(1 元/次),而服务商的排队能从 1 分钟
 /// 拉到十几分钟 —— 客户端不可能一直等着,只能超时收手,那 1 元就悬在半空:
-/// 服务端还在跑,结果没人取。任务号在日志和报错里都留着,这条路负责照号捡回来 ——
-/// **不提交、不再花钱**,只做"下载 + 落地"。
+/// 服务端还在跑,结果没人取。任务号在日志和报错里都留着,这条路负责照号捡回来。
 fn run_video_fetch(task_id: &str, photo_id: &str, screen: (u32, u32)) -> Result<()> {
     let videos = mcwp_ai::Videos::new(mcwp_ai::VideosConfig::load()?);
     let entry = photos::load(photo_id).with_context(|| format!("库里找不到这张:{photo_id}"))?;
@@ -1348,15 +1920,7 @@ fn run_video_fetch(task_id: &str, photo_id: &str, screen: (u32, u32)) -> Result<
     println!("源图:{}", entry.photo.title);
     println!("任务号:{task_id}");
     let started = Instant::now();
-    let generated = videos.fetch(task_id)?;
-    // 动效方案沿用库里存的那份(分析过就有,没有就是空方案):取回一条已经算好的视频,
-    // 不该再花掉一次看图 —— 何况这一次的成片早就生成了,再看图也改不了它。
-    let payload = video_payload_from_bytes(
-        &entry.photo,
-        entry.photo.motion_plan.clone(),
-        generated.bytes,
-        screen,
-    )?;
+    let payload = fetch_video_payload(&videos, &entry, task_id, screen)?;
     let saved = photos::save_video(&payload.photo, &payload.mp4, &payload.cover)?;
     println!(
         "取回并入库({:.0}s):「{}」{} 毫秒 · {:.1} MB",
@@ -1385,7 +1949,11 @@ fn run_images_selftest(request: &str, screen: (u32, u32)) -> Result<()> {
         "耗时:{:.1}s  提示词调用:{} 次  降级:{}",
         started.elapsed().as_secs_f32(),
         payload.calls,
-        if payload.degraded { "是(拿原话去画的)" } else { "否" }
+        if payload.degraded {
+            "是(拿原话去画的)"
+        } else {
+            "否"
+        }
     );
     println!("回复:{}", payload.reply);
     println!("标题:{}", payload.photo.title);
@@ -1418,11 +1986,10 @@ fn sample_mean(frame: &[u8]) -> f32 {
     sum as f32 / sampled as f32
 }
 
-/// 首帧 / 末帧 → 播放到头时该乘的**曝光增益**(1.0 = 不用校)。
+/// 首帧 / 末帧 → **旧版**播放到头时该乘的曝光增益(1.0 = 不用校)。
 ///
-/// 只校**整体亮度**,因为这条路的证据就是这么说的:实测接缝那 13.5 里,有 4.5 是
-/// "整段一路变亮"(把亮度对齐之后只剩 9.5);剩下的两个画面本身就不一样,乘系数救不了 ——
-/// 那部分只能靠接缝那段淡回去盖,或者重出片(见 §11.22)。
+/// 它现在只用来给 `Photo.seam_gain` 留一个诊断值,播放端**不再拿它乘整段**
+/// (那会把片头暗、后面亮的片子压暗;见 `display_gain_for` / §11.33)。
 fn seam_gain_for(first: &[u8], last: &[u8]) -> f32 {
     let (mean_first, mean_last) = (rgb_mean(first), rgb_mean(last));
     if !mean_first.is_finite() || !mean_last.is_finite() || mean_last < 1.0 {
@@ -1437,19 +2004,6 @@ fn seam_gain_for(first: &[u8], last: &[u8]) -> f32 {
     } else {
         gain
     }
-}
-
-/// 把"想让画面乘的增益"换算成着色器那个 `brightness` 参数。
-///
-/// 着色器里是 `color * (0.45 + 0.85 * brightness)`,**不是**直接乘 brightness ——
-/// 想给画面整体乘一个增益,得先把那个偏移解出来。不解的话校正会偏,而且偏得不多不少,
-/// 正好会让你以为"校了,但好像没什么用"。
-fn exposure_brightness(base: f32, gain: f32) -> f32 {
-    if !gain.is_finite() {
-        return base;
-    }
-    // 0.45 + 0.85 * b' = gain * (0.45 + 0.85 * b)
-    ((gain * (0.45 + 0.85 * base) - 0.45) / 0.85).clamp(0.2, 1.6)
 }
 
 /// RGB 三路的均值(不含 alpha)。
@@ -1566,7 +2120,7 @@ fn run_video_selftest(path: &str, screen: (u32, u32)) -> Result<()> {
     // 循环点:把**头尾那两帧差多少**量出来。
     //
     // 为什么要量:循环接缝从外部看只有一个信号 —— 播放完那一下跳不跳。
-    // 现在视频按单图首帧生成,尾帧本来就不会自动回到起点,播放器要靠淡回第一帧收口。
+    // 默认是单图首帧,尾帧本来就不会精确回到起点,播放器靠两端收口。
     // 盯着桌面等十秒去判,既看不准又受当时画面影响;而"末帧离首帧有多远"是个数。
     // 再拿"首帧到中点那帧"当基线,这个数才有尺度:两者相当 = 尾帧没有绕回起点,
     // 接缝完全靠播放器的淡入淡出兜着(单图提交的常态,见 §11.31)。
@@ -1602,11 +2156,13 @@ fn run_video_selftest(path: &str, screen: (u32, u32)) -> Result<()> {
     if seam.is_nan() || span.is_nan() {
         println!("  → 帧长度对不齐,这个数没意义(尺寸中途变了?)");
     } else if seam <= span * 0.25 {
-        println!("  → 头尾基本绕回了起点,0.8 秒的淡回足以把这点差抹平");
+        println!("  → 头尾基本绕回了起点,0.8 秒的两端收口足以把这点差抹平");
     } else if seam <= span * 0.6 {
         println!("  → 头尾明显比半途近,但没到「绕回」:淡回能盖住跳变,看得出画面在往回并");
     } else {
-        println!("  → 头尾和半途一样远:**尾帧没回到起点**(单图首帧生成的常态,靠播放器淡回第一帧)");
+        println!(
+            "  → 头尾和半途一样远:**尾帧没回到起点**(模型只保证局部元素在动,靠播放器两端收口)"
+        );
     }
     // 倒回开头再解一帧:循环播放全靠这一步,而它在 MF 上是最容易"静默不生效"的一处
     player.rewind()?;
@@ -2229,9 +2785,12 @@ fn main() -> Result<()> {
         match photos::load(&id) {
             Ok(entry) => match videos.as_ref() {
                 Some(animator) => {
-                    tracing::info!("`--animate`:把「{}」做成动态壁纸(要几分钟)", entry.photo.title);
-                    let payload =
-                        animate_photo(ai.as_ref(), animator, &entry, screen).context("`--animate` 失败")?;
+                    tracing::info!(
+                        "`--animate`:把「{}」做成动态壁纸(要几分钟)",
+                        entry.photo.title
+                    );
+                    let payload = animate_photo(ai.as_ref(), animator, &entry, screen)
+                        .context("`--animate` 失败")?;
                     active = Some(adopt_video(
                         &mut renderer,
                         &mut library,
@@ -2343,7 +2902,10 @@ fn main() -> Result<()> {
             &ai_tx,
             run_id,
         );
-        run = mission.map(|mission| Run::Running { id: run_id, mission });
+        run = mission.map(|mission| Run::Running {
+            id: run_id,
+            mission,
+        });
         if let Some(handle) = &panel {
             handle.refresh_session(sessions.state());
             handle.set_run_state(run_state(run.as_ref()));
@@ -2381,7 +2943,7 @@ fn main() -> Result<()> {
         while let Ok(event) = ui_rx.try_recv() {
             tracing::debug!("面板事件:{event:?}");
             match event {
-                // —— 生图界面:一句话 → 模型给一份壁纸规格 → 换上去 —— 
+                // —— 生图界面:一句话 → 模型给一份壁纸规格 → 换上去 ——
                 mcwp_ui::UiEvent::SendMessage(text) => {
                     if text.trim().is_empty() {
                         continue;
@@ -2411,7 +2973,10 @@ fn main() -> Result<()> {
                         &ai_tx,
                         run_id,
                     );
-                    run = mission.map(|mission| Run::Running { id: run_id, mission });
+                    run = mission.map(|mission| Run::Running {
+                        id: run_id,
+                        mission,
+                    });
                     if let Some(handle) = &panel {
                         handle.refresh_session(sessions.state());
                         handle.set_run_state(run_state(run.as_ref()));
@@ -2460,7 +3025,10 @@ fn main() -> Result<()> {
                             &ai_tx,
                             run_id,
                         );
-                        run = mission.map(|mission| Run::Running { id: run_id, mission });
+                        run = mission.map(|mission| Run::Running {
+                            id: run_id,
+                            mission,
+                        });
                         if let Some(handle) = &panel {
                             handle.set_run_state(run_state(run.as_ref()));
                             handle.set_status(status);
@@ -2498,7 +3066,11 @@ fn main() -> Result<()> {
                     let pinned = sessions.toggle_pin(index);
                     if let Some(handle) = &panel {
                         handle.refresh_session(sessions.state());
-                        handle.set_status(if pinned { "已置顶" } else { "已取消置顶" });
+                        handle.set_status(if pinned {
+                            "已置顶"
+                        } else {
+                            "已取消置顶"
+                        });
                     }
                 }
                 mcwp_ui::UiEvent::MarkConversationUnread(index) => {
@@ -2551,8 +3123,13 @@ fn main() -> Result<()> {
                         // 取消了。什么都不做,也不要报"失败" —— 用户自己按的取消。
                         None => tracing::info!("导入:用户取消了选文件"),
                         Some(path) => {
-                            match import_photo(&mut renderer, &mut library, &path, screen, brightness)
-                            {
+                            match import_photo(
+                                &mut renderer,
+                                &mut library,
+                                &path,
+                                screen,
+                                brightness,
+                            ) {
                                 Ok(photo) => {
                                     let title = photo.photo.title.clone();
                                     tracing::info!("已导入并换上:{title}(来自 {})", path.display());
@@ -2620,12 +3197,15 @@ fn main() -> Result<()> {
                 // 走的还是库页点一张那条路(`switch_to_photo`):两件事本来就是同一件 ——
                 // "把库里第 N 张换到桌面上",只是这次的 N 不是用户点出来的,而是会话里那张图给的。
                 mcwp_ui::UiEvent::SetWallpaper(id) => {
-                    match library
-                        .iter()
-                        .position(|entry| entry.source.photo.id == id)
-                    {
+                    match library.iter().position(|entry| entry.source.photo.id == id) {
                         Some(index) => {
-                            match switch_to_photo(&mut renderer, &library, index, screen, brightness) {
+                            match switch_to_photo(
+                                &mut renderer,
+                                &library,
+                                index,
+                                screen,
+                                brightness,
+                            ) {
                                 Ok(photo) => {
                                     let title = photo.photo.title.clone();
                                     tracing::info!("设为壁纸:{title}(会话里的预览图右键)");
@@ -2719,7 +3299,10 @@ fn main() -> Result<()> {
                         Err(err) => {
                             tracing::warn!("切到第 {index} 张失败:{err:?}");
                             if let Some(handle) = &panel {
-                                handle.set_status(format!("这张打不开:{}", brief(&format!("{err:#}"))));
+                                handle.set_status(format!(
+                                    "这张打不开:{}",
+                                    brief(&format!("{err:#}"))
+                                ));
                             }
                         }
                     }
@@ -2748,9 +3331,7 @@ fn main() -> Result<()> {
                 // 在这儿才换成库下标 —— 面板不知道"这在库里是第几张",而"它还在不在库里"
                 // 也只有这边说了算(消息是历史,那张图可能已经被用户在库页里删掉了)。
                 mcwp_ui::UiEvent::MakeVideoFromMessage(id) => {
-                    let index = library
-                        .iter()
-                        .position(|entry| entry.source.photo.id == id);
+                    let index = library.iter().position(|entry| entry.source.photo.id == id);
                     let status = match index {
                         Some(index) => {
                             video_id += 1;
@@ -2767,10 +3348,66 @@ fn main() -> Result<()> {
                                 panel.as_ref(),
                             )
                         }
-                        None => "这张已经不在壁纸库里了 —— 库页里点它一下,或者重新生成一张"
-                            .to_string(),
+                        None => {
+                            "这张已经不在壁纸库里了 —— 库页里点它一下,或者重新生成一张".to_string()
+                        }
                     };
                     tracing::info!("做成动态壁纸(会话里那条 {id}):{status}");
+                    if let Some(handle) = &panel {
+                        handle.set_status(status);
+                    }
+                }
+                // 「免费取回」:照上次失败留下的任务号把成片捡回来。
+                //
+                // 这条路**只轮询 + 下载**,不提交新任务 —— 服务商那边已经计过费,
+                // 重提就是又花一次钱。取回失败时任务号仍然留着,用户还能再点一次。
+                mcwp_ui::UiEvent::FetchVideo { task, photo } => {
+                    let status = if video_run.is_some() {
+                        "正在做上一段动态壁纸,等它出来再说".to_string()
+                    } else if let Some(animator) = videos.as_ref() {
+                        match library
+                            .iter()
+                            .position(|entry| entry.source.photo.id == photo)
+                        {
+                            Some(index) => {
+                                video_id += 1;
+                                let run_id = video_id;
+                                video_run = Some(run_id);
+                                video_target = Some(photo.clone());
+                                if let Some(handle) = &panel {
+                                    handle.set_animating(photo.clone());
+                                }
+                                let sender = video_tx.clone();
+                                let animator = animator.clone();
+                                let entry = library[index].source.clone();
+                                let source_id = photo.clone();
+                                let task_id = task.clone();
+                                std::thread::spawn(move || {
+                                    let result = match fetch_video_payload(
+                                        &animator, &entry, &task_id, screen,
+                                    ) {
+                                        Ok(payload) => Ok(Box::new(payload)),
+                                        Err(err) => Err(VideoFailure {
+                                            message: format!("{err:#}"),
+                                            // 取回失败时任务号仍然有效,留着再试
+                                            task_id: Some(task_id),
+                                            source_id,
+                                        }),
+                                    };
+                                    let _ = sender.send(VideoOutcome {
+                                        run: run_id,
+                                        result,
+                                    });
+                                });
+                                format!("正在按任务号免费取回(不提交、不再扣费):{task}")
+                            }
+                            None => "这张已经不在壁纸库里了 —— 没法取回".to_string(),
+                        }
+                    } else {
+                        "还没配图生视频的 key —— 它和生图是同一把,在「设置」里填上就能用"
+                            .to_string()
+                    };
+                    tracing::info!("免费取回(任务 {task},图 {photo}):{status}");
                     if let Some(handle) = &panel {
                         handle.set_status(status);
                     }
@@ -2847,7 +3484,7 @@ fn main() -> Result<()> {
             }
         }
 
-        // —— 生图的结果落地 —— 
+        // —— 生图的结果落地 ——
         // 只有会话还在才继续:用户可能在等的时候把这条删了,那就别再往库里塞一张、也别在
         // 那儿留一条回复(删了还冒出来,比不冒出来更让人困惑)。
         while let Ok(outcome) = ai_rx.try_recv() {
@@ -2880,13 +3517,22 @@ fn main() -> Result<()> {
                     let reply = payload.reply.clone();
                     // **只入库,不自动换壁纸**(见 `save_generated_photo`)。所以 `active` 这里
                     // 一个字都不动:桌面还是原来那张,什么时候换由用户在预览图的右键菜单里说。
-                    match save_generated_photo(&mut renderer, &mut library, *payload, screen, brightness)
-                    {
+                    match save_generated_photo(
+                        &mut renderer,
+                        &mut library,
+                        *payload,
+                        screen,
+                        brightness,
+                    ) {
                         Ok(saved) => {
                             let title = saved.title;
                             tracing::info!(
                                 "本轮出图:{title} | 提示词调用={calls} | 降级={degraded} | 自动上屏={}",
-                                if saved.applied_as_fallback { "是(库写不进去)" } else { "否" }
+                                if saved.applied_as_fallback {
+                                    "是(库写不进去)"
+                                } else {
+                                    "否"
+                                }
                             );
                             let status = if saved.applied_as_fallback {
                                 format!("已画好「{title}」· 库写不进去,先直接挂上了")
@@ -2900,7 +3546,9 @@ fn main() -> Result<()> {
                             } else if degraded {
                                 format!("模型没接上 · 用你的原话画了「{title}」,已放进壁纸库")
                             } else if calls > 1 {
-                                format!("已画好「{title}」放进壁纸库(提示词重试过一次) · 右键预览图可设为壁纸")
+                                format!(
+                                    "已画好「{title}」放进壁纸库(提示词重试过一次) · 右键预览图可设为壁纸"
+                                )
                             } else {
                                 format!("已画好「{title}」放进壁纸库 · 右键预览图可设为壁纸")
                             };
@@ -2944,7 +3592,10 @@ fn main() -> Result<()> {
         // 和生图那边同一个套路:主循环只收结果,不等。这一段跑的时候用户可能已经切走、
         // 甚至把库翻了个遍 —— 所以成功之后一律刷新面板(库多了一条新的)。
         while let Ok(outcome) = video_rx.try_recv() {
-            let VideoOutcome { run: outcome_run, result } = outcome;
+            let VideoOutcome {
+                run: outcome_run,
+                result,
+            } = outcome;
             // 认轮次:理论上同一时刻只有一轮(起跑前拦过),但这条通道将来要是放开了并发,
             // 这一步就是"旧结果别把新的一轮盖掉"的唯一保障。
             if video_run != Some(outcome_run) {
@@ -2954,9 +3605,19 @@ fn main() -> Result<()> {
             video_run = None;
             // 那条回复下面的「生成动图」要回到原样:成功时它会变成"已是动图"(下面那次刷新
             // 会带上新的库数据),失败时它得能再点一次 —— 两种落点都要求先把"正在做"清掉。
-            video_target = None;
+            // 目标 id 先留下来:失败时要把任务号写回会话里对应的那张图。
+            let target = video_target.take();
             let status = match result {
                 Ok(payload) => {
+                    // 成片有了,这条失败记录就该清掉 —— 留着只会让旧任务号继续占着按钮。
+                    let origin = if payload.photo.origin_id.is_empty() {
+                        target.unwrap_or_default()
+                    } else {
+                        payload.photo.origin_id.clone()
+                    };
+                    if !origin.is_empty() {
+                        sessions.set_video_task(&origin, None);
+                    }
                     let title = payload.photo.title.clone();
                     let seconds = payload.photo.duration_ms as f32 / 1000.0;
                     match adopt_video(&mut renderer, &mut library, *payload, screen, brightness) {
@@ -2971,9 +3632,19 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                Err(reason) => {
-                    tracing::warn!("做成动态壁纸失败:{reason}");
-                    format!("没做成动态壁纸:{}", brief(&reason))
+                Err(failure) => {
+                    // 有任务号就存回会话:那条回复下面会立刻变成「免费取回」。
+                    // 没有任务号的失败(还没提交成功)不动旧任务号 —— 那一条也许还能取回。
+                    if let Some(task) = failure.task_id.as_deref() {
+                        sessions.set_video_task(&failure.source_id, Some(task));
+                    }
+                    tracing::warn!("做成动态壁纸失败:{}", failure.message);
+                    let hint = if failure.task_id.is_some() {
+                        " · 那条回复下面可以「免费取回」"
+                    } else {
+                        ""
+                    };
+                    format!("没做成动态壁纸:{}{hint}", brief(&failure.message))
                 }
             };
             if let Some(handle) = &panel {
@@ -3083,13 +3754,9 @@ fn main() -> Result<()> {
                     tracing::warn!("视频放不下去了({err:?}),先停在当前这一帧");
                     photo.video = None;
                 }
-                // 曝光校正:AI 短片常常一路变亮(实测末帧比首帧亮 10%),按帧把它拉回一致,
-                // 接缝两边才对得平。静图没有播放器,增益恒为 1,这一行等于没做事。
-                let gain = photo
-                    .video
-                    .as_ref()
-                    .map_or(1.0, |video| video.exposure_gain());
-                photo.params.brightness = exposure_brightness(photo.base_brightness, gain);
+                // 曝光校正在 `VideoPlayback::tick` 里烘进视频像素,不能再走渲染器的全局亮度:
+                // 否则最后一帧已经淡回首帧,还会被再乘一次曝光增益,循环点反而多出一记亮度跳。
+                photo.params.brightness = photo.base_brightness;
                 renderer.render(&photo.params)?;
                 frames_in_window += 1;
                 rendered_total += 1;
@@ -3122,7 +3789,10 @@ fn main() -> Result<()> {
         }
     }
 
-    tracing::info!("退出,共渲染 {rendered_total} 帧,跳过 {} 帧", renderer.skipped_frames);
+    tracing::info!(
+        "退出,共渲染 {rendered_total} 帧,跳过 {} 帧",
+        renderer.skipped_frames
+    );
     // 收尾再落一次:自检时长到点、托盘退出这些路径都是从循环里直接跳出来的。
     sessions.flush();
     Ok(())
@@ -3162,7 +3832,32 @@ mod tests {
         for step in 0..=200 {
             let at = 9.2 + LOOP_FADE_SECS * (step as f32 / 200.0);
             let value = loop_fade_alpha(at, duration);
-            assert!(value >= previous - 1e-6, "在 {at}s 处回落了:{value} < {previous}");
+            assert!(
+                value >= previous - 1e-6,
+                "在 {at}s 处回落了:{value} < {previous}"
+            );
+            previous = value;
+        }
+    }
+
+    /// 开头也必须从首帧展开:结尾淡回首帧只接上了“末帧→首帧”,
+    /// 第一帧到第二个视频帧仍是整段最大的一步跳变。
+    #[test]
+    fn 接缝开头从首帧展开() {
+        let duration = 10.0;
+        assert!((loop_intro_alpha(0.0, duration) - 1.0).abs() < 1e-6);
+        assert_eq!(loop_intro_alpha(LOOP_FADE_SECS, duration), 0.0);
+        let middle = loop_intro_alpha(LOOP_FADE_SECS / 2.0, duration);
+        assert!(middle > 0.0 && middle < 1.0, "窗口中间是半淡:{middle}");
+
+        let mut previous = 1.0f32;
+        for step in 0..=100 {
+            let at = LOOP_FADE_SECS * (step as f32 / 100.0);
+            let value = loop_intro_alpha(at, duration);
+            assert!(
+                value <= previous + 1e-6,
+                "在 {at}s 处回升了:{value} > {previous}"
+            );
             previous = value;
         }
     }
@@ -3182,24 +3877,62 @@ mod tests {
         assert_eq!(seam_gain_for(&first, &[]), 1.0);
         assert_eq!(seam_gain_for(&first, &[200u8, 200]), 1.0);
         // 比值离谱(这里是 10 倍)→ 夹到 1.35,而不是照乘
-        assert_eq!(seam_gain_for(&[200u8, 200, 200, 255], &[20u8, 20, 20, 255]), 1.35);
+        assert_eq!(
+            seam_gain_for(&[200u8, 200, 200, 255], &[20u8, 20, 20, 255]),
+            1.35
+        );
     }
 
-    /// 亮度换算:着色器的 brightness 带着一个偏移,不能直接当增益乘。
+    /// 播放端的曝光增益只允许把暗视频提亮,绝不允许把亮视频压暗 ——
+    /// 旧版拿首末帧比值摊到整段,把 0.75 乘满十秒,用户看到的就是"怎么这么暗"。
     #[test]
-    fn 亮度增益换算对得上着色器() {
-        // 增益 1 = 原样
-        for base in [0.4f32, 1.0, 1.4] {
-            assert!((exposure_brightness(base, 1.0) - base).abs() < 1e-5, "{base}");
-        }
-        // 换算完再套回着色器那条式子,得真的等于"原样乘增益"
-        let base = 1.0f32;
-        for gain in [0.9f32, 0.95, 1.05, 1.1] {
-            let shader = |b: f32| 0.45 + 0.85 * b;
-            let got = shader(exposure_brightness(base, gain));
-            let want = gain * shader(base);
-            assert!((got - want).abs() < 1e-4, "增益 {gain}:{got} vs {want}");
-        }
+    fn 播放曝光只提不压() {
+        assert_eq!(display_gain_for(None, 44.0), 1.0);
+        assert_eq!(
+            display_gain_for(Some(30.0), 44.0),
+            1.0,
+            "原图更暗时不压视频"
+        );
+        let gain = display_gain_for(Some(51.0), 44.0);
+        assert!((gain - 1.159).abs() < 0.01, "算出来是 {gain}");
+        assert_eq!(
+            display_gain_for(Some(200.0), 44.0),
+            1.35,
+            "离谱的比值要夹住"
+        );
+    }
+
+    /// 提亮只动 RGB,alpha 通道必须原样保留。
+    #[test]
+    fn 曝光提亮不动_alpha() {
+        let pixels = vec![100u8, 120, 140, 77, 0, 10, 250, 255];
+        let out = scale_rgb(&pixels, 1.2);
+        assert_eq!(&out[0..3], &[120, 144, 168]);
+        assert_eq!(out[3], 77);
+        assert_eq!(&out[4..7], &[0, 12, 255]);
+        assert_eq!(out[7], 255);
+    }
+
+    /// 接缝的最后一帧必须**严格等于首帧**,不能再被曝光增益乘一次。
+    ///
+    /// 这是循环点亮度硬跳的根因:原来先把末帧淡成首帧,再走渲染器全局亮度乘 0.75,
+    /// 屏幕上实际是"首帧 × 0.75";下一轮立刻恢复成"首帧 × 1.0",于是每十秒闪一下。
+    #[test]
+    fn 接缝末帧不会被曝光增益二次压暗() {
+        let first = vec![100u8, 120, 140, 255];
+        let video = vec![240u8, 200, 160, 255];
+        let mut out = Vec::new();
+        let changed = compose_video_frame(&video, &first, 1.0, 0.75, &mut out);
+        assert!(changed);
+        assert_eq!(out, first, "alpha=1 时输出必须等于首帧原像素");
+
+        // 没到接缝时,增益仍然作用于视频帧:末帧更亮就该压暗。
+        let changed = compose_video_frame(&video, &first, 0.0, 0.75, &mut out);
+        assert!(changed);
+        assert_eq!(out, vec![180u8, 150, 120, 255]);
+
+        // 既不用混、也不用校 → 不拷帧,直接走原像素那条快路。
+        assert!(!compose_video_frame(&video, &first, 0.0, 1.0, &mut out));
     }
 
     /// 短片别整段都在淡 —— 那等于整段都不对劲,所以窗口按片子长度的 1/4 收窄。
@@ -3212,5 +3945,106 @@ mod tests {
         // 时长为 0 / 解不出长度的坏输入:不淡,照原样放
         assert_eq!(loop_fade_alpha(0.0, 0.0), 0.0);
         assert_eq!(loop_fade_alpha(5.0, 0.0), 0.0);
+    }
+
+    fn guide_test_bitmap(width: u32, height: u32) -> mcwp_image::Bitmap {
+        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in 0..height {
+            for x in 0..width {
+                let value = if y < height / 3 {
+                    180 + (x * 7 % 50) as u8
+                } else {
+                    70 + (x * 5 + y * 3) as u8 % 120
+                };
+                rgba.extend_from_slice(&[value, value, value, 255]);
+            }
+        }
+        mcwp_image::Bitmap {
+            width,
+            height,
+            rgba,
+        }
+    }
+
+    fn guide_test_plan() -> mcwp_spec::MotionPlan {
+        mcwp_spec::MotionPlan {
+            camera: "固定机位".to_string(),
+            elements: vec![
+                mcwp_spec::MotionElement {
+                    kind: "clouds".to_string(),
+                    area: "sky".to_string(),
+                    action: "stream left".to_string(),
+                    sentence: "Clouds stream left across the sky.".to_string(),
+                },
+                mcwp_spec::MotionElement {
+                    kind: "grass".to_string(),
+                    area: "foreground".to_string(),
+                    action: "bend".to_string(),
+                    sentence: "Grass bends in the wind.".to_string(),
+                },
+            ],
+            caption: String::new(),
+            scene: "A field under a cloudy sky.".to_string(),
+        }
+    }
+
+    /// 尾帧只允许动局部元素:四角和画面中央的“路”必须保持原像素。
+    #[test]
+    fn 动效尾帧只动局部元素() {
+        let bitmap = guide_test_bitmap(90, 60);
+        let (guide, warps, max_shift) = motion_guide_bitmap(&bitmap, &guide_test_plan());
+        assert!(warps >= 2, "天空和草地都该有引导区:{warps}");
+        assert!(max_shift > 0.0, "至少得有一个像素级的位移:{max_shift}");
+
+        let pixel = |image: &mcwp_image::Bitmap, x: usize, y: usize| {
+            let at = (y * image.width as usize + x) * 4;
+            image.rgba[at..at + 4].to_vec()
+        };
+        assert_eq!(pixel(&guide, 0, 0), pixel(&bitmap, 0, 0), "左上角不能动");
+        assert_eq!(
+            pixel(&guide, 45, 50),
+            pixel(&bitmap, 45, 50),
+            "画面中央的路不能动"
+        );
+        assert_ne!(
+            pixel(&guide, 10, 10),
+            pixel(&bitmap, 10, 10),
+            "云层该有位移"
+        );
+        assert_ne!(
+            pixel(&guide, 10, 50),
+            pixel(&bitmap, 10, 50),
+            "草地该有位移"
+        );
+    }
+
+    /// 引导帧的局部位移必须足够大。旧值在 320 宽上只有 2~3 px,视频模型会当成静帧;
+    /// 现在草地/蕨类应该到 5 px 以上(1080p 约 30 px)。
+    #[test]
+    fn 动效尾帧的位移足够让模型看见() {
+        let bitmap = guide_test_bitmap(320, 180);
+        let (_, _, max_shift) = motion_guide_bitmap(&bitmap, &guide_test_plan());
+        assert!(max_shift >= 4.0, "位移太小,模型会当成静帧:{max_shift}");
+    }
+
+    /// 纯光影方案不生成尾帧:否则又回到“只有明暗变化”的老问题。
+    #[test]
+    fn 纯光效方案不生成尾帧() {
+        let bitmap = guide_test_bitmap(60, 40);
+        let plan = mcwp_spec::MotionPlan {
+            camera: "固定机位".to_string(),
+            elements: vec![mcwp_spec::MotionElement {
+                kind: "Sunlight".to_string(),
+                area: "全图".to_string(),
+                action: "shift".to_string(),
+                sentence: "Sunlight shifts across the room.".to_string(),
+            }],
+            caption: String::new(),
+            scene: "A room.".to_string(),
+        };
+        let (guide, warps, max_shift) = motion_guide_bitmap(&bitmap, &plan);
+        assert_eq!(warps, 0);
+        assert_eq!(max_shift, 0.0);
+        assert_eq!(guide, bitmap);
     }
 }

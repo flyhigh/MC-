@@ -143,12 +143,27 @@ const VIDEO_WAIT_TIMEOUT: Duration = Duration::from_secs(1800);
 /// 的硬上限是 512 字符,所以这里和 `MAX_VIDEO_PROMPT_CHARS` 对齐。
 const MAX_MOTION_PROMPT_CHARS: usize = 512;
 
+/// 所有动效提示词共用的固定机位约束。
+///
+/// 2026-10-17 的真实成片说明单纯的 "camera remains locked off" 太弱:模型仍然在 10 秒里
+/// 推近了约 9%。这里保留三脚架、构图、透视和比例,但把长度压到 77 字符 —— 旧版 87 字符
+/// 会吃掉 512 预算,把后面的实体运动挤掉。
+const MOTION_STATIC_LINE: &str =
+    "Camera locked off on a tripod; framing, perspective and scale never change.";
+
 /// 所有动效提示词共用的收尾。
 ///
-/// 不能只写 `seamless`:那只是"看起来不跳",视频模型完全可能理解成"整段几乎不动"。
-/// 这里把动作幅度和位置钉死 —— 中段最大、末帧回到起始姿态;再把曝光、色彩和光照锁住,
-/// 避免模型用"太阳落山 / 整体明暗变化"来伪造运动。
-const MOTION_LOOP_TAIL: &str = "Each motion completes one full visible cycle and returns to its starting pose; no camera movement, zoom, pan or orbit, and exposure and color stay fixed.";
+/// **不要再写 "returns to its starting pose / last frame matches the first"**:那句话
+/// 会把 10 秒的片子压成静帧(2026-10-17 森林那条实测光流 0.06~0.12,元素几乎不动)。
+/// 循环接缝由播放器在最后 0.8 秒淡回首帧(见 `LOOP_FADE_SECS`),提示词只负责
+/// 让实体**持续、明显地动**,并把镜头和曝光锁住。旧版 164 字符,现在压到 76 字符,
+/// 把省下来的预算留给前景/中景元素。
+const MOTION_LOOP_TAIL: &str =
+    "Every mover keeps moving continuously to the last frame; never freeze.";
+
+/// 首尾帧模式专用:第二张图就是最后一帧。它给模型一个明确的落点,同时不要求
+/// "回到起始姿态",所以不会把动作压成静帧。
+const MOTION_LAST_FRAME_LINE: &str = "End on the second image.";
 
 /// 提交被"服务商在忙"挡回来时的退避(秒)。
 ///
@@ -520,8 +535,7 @@ struct ImageReply {
 /// 就会把别的错误(参数不合法、欠费、模型下线)也重发一遍 —— 轻则白等一轮,重则在
 /// 按张计费的服务商那边多花一次钱。认不出来就只是不重发,报错原样往上抛。
 fn is_watermark_refusal(status: u16, body: &str) -> bool {
-    (400..500).contains(&status)
-        && (body.contains("watermark") || body.contains("水印"))
+    (400..500).contains(&status) && (body.contains("watermark") || body.contains("水印"))
 }
 
 impl Images {
@@ -560,7 +574,11 @@ impl Images {
             "{host} · {} · {} · {}",
             self.cfg.model,
             self.cfg.quality,
-            if self.cfg.watermark { "带水印" } else { "无水印" }
+            if self.cfg.watermark {
+                "带水印"
+            } else {
+                "无水印"
+            }
         )
     }
 
@@ -734,7 +752,10 @@ pub enum VideoProgress {
     /// 还在跑(服务商那边)
     Running,
     /// 出来了:视频地址 + 封面图地址(封面是它的第一帧,存下来当缩略图)
-    Done { video_url: String, cover_url: String },
+    Done {
+        video_url: String,
+        cover_url: String,
+    },
     /// 服务商说这条失败了
     Failed(String),
 }
@@ -745,6 +766,28 @@ pub struct GeneratedVideo {
     pub url: String,
     pub bytes: Vec<u8>,
 }
+
+/// 一条**已经提交过**的视频任务没等到成片。
+///
+/// 它专门把任务号从 `anyhow` 的字符串里捞出来,交给界面做「免费取回」按钮:
+/// 报错文本是给人看的,任务号是给程序用的 —— 让面板去正则解析
+/// `--video-fetch <任务号> ...` 那种句子,迟早会被文案改动弄坏。
+///
+/// 只有"提交成功之后才失败"的路径会带它(轮询 FAIL / 等待超时 / 取回时再次失败);
+/// 提交本身被 429 或参数错误挡回来时没有任务号,也就没有免费取回这回事。
+#[derive(Debug, Clone)]
+pub struct VideoTaskFailure {
+    pub task_id: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for VideoTaskFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for VideoTaskFailure {}
 
 /// 「图生视频」接口的客户端。
 ///
@@ -823,6 +866,19 @@ impl Videos {
         screen: (u32, u32),
     ) -> Result<String> {
         self.submit_image(VideoImage::Pair([image_url, image_url]), prompt, screen)
+    }
+
+    /// 提交一条**不同首尾帧**的任务。动态壁纸用首帧原图 + 本地生成的局部动效引导帧:
+    /// 两张图的构图完全一致,只有会动的元素发生很小位移。这样模型拿到明确的运动目标,
+    /// 同时没有"推近镜头"的余地。
+    pub fn submit_frames(
+        &self,
+        first_url: &str,
+        last_url: &str,
+        prompt: &str,
+        screen: (u32, u32),
+    ) -> Result<String> {
+        self.submit_image(VideoImage::Pair([first_url, last_url]), prompt, screen)
     }
 
     fn submit_image(
@@ -920,7 +976,10 @@ impl Videos {
             .call()
             .map_err(|err| anyhow!("查询图生视频结果失败:{err}"))?;
         let status = response.status();
-        let raw = response.body_mut().read_to_string().context("读查询响应失败")?;
+        let raw = response
+            .body_mut()
+            .read_to_string()
+            .context("读查询响应失败")?;
         let task: VideoTask = match serde_json::from_str(&raw) {
             Ok(task) => task,
             Err(err) => {
@@ -980,6 +1039,28 @@ impl Videos {
         self.animate_with(image_url, prompt, false, screen)
     }
 
+    /// 首帧原图 + 尾帧局部动效引导帧。首尾帧被服务商拒绝时退回单图,至少让按钮可用;
+    /// 正常路径下这条路比单图更稳,因为构图在两端被钉住了。
+    pub fn animate_frames(
+        &self,
+        first_url: &str,
+        last_url: &str,
+        prompt: &str,
+        screen: (u32, u32),
+    ) -> Result<GeneratedVideo> {
+        let id = match self.submit_frames(first_url, last_url, prompt, screen) {
+            Ok(id) => {
+                tracing::info!("首尾帧被受理(尾帧是局部元素位移引导帧)");
+                id
+            }
+            Err(err) => {
+                tracing::warn!("首尾帧这条路没被受理({err:#}),退回单图重提一次");
+                self.submit(first_url, prompt, screen)?
+            }
+        };
+        self.wait_and_download(&id)
+    }
+
     /// 同上,但**先按首尾帧提交**(首尾都给这张图)。
     ///
     /// **不要用它做壁纸。** 2026-10-17 的多轮对照出片证明"首尾同图"会把运动锁死:
@@ -1032,12 +1113,15 @@ impl Videos {
             match self.poll(id)? {
                 VideoProgress::Running => {
                     if started.elapsed() > VIDEO_WAIT_TIMEOUT {
-                        return Err(anyhow!(
-                            "等了 {:.0} 分钟还没出片(任务 {id} 可能还在排队)。\
-                             它还在服务商那边跑、钱也已经花了,别重提 —— \
-                             过一会儿用 `--video-fetch {id} <库 id>` 把它取回来",
-                            VIDEO_WAIT_TIMEOUT.as_secs_f32() / 60.0
-                        ));
+                        return Err(anyhow::Error::new(VideoTaskFailure {
+                            task_id: id.to_string(),
+                            message: format!(
+                                "等了 {:.0} 分钟还没出片(任务 {id} 可能还在排队)。\
+                                 它还在服务商那边跑、钱也已经花了,别重提 —— \
+                                 过一会儿用 `--video-fetch {id} <库 id>` 把它取回来",
+                                VIDEO_WAIT_TIMEOUT.as_secs_f32() / 60.0
+                            ),
+                        }));
                     }
                     std::thread::sleep(VIDEO_POLL_INTERVAL);
                 }
@@ -1063,11 +1147,14 @@ impl Videos {
                     // 另一个视频模型探,提交直接被 429 挡回来:code 1305「访问量过大」),
                     // 不是请求体写错了 —— 报错里得让用户能分辨这一点。
                     let waited = started.elapsed().as_secs();
-                    return Err(anyhow!(
-                        "服务商说这条视频没生成出来(任务 {id},等了 {waited} 秒,他们没给原因):{reason}\
-                         —— 拖这么久才 FAIL 多半是他们那边排队/过载。过一会儿用 \
-                         `--video-fetch {id} <库 id>` 免费取回,**别重提**(重提要再花一次钱)"
-                    ));
+                    return Err(anyhow::Error::new(VideoTaskFailure {
+                        task_id: id.to_string(),
+                        message: format!(
+                            "服务商说这条视频没生成出来(任务 {id},等了 {waited} 秒,他们没给原因):{reason}\
+                             —— 拖这么久才 FAIL 多半是他们那边排队/过载。过一会儿用 \
+                             `--video-fetch {id} <库 id>` 免费取回,**别重提**(重提要再花一次钱)"
+                        ),
+                    }));
                 }
             }
         }
@@ -1091,7 +1178,11 @@ impl Videos {
             .map_err(|err| anyhow!("下载视频失败:{err}"))?;
         let status = response.status();
         if !status.is_success() {
-            return Err(anyhow!("下载视频返回 {}:{}", status.as_u16(), truncate(url, 120)));
+            return Err(anyhow!(
+                "下载视频返回 {}:{}",
+                status.as_u16(),
+                truncate(url, 120)
+            ));
         }
         let bytes = response
             .body_mut()
@@ -1347,7 +1438,11 @@ impl Client {
                     tracing::info!(
                         "生图计划:{}({})| 动效={} | 提示词={}",
                         plan.title,
-                        if plan.reply.is_empty() { "无回复" } else { &plan.reply },
+                        if plan.reply.is_empty() {
+                            "无回复"
+                        } else {
+                            &plan.reply
+                        },
                         plan.motion.summary(),
                         truncate(&plan.image_prompt, 80)
                     );
@@ -1431,10 +1526,7 @@ impl Client {
     pub fn plan_motion_vision(&self, photo: &Photo, image_bytes: &[u8]) -> MotionPlan {
         let messages = vec![
             Message::system(VISION_SYSTEM_PROMPT.to_string()),
-            Message::user_with_image(
-                motion_vision_request(photo),
-                image_data_url(image_bytes),
-            ),
+            Message::user_with_image(motion_vision_request(photo), image_data_url(image_bytes)),
         ];
         let raw = match self.chat_as(&self.cfg.vision_model, &messages) {
             Ok(text) => text,
@@ -1447,7 +1539,10 @@ impl Client {
             Ok(mut plan) => {
                 plan.normalize();
                 if plan.is_empty() {
-                    tracing::warn!("动效分析没认出任何元素,退回通用描述:{}", truncate(&raw, 200));
+                    tracing::warn!(
+                        "动效分析没认出任何元素,退回通用描述:{}",
+                        truncate(&raw, 200)
+                    );
                 } else {
                     tracing::info!(
                         "动效方案:镜头={} · {}个元素 · scene {} 字 / caption {} 字 / 最终提示词 {} 字",
@@ -1458,14 +1553,20 @@ impl Client {
                         video_prompt(&plan).chars().count()
                     );
                     if !plan.has_caption() {
-                        tracing::warn!("视觉模型没给 caption,只能退回元素拼接:{}", truncate(&raw, 200));
+                        tracing::warn!(
+                            "视觉模型没给 caption,只能退回元素拼接:{}",
+                            truncate(&raw, 200)
+                        );
                     }
                 }
                 plan
             }
             Err(err) => {
                 // 这一步的失败几乎全是形状问题(数组写成字符串、字段名写错),原话留在日志里
-                tracing::warn!("动效分析的 JSON 读不懂({err}),退回通用运镜:{}", truncate(&raw, 200));
+                tracing::warn!(
+                    "动效分析的 JSON 读不懂({err}),退回通用运镜:{}",
+                    truncate(&raw, 200)
+                );
                 MotionPlan::default()
             }
         }
@@ -1677,16 +1778,16 @@ motion 的四个数都是 0~1:intensity 是效果强弱,zoom 是画面推近幅�
 const MOTION_SYSTEM_PROMPT: &str = "\
 你在为「动态壁纸」写图生视频提示词。用户会给你一张**已经画好的图**的文字描述;\
 你看不到像素,所以只能写描述里确实提到过的东西,不要编。\n\
-只输出**一段英文**,55~85 个词,不要解释、不要加引号、不要 JSON、不要 markdown。\n\
+只输出**一段英文**,40~52 个词,不要解释、不要加引号、不要 JSON、不要 markdown。\n\
 必须满足:\n\
-1. 第一句先点一下场景,紧接着写 \"The camera remains locked off.\";\n\
+1. 第一句先点一下场景;后面按**前景→中景→天空**写 3~5 个实体运动;\n\
 2. 找出描述里**能物理移动的 3~5 样东西**(云、雾、水面、树叶、草、花、车流、人群、\
    飞鸟、衣摆、头发、窗帘、烟……),每样都写清楚位置和一个现在时动词;\n\
 3. 动词要具体、看得出来:drifts slowly right / sways back and forth / flutters /\n\
    ripples outward / rustles / billows / streams past / glides;\n\
 4. 不要只写光影变化 —— 至少有两样是实体在动;\n\
-5. 不要镜头切换、不要缩放/平移/环绕、不要出现新物体、不要文字、不要画风词;\n\
-6. 最后一句写 \"Each motion completes one full visible cycle and returns to its starting pose; no camera movement, zoom, pan or orbit, and exposure and color stay fixed.\"。";
+5. 不要镜头切换、不要缩放/平移/环绕/透视变化、不要出现新物体、不要文字、不要画风词;\n\
+6. **不要写固定机位、不要写收尾、不要写负面约束**;这些由本地统一补,你只写场景和实体运动。";
 
 /// 交给模型的"这张图是什么"。
 fn motion_request(photo: &Photo) -> String {
@@ -1708,7 +1809,7 @@ fn motion_vision_request(photo: &Photo) -> String {
          Original generation prompt (Chinese): {}\n\
          Look at the image itself, not the text. The Chinese text is only context;\n\
          translate everything you see into English.\n\
-         List 4-5 movers across sky, midground and foreground, with at least 3 physical objects.\n\
+         List 3-5 movers across sky, midground and foreground, with at least 2 physical objects.\n\
          Do not describe only changing light: leaves, grass, clouds, water, traffic, fabric\n\
          and hair must actually move. Output English only (except area).",
         photo.title, photo.prompt
@@ -1730,21 +1831,21 @@ const VISION_SYSTEM_PROMPT: &str = "\
 云、雾、烟、雨雪、水面/波纹、树叶、树枝、草、蕨类、花、旗子、窗帘、衣摆、头发、\n\
 人群、车流、飞鸟、昆虫、火焰、浮尘。\n\
 然后**只输出一份 JSON**,不要解释、不要 markdown 代码块、不要多余的字:\n\
-{\"camera\":\"固定机位\",\"scene\":\"English scene anchor, 12-24 words\",\"elements\":[{\"kind\":\"English noun phrase\",\"area\":\"左下\",\"action\":\"short English verb phrase\",\"sentence\":\"One complete present-tense English sentence, 8-16 words\"}]}\n\
+{\"camera\":\"固定机位\",\"scene\":\"English scene anchor, 10-18 words\",\"elements\":[{\"kind\":\"English noun phrase\",\"area\":\"左下\",\"action\":\"short English verb phrase\",\"sentence\":\"One complete present-tense English sentence, 7-14 words\"}]}\n\
 规则:\n\
 1. **只写图里看得见的东西**。图里没有车就别写车流;编出来的动作会让视频里凭空出现东西。\n\
 2. `area` 只能逐字使用这十个中文值之一:左上、上中、右上、左中、正中、右中、左下、下中、右下、全图。\n\
    不要写 sky / foreground / midground / center 这类英文,**中文值写错这条元素就无效**。\n\
-3. **必须列 4~5 个元素**,其中**至少 3 个是实体**(云/水/植物/车/人/鸟/烟/衣摆……)。\n\
+3. **必须列 3~5 个元素**(预算允许时优先 4 个),其中**至少 2 个是实体**(云/水/植物/车/人/鸟/烟/衣摆……)。\n\
    太阳、夕阳、光线、光晕、阴影、曝光、亮度、色彩变化都**不算实体**,不要把它们写成元素。\n\
    画面里真的只有两三样会动,就写两三样,但**至少 2 个实体**,不能只写光影。\n\
 4. **元素顺序前景优先**:先写草、蕨类、花、衣摆等前景,再写树/车/人群等中景,\n\
    最后写云/鸟等天空元素。前景有植物或地面,至少写一个前景元素。\n\
-5. `scene` 写 **12~24 个英文词**:地点 + 地形 + 前景/中景/天空的主要实体,\n\
+5. `scene` 写 **10~18 个英文词**:地点 + 地形 + 前景/中景/天空的主要实体,\n\
    例如 \"A dense forest with a winding dirt path, thick ferns and tall trees on both sides\";\n\
    不要写时间、日落、阳光、光晕、阴影、曝光、色调或 mood,也不要写 \"English\" 这个词。\n\
    `scene`、`kind`、`action` 必须是英文,中文标题和中文描述只是上下文,不要用中文回答。\n\
-6. `sentence` 是**每个元素一句完整英文**,8~16 词,主语 + 现在时强动词 + 方向/幅度。\n\
+6. `sentence` 是**每个元素一句完整英文**,7~14 词,主语 + 现在时强动词 + 方向/幅度。\n\
    必须写出方向或幅度:back and forth / from left to right / outward / upward /\n\
    in large waves / deeply / strongly / continuously / across the frame。\n\
    不要只写\"sway gently\",要写\"sway strongly back and forth\";\n\
@@ -1755,8 +1856,13 @@ const VISION_SYSTEM_PROMPT: &str = "\
    **不要用 subtle / subtly / tiny / faint / slight / gentle / gently / softly /\n\
    gracefully** 形容主要动作;也不要写\"保持不变\"\"静止\"来凑数。\n\
    `action` 只是给诊断看的短动词短语,caption 真正用的是 `sentence`。\n\
-7. `camera` 一律写\"固定机位\":壁纸不需要运镜,画面里的东西自己动才是重点。\n\
-8. 不要镜头切换、不要缩放/平移/环绕、不要出现新物体、不要文字、不要画风词。";
+7. `camera` 一律写\"固定机位\":壁纸的相机架在三脚架上,焦距、透视和比例都不变;\n\
+   画面里的元素自己动,不要靠推镜、拉镜、摇摄或环绕制造运动。\n\
+8. 不要镜头切换、不要缩放/平移/环绕/透视变化、不要出现新物体、不要文字、不要画风词。\n\
+9. 每个 `sentence` 里不要出现 camera / zoom / pan / orbit / dolly / shot 这些词;\n\
+   只写实体自己怎么动。\n\
+10. `scene` + 所有 `sentence` 合计控制在 **330 个字符**以内;超过时先删天空元素,\n\
+    不要删前景运动,也不要把句子写成光影变化。";
 
 /// 把元素级方案拼成**图生视频那句提示词**。
 ///
@@ -1793,16 +1899,29 @@ fn trim_repeated_prefix<'a>(kind: &str, action: &'a str) -> &'a str {
 ///
 /// `caption` 为空时才退回元素拼接(老资产 / 模型漏字段),再空就退回通用描述。
 pub fn video_prompt(plan: &MotionPlan) -> String {
+    video_prompt_inner(plan, false)
+}
+
+/// 首尾帧模式用那一句:和 `video_prompt` 只差两点 ——
+/// 1. 不再写三脚架那句长约束(两张图的构图完全一致,本身就把镜头钉住了);
+/// 2. 明确要求**最后一帧落到第二张图**,给模型一个清晰的运动终点。
+///
+/// 它仍然不写"回到起始姿态":那句话会让模型选择整段不动。
+pub fn video_prompt_for_frames(plan: &MotionPlan) -> String {
+    video_prompt_inner(plan, true)
+}
+
+fn video_prompt_inner(plan: &MotionPlan, guided: bool) -> String {
     if plan.is_empty() {
         return fallback_motion_prompt().to_string();
     }
     let caption = plan.caption.trim();
     if !caption.is_empty() {
-        return fit_video_caption(caption);
+        return fit_video_caption(caption, guided);
     }
     // 新方案:模型给 scene + 英文 elements,本地拼成官方要的英文长描述。
     if !plan.scene.trim().is_empty() && !plan.elements.is_empty() {
-        return compose_scene_caption(plan);
+        return compose_scene_caption(plan, guided);
     }
     let camera = if plan.camera.trim().is_empty() {
         "固定机位"
@@ -1823,7 +1942,7 @@ pub fn video_prompt(plan: &MotionPlan) -> String {
         )
         .collect();
     let head = format!("镜头{camera}。画面里:");
-    let tail = "。动作连续、轻缓,构图、色彩和光线保持稳定,结尾回到起始画面。";
+    let tail = "。动作连续、明显,构图、色彩和光线保持稳定,不要冻结或停住。";
     let budget =
         MAX_VIDEO_PROMPT_CHARS.saturating_sub(head.chars().count() + tail.chars().count() + 1);
     format!("{head}{}{tail}", truncate(&elements.join(";"), budget))
@@ -1832,25 +1951,23 @@ pub fn video_prompt(plan: &MotionPlan) -> String {
 /// 把 `scene` + 英文 `elements` 拼成一段完整的英文图生视频描述。
 ///
 /// 顺序是固定的:
-/// 1. 场景锚点(8~15 词);
-/// 2. `The camera remains locked off.` —— 壁纸不做运镜;
-/// 3. 每个元素一句 `In the <位置>, <元素> <动作>.`;
-/// 4. 闭环句。
+/// 1. 场景锚点(10~18 词);
+/// 2. 每个元素一句 `In the <位置>, <元素> <动作>.`,按前景→中景→天空排序;
+/// 3. 单图模式在**元素之后**加 `MOTION_STATIC_LINE`;首尾帧模式不加 ——
+///    首尾两张图的构图完全一致,镜头已经被钉住,省下来的字符留给元素动作;
+/// 4. 首尾帧模式加"落到第二张图";单图模式跳过;
+/// 5. `MOTION_LOOP_TAIL`(持续运动,不冻结)。
 ///
-/// **先给闭环句留位置,再塞元素**:宁可少写一个元素,也不能让 512 字把
-/// `MOTION_LOOP_TAIL` 截掉 —— 那是循环接缝的一半(见 §11.22)。
-fn compose_scene_caption(plan: &MotionPlan) -> String {
+/// **先给尾巴留位置,再塞元素**:宁可少写一个元素,也不能让 512 字把
+/// `MOTION_STATIC_LINE` / `MOTION_LOOP_TAIL` / `MOTION_LAST_FRAME_LINE` 截掉。
+fn compose_scene_caption(plan: &MotionPlan, guided: bool) -> String {
     const TAIL: &str = MOTION_LOOP_TAIL;
-    let scene = clean_scene_anchor(&plan.scene);
+    let scene = strengthen_motion(&clean_scene_anchor(&plan.scene));
     let mut text = if scene.is_empty() {
         String::new()
     } else {
         format!("{scene}.")
     };
-    if !text.is_empty() {
-        text.push(' ');
-    }
-    text.push_str("The camera remains locked off.");
 
     // **前景优先**。视觉模型即使被要求"先前景",仍会把 clouds 写在第一句;
     // 视频模型对前几句最敏感,天空排前面就会只做云/光的变化。这里按位置强制排序,
@@ -1878,8 +1995,30 @@ fn compose_scene_caption(plan: &MotionPlan) -> String {
         } else {
             continue;
         };
-        let needed = text.chars().count() + 1 + sentence.chars().count() + 1 + TAIL.chars().count();
+        let sentence = strengthen_motion(&sentence);
+        let camera_line = if guided { "" } else { MOTION_STATIC_LINE };
+        let guide_line = if guided { MOTION_LAST_FRAME_LINE } else { "" };
+        let reserve = TAIL.chars().count()
+            + 1
+            + if camera_line.is_empty() {
+                0
+            } else {
+                camera_line.chars().count() + 1
+            }
+            + if guide_line.is_empty() {
+                0
+            } else {
+                guide_line.chars().count() + 1
+            };
+        let needed = text.chars().count() + 1 + sentence.chars().count() + reserve;
         if needed > MAX_VIDEO_PROMPT_CHARS {
+            tracing::warn!(
+                "动效提示词预算不足,丢弃元素「{}」;当前 {} 字符,保留 {}/{} 个元素",
+                kind,
+                text.chars().count(),
+                kept,
+                plan.elements.len()
+            );
             break;
         }
         text.push(' ');
@@ -1889,9 +2028,17 @@ fn compose_scene_caption(plan: &MotionPlan) -> String {
     if kept == 0 {
         return fallback_motion_prompt().to_string();
     }
+    if !guided {
+        text.push(' ');
+        text.push_str(MOTION_STATIC_LINE);
+    }
+    if guided {
+        text.push(' ');
+        text.push_str(MOTION_LAST_FRAME_LINE);
+    }
     text.push(' ');
     text.push_str(TAIL);
-    truncate_at_sentence(&strengthen_motion(&text), MAX_VIDEO_PROMPT_CHARS)
+    truncate_at_sentence(&text, MAX_VIDEO_PROMPT_CHARS)
 }
 
 /// 清理视觉模型给的场景锚点。
@@ -1901,7 +2048,11 @@ fn compose_scene_caption(plan: &MotionPlan) -> String {
 /// 这类词会把视频模型往"太阳落山、整体明暗变化"上带,正是这次要修的病。
 /// 这里只做确定性的清洗:去 `English` 前缀、去时间/光线短语、压空格、首字母大写。
 fn clean_scene_anchor(raw: &str) -> String {
-    let mut text = raw.trim().trim_matches(['"', '\u{201c}', '\u{201d}']).trim().to_string();
+    let mut text = raw
+        .trim()
+        .trim_matches(['"', '\u{201c}', '\u{201d}'])
+        .trim()
+        .to_string();
     if text
         .get(..7)
         .is_some_and(|head| head.eq_ignore_ascii_case("english"))
@@ -2128,9 +2279,9 @@ fn truncate_at_sentence(text: &str, max: usize) -> String {
 ///
 /// 三件事必须兜住:
 /// - 模型爱加 ``` 和引号,直接发过去会变成画面里的怪东西;
-/// - 没有 "camera" 就补一句固定机位 —— 壁纸不需要运镜;
+/// - 没有 "camera" 就在**动作之后**补一句固定机位 —— 壁纸不需要运镜;
 /// - 没有闭环句就补一句,接缝才不容易被看出来。
-fn fit_video_caption(raw: &str) -> String {
+fn fit_video_caption(raw: &str, guided: bool) -> String {
     let mut body = raw.trim();
     if let Some(rest) = body.strip_prefix("```json") {
         body = rest;
@@ -2145,20 +2296,51 @@ fn fit_video_caption(raw: &str) -> String {
         .trim_matches(['\"', '\u{201c}', '\u{201d}'])
         .trim()
         .to_string();
-    let lower = text.to_ascii_lowercase();
-    if !lower.contains("camera") && !text.contains("镜头") {
-        text = format!("The camera remains locked off. {text}");
+    // 老资产里可能已经存了旧版收尾。那不是"已经满足条件",而是这一轮要修的病根之一:
+    // 旧句要求"回到起始姿态",模型会照做 —— 于是整段几乎不动。这里先剥掉所有已知旧尾巴,
+    // 再统一换成"持续运动"的那一句。
+    const OLD_TAIL: &str = "Each motion completes one full visible cycle and returns to its starting pose; no camera movement, zoom, pan or orbit, and exposure and color stay fixed.";
+    const PREVIOUS_SEAMLESS_TAIL: &str = "Seamless loop: every mover completes one closed cycle and returns to its starting pose, so the last frame matches the first; static objects stay pixel-locked, with fixed exposure and color.";
+    for tail in [
+        OLD_TAIL,
+        PREVIOUS_SEAMLESS_TAIL,
+        MOTION_LOOP_TAIL,
+        MOTION_LAST_FRAME_LINE,
+    ] {
+        if let Some(at) = text.find(tail) {
+            text.replace_range(at..at + tail.len(), "");
+            text = text.trim().to_string();
+        }
     }
-    let lower = text.to_ascii_lowercase();
-    if !lower.contains("full visible cycle") && !text.contains("无缝")
-    {
-        const TAIL: &str = MOTION_LOOP_TAIL;
-        let budget = MAX_VIDEO_PROMPT_CHARS.saturating_sub(TAIL.chars().count() + 1);
-        text = truncate_at_sentence(&text, budget);
-        text.push(' ');
-        text.push_str(TAIL);
+    // 老 caption 里的固定机位句可能出现在开头。先把它从正文里剥掉,
+    // 最后统一放到动作清单之后 —— 先让模型看到"谁在动",再锁镜头。
+    const OLD_STATIC_SHORT: &str = "The camera remains locked off.";
+    const OLD_STATIC_LONG: &str =
+        "The camera remains locked off on a tripod; framing, perspective and scale never change.";
+    for camera_line in [OLD_STATIC_SHORT, OLD_STATIC_LONG, MOTION_STATIC_LINE] {
+        if let Some(at) = text.find(camera_line) {
+            text.replace_range(at..at + camera_line.len(), "");
+            text = text.trim().to_string();
+        }
     }
-    truncate_at_sentence(&strengthen_motion(&text), MAX_VIDEO_PROMPT_CHARS)
+    let mut tail = String::new();
+    if !guided {
+        tail.push_str(MOTION_STATIC_LINE);
+        tail.push(' ');
+    }
+    if guided {
+        tail.push_str(MOTION_LAST_FRAME_LINE);
+        tail.push(' ');
+    }
+    tail.push_str(MOTION_LOOP_TAIL);
+    let body = strengthen_motion(&text);
+    let budget = MAX_VIDEO_PROMPT_CHARS.saturating_sub(tail.chars().count() + 1);
+    let body = truncate_at_sentence(&body, budget);
+    if body.is_empty() {
+        tail
+    } else {
+        format!("{body} {tail}")
+    }
 }
 
 /// 模型没答上来时用的通用描述。**必须是一段真能用的话**:这条路是兜底,
@@ -2166,8 +2348,10 @@ fn fit_video_caption(raw: &str) -> String {
 ///
 /// 旧版是"镜头缓慢推近 + 云/水/光影"的中文短句;现在改成英文长描述,和主路同一个形状。
 /// 用 "Where present" 限定,是怕图里没有水面/烟时模型硬加。
-pub fn fallback_motion_prompt() -> &'static str {
-    "The camera remains locked off on this scene. Where present, thin clouds drift across the sky, tree canopies and leaves sway and rustle, grass and ferns bend and spring back, water surfaces ripple outward, and loose fabric, hair or smoke moves with the air. Each motion completes one full visible cycle and returns to its starting pose; no camera movement, zoom, pan or orbit, and exposure and color stay fixed."
+pub fn fallback_motion_prompt() -> String {
+    format!(
+        "An ambient natural scene. Where present, grass and ferns bend in visible waves, leaves sway and rustle, water ripples, fabric and hair move with the air, and clouds stream across the sky. {MOTION_STATIC_LINE} {MOTION_LOOP_TAIL}"
+    )
 }
 
 /// 把模型那句回复收干净:去围栏、去引号、把换行接成一段、限长。
@@ -2527,8 +2711,16 @@ pub fn video_size_for(screen: (u32, u32)) -> (u32, u32) {
         let distance = (((width as f32 / height as f32).ln() - want).abs() * 1000.0).round() as i64;
         let area = width as i64 * height as i64;
         let fits = area <= screen_area;
-        let key = (distance, if fits { 0 } else { 1 }, if fits { -area } else { area });
-        if best.as_ref().map(|(current, _)| key < *current).unwrap_or(true) {
+        let key = (
+            distance,
+            if fits { 0 } else { 1 },
+            if fits { -area } else { area },
+        );
+        if best
+            .as_ref()
+            .map(|(current, _)| key < *current)
+            .unwrap_or(true)
+        {
             best = Some((key, (width, height)));
         }
     }
@@ -2692,8 +2884,14 @@ mod tests {
         ));
         assert!(is_watermark_refusal(403, "该账号未开通去水印权限"));
         // 认不出的:别的 400(参数不合法 / 欠费 / 模型不存在)一律不重发
-        assert!(!is_watermark_refusal(400, r#"{"error":{"message":"size 不合法"}}"#));
-        assert!(!is_watermark_refusal(401, r#"{"error":{"message":"invalid api key"}}"#));
+        assert!(!is_watermark_refusal(
+            400,
+            r#"{"error":{"message":"size 不合法"}}"#
+        ));
+        assert!(!is_watermark_refusal(
+            401,
+            r#"{"error":{"message":"invalid api key"}}"#
+        ));
         // 200 更不该被当成"被拒" —— 那会白画第二张
         assert!(!is_watermark_refusal(200, "ok"));
         // 5xx 也不重发:服务端自己出问题,重发只是再等一轮 45 秒
@@ -2879,12 +3077,16 @@ mod tests {
         }
         assert!(VISION_SYSTEM_PROMPT.contains("元素顺序前景优先"));
         assert!(VISION_SYSTEM_PROMPT.contains("至少 2 个实体"));
+        assert!(VISION_SYSTEM_PROMPT.contains("3~5 个元素"));
+        assert!(VISION_SYSTEM_PROMPT.contains("330 个字符"));
+        assert!(VISION_SYSTEM_PROMPT.contains("camera / zoom / pan"));
     }
 
     /// 生图响应只认 `data[0].url`,但它真实的形状比这花哨得多,多一层嵌套不能把解析搞崩。
     #[test]
     fn 生图响应能挑出图片地址() {
-        let raw = r#"{"id":"task","created":1760000000,"data":[{"url":"https://example.com/a.png"}]}"#;
+        let raw =
+            r#"{"id":"task","created":1760000000,"data":[{"url":"https://example.com/a.png"}]}"#;
         let parsed: ImageResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(parsed.data.len(), 1);
         assert_eq!(parsed.data[0].url, "https://example.com/a.png");
@@ -2897,7 +3099,10 @@ mod tests {
     #[test]
     fn 降级提示词兜住了底线() {
         let prompt = fallback_image_prompt("  我想要个安静点的桌面  ");
-        assert!(prompt.starts_with("我想要个安静点的桌面"), "开头就是用户原话");
+        assert!(
+            prompt.starts_with("我想要个安静点的桌面"),
+            "开头就是用户原话"
+        );
         assert!(prompt.contains("无文字"));
         assert!(prompt.contains("留白"));
     }
@@ -2942,7 +3147,10 @@ mod tests {
         .unwrap();
         assert_eq!(done.video_result.len(), 1);
         assert_eq!(done.video_result[0].url, "https://example.com/a.mp4");
-        assert_eq!(done.video_result[0].cover_image_url, "https://example.com/a.png");
+        assert_eq!(
+            done.video_result[0].cover_image_url,
+            "https://example.com/a.png"
+        );
 
         let failed: VideoTask =
             serde_json::from_str(r#"{"id":"task-1","task_status":"FAIL"}"#).unwrap();
@@ -3020,14 +3228,14 @@ mod tests {
         assert!(prompt.contains("镜头固定机位"), "{prompt}");
         assert!(prompt.contains("左中灯光窗口逐个亮灭闪烁"), "{prompt}");
         assert!(prompt.contains("下中车流沿道路从右往左流动"), "{prompt}");
-        // 闭环要求**不能少**:循环播放能不能接上,一半靠这句(见 §11.22)
-        assert!(prompt.contains("结尾回到起始画面"), "{prompt}");
+        // 收尾要求**不能少**:它负责把"持续、明显地动"说死,别让模型交静帧。
+        assert!(prompt.contains("不要冻结或停住"), "{prompt}");
     }
 
     /// 方案是空的(看图失败 / 没配视觉模型)→ 必须退回那句通用运镜,而不是发一句空提示词。
     /// 元素再多,收尾那几句也不能被截掉。
     ///
-    /// 这条是**按实测补的**:截断砍的是尾巴,而元素一多、最先没的就是"结尾回到起始画面"。
+    /// 这条是**按实测补的**:截断砍的是尾巴,而元素一多、最先没的就是收尾那句。
     /// 少一个元素只是少动一处;闭环那句没了,循环点上那一记跳就回来了(见 §11.22)。
     #[test]
     fn 元素再多也留得住闭环那句() {
@@ -3051,8 +3259,8 @@ mod tests {
             "还是超了:{}",
             prompt.chars().count()
         );
-        assert!(prompt.contains("结尾回到起始画面"), "{prompt}");
-        assert!(prompt.ends_with("结尾回到起始画面。"), "{prompt}");
+        assert!(prompt.contains("不要冻结或停住"), "{prompt}");
+        assert!(prompt.ends_with("不要冻结或停住。"), "{prompt}");
     }
 
     /// 方案是空的(看图失败 / 没配视觉模型)→ 必须退回那句通用运镜,而不是发一句空提示词。
@@ -3107,10 +3315,7 @@ mod tests {
             prompt.starts_with("A quiet forest path through tall trees"),
             "{prompt}"
         );
-        assert!(
-            prompt.contains("The camera remains locked off."),
-            "{prompt}"
-        );
+        assert!(prompt.contains(MOTION_STATIC_LINE), "{prompt}");
         assert!(
             prompt.contains("In the upper left, tree leaves sway back and forth"),
             "{prompt}"
@@ -3123,11 +3328,132 @@ mod tests {
             prompt.contains("In the upper right, thin clouds stream steadily"),
             "{prompt}"
         );
-        assert!(prompt.ends_with("no camera movement, zoom, pan or orbit, and exposure and color stay fixed."), "{prompt}");
+        let camera = prompt
+            .find(MOTION_STATIC_LINE)
+            .expect("camera line should be present");
+        let last_element = prompt
+            .find("In the upper right, thin clouds stream steadily")
+            .expect("last element should be present");
+        assert!(
+            last_element < camera,
+            "固定机位必须排在元素动作之后:{prompt}"
+        );
+        let lower = prompt.to_ascii_lowercase();
+        for forbidden in ["dolly", "zoom", "orbit", "tracking", "handheld", "crane"] {
+            assert!(
+                !lower.contains(forbidden),
+                "动效提示词里不该出现运镜词「{forbidden}」:{prompt}"
+            );
+        }
+        assert!(prompt.ends_with(MOTION_LOOP_TAIL), "{prompt}");
         assert!(
             prompt.chars().count() <= MAX_VIDEO_PROMPT_CHARS,
             "{}",
             prompt.chars().count()
+        );
+    }
+
+    /// 首尾帧模式:第二张图就是最后一帧,提示词必须明确要求落到它,同时不能再
+    /// 要求"回到起始姿态"(那会把整段压成静帧)。
+    #[test]
+    fn 首尾帧提示词要求落到第二张图() {
+        let plan = MotionPlan {
+            camera: "固定机位".to_string(),
+            scene: "A forest path between tall trees and thick ferns".to_string(),
+            elements: vec![
+                MotionElement {
+                    kind: "grass".to_string(),
+                    area: "下中".to_string(),
+                    action: "bend strongly".to_string(),
+                    sentence: "Grass bends strongly along both sides of the path.".to_string(),
+                },
+                MotionElement {
+                    kind: "leaves".to_string(),
+                    area: "左上".to_string(),
+                    action: "rustle continuously".to_string(),
+                    sentence: "Leaves rustle continuously in the canopy.".to_string(),
+                },
+            ],
+            caption: String::new(),
+        };
+        let prompt = video_prompt_for_frames(&plan);
+        assert!(prompt.contains(MOTION_LAST_FRAME_LINE), "{prompt}");
+        assert!(prompt.ends_with(MOTION_LOOP_TAIL), "{prompt}");
+        assert!(!prompt.contains(MOTION_STATIC_LINE), "{prompt}");
+        assert!(!prompt.contains("returns to its starting pose"), "{prompt}");
+        assert!(!prompt.contains("closed cycle"), "{prompt}");
+        assert!(
+            prompt.chars().count() <= MAX_VIDEO_PROMPT_CHARS,
+            "{}: {prompt}",
+            prompt.chars().count()
+        );
+    }
+
+    /// 用户点「生成动图」时最常见的那份森林方案:四个元素必须都留在 512 字以内。
+    /// 少一个元素就是少一片会动的区域,这次“场景元素都不动”的问题里不能再丢。
+    #[test]
+    fn 森林方案四个元素都进得去() {
+        let plan = MotionPlan {
+            camera: "固定机位".to_string(),
+            scene:
+                "a dense forest with a winding dirt path, thick ferns and tall trees on both sides"
+                    .to_string(),
+            elements: vec![
+                MotionElement {
+                    kind: "clouds".to_string(),
+                    area: "sky".to_string(),
+                    action: "stream steadily".to_string(),
+                    sentence: "Clouds stream steadily across the sky.".to_string(),
+                },
+                MotionElement {
+                    kind: "grass".to_string(),
+                    area: "midground".to_string(),
+                    action: "bends deeply".to_string(),
+                    sentence: "Grass bends deeply under the weight of the wind.".to_string(),
+                },
+                MotionElement {
+                    kind: "fern".to_string(),
+                    area: "midground".to_string(),
+                    action: "ripples in visible waves".to_string(),
+                    sentence: "Ferns ripple in visible waves along the path.".to_string(),
+                },
+                MotionElement {
+                    kind: "leaves".to_string(),
+                    area: "midground".to_string(),
+                    action: "shakes and rustles continuously".to_string(),
+                    sentence: "Leaves shake and rustle continuously in the breeze.".to_string(),
+                },
+            ],
+            caption: String::new(),
+        };
+        let prompt = video_prompt_for_frames(&plan);
+        for mover in ["Clouds", "Grass", "Ferns", "Leaves"] {
+            assert!(prompt.contains(mover), "少了 {mover}:{prompt}");
+        }
+        assert!(prompt.contains(MOTION_LAST_FRAME_LINE), "{prompt}");
+        assert!(prompt.ends_with(MOTION_LOOP_TAIL), "{prompt}");
+        assert!(
+            prompt.chars().count() <= MAX_VIDEO_PROMPT_CHARS,
+            "{}: {prompt}",
+            prompt.chars().count()
+        );
+
+        // 默认走单图首帧时也必须装得下四个元素,并且固定机位在动作之后。
+        let single = video_prompt(&plan);
+        for mover in ["Clouds", "Grass", "Ferns", "Leaves"] {
+            assert!(single.contains(mover), "单图模式少了 {mover}:{single}");
+        }
+        let camera = single
+            .find(MOTION_STATIC_LINE)
+            .expect("camera line should be present");
+        let last_element = single
+            .find("Leaves shake and rustle")
+            .expect("leaves should be present");
+        assert!(last_element < camera, "固定机位应该在元素之后:{single}");
+        assert!(
+            single.chars().count() <= MAX_VIDEO_PROMPT_CHARS,
+            "{}: {single}",
+            single.chars().count()
         );
     }
 
@@ -3162,10 +3488,14 @@ mod tests {
         };
         let prompt = video_prompt(&plan);
         let grass = prompt.find("Grass bends").expect("grass should be present");
-        let leaves = prompt.find("Tree leaves sway").expect("leaves should be present");
-        let clouds = prompt.find("Clouds drift").expect("clouds should be present");
+        let leaves = prompt
+            .find("Tree leaves sway")
+            .expect("leaves should be present");
+        let clouds = prompt
+            .find("Clouds drift")
+            .expect("clouds should be present");
         assert!(grass < leaves && leaves < clouds, "{prompt}");
-        assert!(prompt.ends_with("no camera movement, zoom, pan or orbit, and exposure and color stay fixed."), "{prompt}");
+        assert!(prompt.ends_with(MOTION_LOOP_TAIL), "{prompt}");
     }
 
     /// 旧方案里的 `Sunset / The sun sets...` 不能再发给视频模型。
@@ -3213,7 +3543,10 @@ mod tests {
     /// 本地必须清掉,否则视频模型又会去动太阳和整体光线。
     #[test]
     fn 场景锚点会清掉英文前缀和光线时间词() {
-        assert_eq!(clean_scene_anchor("English forest path at dusk"), "Forest path");
+        assert_eq!(
+            clean_scene_anchor("English forest path at dusk"),
+            "Forest path"
+        );
         assert_eq!(
             clean_scene_anchor("a quiet lake at sunset with warm sunlight"),
             "A quiet lake"
@@ -3244,11 +3577,8 @@ mod tests {
             !prompt.contains("In the upper right, thin clouds"),
             "{prompt}"
         );
-        assert!(
-            prompt.contains("The camera remains locked off."),
-            "{prompt}"
-        );
-        assert!(prompt.ends_with("no camera movement, zoom, pan or orbit, and exposure and color stay fixed."), "{prompt}");
+        assert!(prompt.contains(MOTION_STATIC_LINE), "{prompt}");
+        assert!(prompt.ends_with(MOTION_LOOP_TAIL), "{prompt}");
     }
 
     /// caption 是主路:有它就直接发,不再退回"镜头 + 元素"的短清单。
@@ -3269,7 +3599,11 @@ mod tests {
         assert!(prompt.starts_with("A forest path at dusk."), "{prompt}");
         assert!(!prompt.contains("镜头缓慢推近"), "{prompt}");
         assert!(prompt.contains("Ferns sway back and forth"), "{prompt}");
-        assert!(prompt.ends_with("no camera movement, zoom, pan or orbit, and exposure and color stay fixed."), "{prompt}");
+        assert!(prompt.ends_with(MOTION_LOOP_TAIL), "{prompt}");
+        assert!(
+            !prompt.contains("no camera movement, zoom, pan or orbit"),
+            "{prompt}"
+        );
     }
 
     /// caption 里没提相机 → 本地补一句固定机位;没提闭环 → 补一句闭环。
@@ -3282,12 +3616,16 @@ mod tests {
             scene: String::new(),
         };
         let prompt = video_prompt(&plan);
-        assert!(
-            prompt.starts_with("The camera remains locked off."),
-            "{prompt}"
-        );
+        assert!(prompt.starts_with("Leaves rustle"), "{prompt}");
+        let leaves = prompt
+            .find("Leaves rustle")
+            .expect("leaves should be present");
+        let camera = prompt
+            .find(MOTION_STATIC_LINE)
+            .expect("camera line should be present");
+        assert!(leaves < camera, "固定机位应该在动作之后:{prompt}");
         assert!(prompt.contains("Leaves rustle"), "{prompt}");
-        assert!(prompt.ends_with("no camera movement, zoom, pan or orbit, and exposure and color stay fixed."), "{prompt}");
+        assert!(prompt.ends_with(MOTION_LOOP_TAIL), "{prompt}");
         assert!(prompt.chars().count() <= MAX_VIDEO_PROMPT_CHARS, "{prompt}");
     }
 
@@ -3315,9 +3653,16 @@ mod tests {
     #[test]
     fn 通用兜底写的是实体运动() {
         let prompt = fallback_motion_prompt();
-        assert!(prompt.contains("camera remains locked off"), "{prompt}");
         assert!(prompt.contains("leaves sway"), "{prompt}");
-        assert!(prompt.contains("ripple outward"), "{prompt}");
+        assert!(prompt.contains("water ripples"), "{prompt}");
+        let motion = prompt
+            .find("leaves sway")
+            .expect("the fallback should name moving entities");
+        let camera = prompt
+            .find(MOTION_STATIC_LINE)
+            .expect("camera line should be present");
+        assert!(motion < camera, "固定机位应该在元素动作之后:{prompt}");
+        assert!(prompt.ends_with(MOTION_LOOP_TAIL), "{prompt}");
         assert!(
             prompt.chars().count() <= MAX_VIDEO_PROMPT_CHARS,
             "{}",
@@ -3468,7 +3813,7 @@ mod tests {
         let pair = serde_json::to_value(&VideoRequest {
             model: "cogvideox-3",
             prompt: "镜头固定",
-            image_url: VideoImage::Pair(["data:image/png;base64,AAA", "data:image/png;base64,AAA"]),
+            image_url: VideoImage::Pair(["data:image/png;base64,AAA", "data:image/png;base64,BBB"]),
             quality: VIDEO_QUALITY,
             watermark_enabled: false,
             size: "1920x1080",
@@ -3478,13 +3823,16 @@ mod tests {
         .unwrap();
         let images = pair["image_url"].as_array().expect("首尾帧要发成数组");
         assert_eq!(images.len(), 2);
-        assert_eq!(images[0], images[1], "首尾帧给的是同一张图");
+        assert_ne!(images[0], images[1], "首帧和局部动效尾帧必须是两张图");
     }
 
     /// 看图那条消息的形状:一段话 + 一张图,而且图的字段名必须是 `image_url`。
     #[test]
     fn 看图消息是文本加图片() {
-        let message = Message::user_with_image("看这张图".to_string(), "data:image/png;base64,AAA".to_string());
+        let message = Message::user_with_image(
+            "看这张图".to_string(),
+            "data:image/png;base64,AAA".to_string(),
+        );
         let value = serde_json::to_value(&message).unwrap();
         assert_eq!(value["role"], "user");
         let parts = value["content"].as_array().expect("带图时正文是数组");
