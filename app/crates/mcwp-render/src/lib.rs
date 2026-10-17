@@ -37,7 +37,7 @@ fn mem_mb() -> (f64, f64) {
     }
 }
 use bytemuck::{Pod, Zeroable};
-use mcwp_spec::{MotionKind, Photo};
+use mcwp_spec::{ClockStyle, MotionKind, MotionRecipe, Photo};
 use raw_window_handle::{RawWindowHandle, Win32WindowHandle};
 
 /// 一个最小的 `HasDisplayHandle` 实现。
@@ -112,6 +112,18 @@ pub struct PhotoParams {
     pub vignette: f32,
     /// 颗粒感 0~1
     pub grain: f32,
+    /// 对比度，1.0 = 原样
+    pub contrast: f32,
+    /// 冷暖：-1 偏冷 / 0 原样 / 1 偏暖
+    pub warmth: f32,
+    /// 时钟样式编号，0 = 关
+    pub clock_style: f32,
+    /// 时钟不透明度
+    pub clock_opacity: f32,
+    /// 本地时间的小时 / 分钟
+    pub clock_time: [f32; 2],
+    /// 时钟锚点（屏幕 uv，右上角）
+    pub clock_pos: [f32; 2],
     /// 补齐到 16 字节对齐(WGSL uniform 要求)
     pub _pad: [f32; 2],
 }
@@ -126,22 +138,33 @@ impl PhotoParams {
             }
         }
         let motion = photo.motion;
+        let edit = photo.edit;
         Self {
             resolution: [width as f32, height as f32],
             time: 0.0,
-            brightness: desktop_brightness.clamp(0.2, 1.6),
+            brightness: (desktop_brightness * edit.brightness).clamp(0.2, 1.6),
             palette,
             zoom: motion.zoom,
             pan: motion.pan,
-            speed: motion.speed,
+            speed: (motion.speed * edit.speed).clamp(0.0, MotionRecipe::SPEED_MAX),
             intensity: motion.intensity,
             effect: effect_index(motion.kind) as f32,
             image_aspect: photo.aspect(),
             screen_aspect: width as f32 / height.max(1) as f32,
             seed: photo.seed as f32,
-            // 暗角给得比程序化场景轻:照片本身已经有构图和明暗,再压一圈会显得脏
-            vignette: 0.55,
+            // 暗角默认给得比程序化场景轻:照片本身已经有构图和明暗,再压一圈会显得脏
+            vignette: edit.vignette,
             grain: 0.12,
+            contrast: edit.contrast,
+            warmth: edit.warmth,
+            clock_style: edit.clock.index() as f32,
+            clock_opacity: if edit.clock == ClockStyle::Digital {
+                0.86
+            } else {
+                0.0
+            },
+            clock_time: [0.0, 0.0],
+            clock_pos: [0.94, 0.10],
             _pad: [0.0; 2],
         }
     }
@@ -854,7 +877,7 @@ mod tests {
     #[test]
     fn 照片参数的显存布局和着色器逐字段对齐() {
         use std::mem::{offset_of, size_of};
-        assert_eq!(size_of::<PhotoParams>(), 144);
+        assert_eq!(size_of::<PhotoParams>(), 176);
         assert_eq!(offset_of!(PhotoParams, resolution), 0);
         assert_eq!(offset_of!(PhotoParams, time), 8);
         assert_eq!(offset_of!(PhotoParams, brightness), 12);
@@ -869,10 +892,16 @@ mod tests {
         assert_eq!(offset_of!(PhotoParams, seed), 124);
         assert_eq!(offset_of!(PhotoParams, vignette), 128);
         assert_eq!(offset_of!(PhotoParams, grain), 132);
-        assert_eq!(offset_of!(PhotoParams, _pad), 136);
+        assert_eq!(offset_of!(PhotoParams, contrast), 136);
+        assert_eq!(offset_of!(PhotoParams, warmth), 140);
+        assert_eq!(offset_of!(PhotoParams, clock_style), 144);
+        assert_eq!(offset_of!(PhotoParams, clock_opacity), 148);
+        assert_eq!(offset_of!(PhotoParams, clock_time), 152);
+        assert_eq!(offset_of!(PhotoParams, clock_pos), 160);
+        assert_eq!(offset_of!(PhotoParams, _pad), 168);
         // `_pad` 之后就是 WGSL 里 `Params` 的末尾:两边的字段数量必须一起变
         assert!(
-            PHOTO_SHADER.contains("_pad: vec2<f32>,              // 136\n};"),
+            PHOTO_SHADER.contains("_pad: vec2<f32>,              // 168\n};"),
             "着色器的 Params 尾部结构和 Rust 这边对不上了"
         );
     }
@@ -962,6 +991,34 @@ mod tests {
         assert!((params.screen_aspect - 2560.0 / 1440.0).abs() < 1e-6);
         // 调色板第一个槽是 #0B1020 → r=11/255
         assert!((params.palette[0][0] - 11.0 / 255.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn 编辑设置会进入后处理和时钟参数() {
+        let mut photo = Photo {
+            width: 1920,
+            height: 1080,
+            ..Default::default()
+        };
+        photo.motion.speed = 0.3;
+        photo.edit = mcwp_spec::WallpaperEdit {
+            speed: 2.0,
+            brightness: 1.2,
+            contrast: 1.1,
+            warmth: 0.5,
+            vignette: 0.25,
+            clock: ClockStyle::Digital,
+            seamless_loop: false,
+        };
+        let params = PhotoParams::from_photo(&photo, 1920, 1080, 0.8);
+        // 静图速度 = 推拉速度 × 倍率，并且仍受 MotionRecipe 的保守上限约束
+        assert_eq!(params.speed, MotionRecipe::SPEED_MAX);
+        assert!((params.brightness - 0.96).abs() < 1e-6);
+        assert_eq!(params.contrast, 1.1);
+        assert_eq!(params.warmth, 0.5);
+        assert_eq!(params.vignette, 0.25);
+        assert_eq!(params.clock_style, 1.0);
+        assert!(params.clock_opacity > 0.0);
     }
 }
 

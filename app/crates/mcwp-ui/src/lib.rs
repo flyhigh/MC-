@@ -20,8 +20,9 @@ use std::rc::Rc;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use mcwp_platform::glass_window::{WindowDrag, WindowZoom, apply_glass, minimize};
+use mcwp_spec::WallpaperEdit;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::ComponentHandle;
 use slint::winit_030::WinitWindowAccessor;
@@ -102,6 +103,10 @@ pub enum UiEvent {
     ResumeRun,
     /// 点了壁纸库里的第 `index` 张(`PanelState::library` 的下标)
     OpenWallpaper(usize),
+    /// 编辑面板里拖了滑杆:立刻作用到正在显示的这张壁纸,但**先不落盘**
+    PreviewWallpaperEdit(WallpaperEdit),
+    /// 编辑面板里点了保存:把当前这张的编辑设置写回它的 JSON
+    SaveWallpaperEdit,
     /// 库那一格的右键菜单:删掉第 `index` 张
     DeleteWallpaper(usize),
     /// 把第 `index` 张静图「做成动态壁纸」(图生视频)。
@@ -114,6 +119,11 @@ pub enum UiEvent {
     /// 为什么这一个走 id 而不是库下标:消息是历史,库列表会因为生成 / 删除 / 换个排序而变 ——
     /// 用户点的那一下和他看到的那张图之间隔着若干次刷新,下标是唯一会漂的那种 key。
     MakeVideoFromMessage(String),
+    /// 「免费取回」:照上一次失败留下的任务号去服务商那里取回成片。
+    ///
+    /// **不提交新任务**,所以不会再花一次钱。`photo` 是那张原图的 id ——
+    /// 成片入库时要靠它找回源图、动效方案和出处。
+    FetchVideo { task: String, photo: String },
     /// 同一件事,对象是**当前挂着的那张**(库页工具栏那颗钮)。
     MakeVideoFromCurrent,
     /// 「用当前壁纸」:把桌面上原来那张抬进来当作库里的新一张
@@ -172,6 +182,8 @@ pub struct LibraryEntryView {
     pub hint: String,
     pub summary: String,
     pub accent: slint::Color,
+    /// 这张壁纸自己的播放 / 光影 / 时钟设置(编辑面板回填用)
+    pub edit: WallpaperEdit,
     /// 这一条是不是「动态壁纸」(视频)。面板靠它在格子角上画一个「动」标 ——
     /// 库里两种东西混着放,没有这个标就得点开才知道。
     pub video: bool,
@@ -330,11 +342,7 @@ fn watermark_from_index(index: i32) -> bool {
 
 /// 反过来:`ai.json` 里那个布尔 → 面板上的下标。
 fn watermark_index(watermark: bool) -> i32 {
-    if watermark {
-        1
-    } else {
-        0
-    }
+    if watermark { 1 } else { 0 }
 }
 
 /// 这一轮对话跑到哪儿了 —— 面板靠它决定右下角那颗钮长什么样。
@@ -390,7 +398,10 @@ impl SessionState {
         let mut fields: Vec<(String, String)> = Vec::new();
         fields.push(("标题".into(), self.title.clone()));
         for (index, conversation) in self.conversations.iter().enumerate() {
-            fields.push((format!("会话{index} 标题"), conversation.heading.to_string()));
+            fields.push((
+                format!("会话{index} 标题"),
+                conversation.heading.to_string(),
+            ));
             fields.push((format!("会话{index} 预览"), conversation.sub.to_string()));
         }
         for (index, message) in self.messages.iter().enumerate() {
@@ -668,6 +679,33 @@ fn build(state: &PanelState, events: Sender<UiEvent>) -> Result<Panel> {
     }
 
     {
+        // 滑杆拖动的实时预览。面板只给整数百分比 —— 浮点数在 Slint ↔ Rust 边界上没有
+        // 额外好处，反而更容易在多次刷新里攒出 99.999% 这种值。
+        let tx = events.clone();
+        ui.on_preview_wallpaper_edit(
+            move |speed, brightness, contrast, warmth, vignette, clock, seamless| {
+                let _ = tx.send(UiEvent::PreviewWallpaperEdit(WallpaperEdit {
+                    speed: speed as f32 / 100.0,
+                    brightness: brightness as f32 / 100.0,
+                    contrast: contrast as f32 / 100.0,
+                    warmth: warmth as f32 / 100.0,
+                    vignette: vignette as f32 / 100.0,
+                    clock: if clock == 0 {
+                        mcwp_spec::ClockStyle::Off
+                    } else {
+                        mcwp_spec::ClockStyle::Digital
+                    },
+                    seamless_loop: seamless,
+                }));
+            },
+        );
+        let tx = events.clone();
+        ui.on_save_wallpaper_edit(move || {
+            let _ = tx.send(UiEvent::SaveWallpaperEdit);
+        });
+    }
+
+    {
         let tx = events.clone();
         ui.on_refresh_library(move || {
             let _ = tx.send(UiEvent::RefreshLibrary);
@@ -722,20 +760,31 @@ fn build(state: &PanelState, events: Sender<UiEvent>) -> Result<Panel> {
     {
         // 设置页的「保存」。面板只把四个值原样递出去 —— 校验、落盘、重建客户端都在壁纸侧。
         let tx = events.clone();
-        ui.on_save_ai_config(move |base_url, model, api_key, thinking, image_base_url, image_model, image_api_key, image_quality, image_watermark, video_model| {
-            let _ = tx.send(UiEvent::SaveAiConfig {
-                base_url: base_url.to_string(),
-                model: model.to_string(),
-                api_key: api_key.to_string(),
-                thinking: ThinkingChoice::from_index(thinking),
-                image_base_url: image_base_url.to_string(),
-                image_model: image_model.to_string(),
-                image_api_key: image_api_key.to_string(),
-                image_quality: QualityChoice::from_index(image_quality).value(),
-                image_watermark: watermark_from_index(image_watermark),
-                video_model: video_model.to_string(),
-            });
-        });
+        ui.on_save_ai_config(
+            move |base_url,
+                  model,
+                  api_key,
+                  thinking,
+                  image_base_url,
+                  image_model,
+                  image_api_key,
+                  image_quality,
+                  image_watermark,
+                  video_model| {
+                let _ = tx.send(UiEvent::SaveAiConfig {
+                    base_url: base_url.to_string(),
+                    model: model.to_string(),
+                    api_key: api_key.to_string(),
+                    thinking: ThinkingChoice::from_index(thinking),
+                    image_base_url: image_base_url.to_string(),
+                    image_model: image_model.to_string(),
+                    image_api_key: image_api_key.to_string(),
+                    image_quality: QualityChoice::from_index(image_quality).value(),
+                    image_watermark: watermark_from_index(image_watermark),
+                    video_model: video_model.to_string(),
+                });
+            },
+        );
     }
 
     {
@@ -752,6 +801,13 @@ fn build(state: &PanelState, events: Sender<UiEvent>) -> Result<Panel> {
         let tx = events.clone();
         ui.on_animate_photo(move |id| {
             let _ = tx.send(UiEvent::MakeVideoFromMessage(id.to_string()));
+        });
+        let tx = events.clone();
+        ui.on_fetch_video(move |task, photo| {
+            let _ = tx.send(UiEvent::FetchVideo {
+                task: task.to_string(),
+                photo: photo.to_string(),
+            });
         });
     }
 
@@ -988,6 +1044,7 @@ fn apply_session(ui: &Panel, session: &SessionState) {
                 has_shot: shot.is_some(),
                 photo_gone: !id.is_empty() && shot.is_none(),
                 video,
+                video_task: message.video_task.clone(),
             }
         })
         .collect();
@@ -1026,14 +1083,19 @@ fn apply_library(ui: &Panel, library: Vec<LibraryEntryView>, current: String, cu
     // 身份不该留下来(见 `VIDEOS`)。
     VIDEOS.with(|videos| videos.borrow_mut().clear());
     // 当前那张的标题要在把 items 交出去之前取出来(交出去之后就只剩 Slint 那边的模型了)
-    let current_title = if current_index >= 0 {
-        library
-            .get(current_index as usize)
-            .map(|entry| entry.title.clone())
-            .unwrap_or_default()
+    let current_entry = if current_index >= 0 {
+        library.get(current_index as usize).cloned()
     } else {
-        String::new()
+        None
     };
+    let current_title = current_entry
+        .as_ref()
+        .map(|entry| entry.title.clone())
+        .unwrap_or_default();
+    let current_edit = current_entry
+        .as_ref()
+        .map(|entry| entry.edit)
+        .unwrap_or_default();
 
     let items: Vec<LibraryItem> = library
         .into_iter()
@@ -1073,6 +1135,18 @@ fn apply_library(ui: &Panel, library: Vec<LibraryEntryView>, current: String, cu
     ui.set_library_current(current.into());
     ui.set_library_current_index(current_index);
     ui.set_library_current_title(current_title.into());
+    ui.set_edit_speed((current_edit.speed * 100.0).round() as i32);
+    ui.set_edit_brightness((current_edit.brightness * 100.0).round() as i32);
+    ui.set_edit_contrast((current_edit.contrast * 100.0).round() as i32);
+    ui.set_edit_warmth((current_edit.warmth * 100.0).round() as i32);
+    ui.set_edit_vignette((current_edit.vignette * 100.0).round() as i32);
+    ui.set_edit_clock(if current_edit.clock == mcwp_spec::ClockStyle::Digital {
+        1
+    } else {
+        0
+    });
+    ui.set_edit_seamless(current_edit.seamless_loop);
+    ui.set_edit_is_video(current_entry.as_ref().is_some_and(|entry| entry.video));
 }
 
 /// 回填设置页的模型配置。

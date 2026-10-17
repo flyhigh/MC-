@@ -29,9 +29,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use mcwp_image::Bitmap;
-use mcwp_spec::photo::PhotoKind;
-use mcwp_spec::MotionPlan;
 use mcwp_spec::Photo;
+use mcwp_spec::photo::PhotoKind;
+use mcwp_spec::{MotionPlan, WallpaperEdit};
 
 /// 缩略图的尺寸上限(16:9)。面板那一格是 168 × 94,按 2 倍给,够清楚也不占地方;
 /// 换面板格子尺寸时这个数可以不动 —— 它只是"缩到不超过",不是"必须正好"。
@@ -209,6 +209,27 @@ pub fn save_motion_plan(entry: &Entry, plan: &MotionPlan) -> Result<()> {
     photo.motion_plan = plan.clone();
     photo.normalize();
     write_meta(&entry.meta, &photo)
+}
+
+/// 把编辑面板里的设置写回这张壁纸的元数据。
+///
+/// 只改 JSON，不碰画面文件：视频不重新编码、原图不重压。返回 `Photo` 是为了让调用方
+/// 能立刻把当前画面上的那份副本也换成同一组值，不用再 `photos::load` 一次。
+pub fn save_edit(entry: &Entry, edit: WallpaperEdit) -> Result<Photo> {
+    let mut photo = entry.photo.clone();
+    photo.edit = edit;
+    photo.normalize();
+    write_meta(&entry.meta, &photo)?;
+    Ok(photo)
+}
+
+/// 把循环接缝写回视频壁纸的元数据。只改 JSON，不重新编码 mp4。
+pub fn save_loop_seam(entry: &Entry, seam: Option<mcwp_spec::photo::LoopSeam>) -> Result<Photo> {
+    let mut photo = entry.photo.clone();
+    photo.loop_seam = seam;
+    photo.normalize();
+    write_meta(&entry.meta, &photo)?;
+    Ok(photo)
 }
 
 /// 元数据走"临时文件 + 改名"(和会话 / 模型配置一个态度):半截 JSON 比没有 JSON 难查得多。

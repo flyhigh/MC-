@@ -19,8 +19,8 @@
 pub mod photo;
 
 pub use photo::{
-    palette_from_rgba, MotionElement, MotionKind, MotionPlan, MotionRecipe, Photo,
-    AREA_NAMES,
+    AREA_NAMES, ClockStyle, MotionElement, MotionKind, MotionPlan, MotionRecipe, Photo,
+    WallpaperEdit, palette_from_rgba,
 };
 
 /// 调色板的槽位数。

@@ -24,7 +24,13 @@ struct Params {
     seed: f32,                    // 124
     vignette: f32,                // 128
     grain: f32,                   // 132
-    _pad: vec2<f32>,              // 136
+    contrast: f32,                // 136
+    warmth: f32,                  // 140
+    clock_style: f32,             // 144
+    clock_opacity: f32,           // 148
+    clock_time: vec2<f32>,        // 152
+    clock_pos: vec2<f32>,         // 160
+    _pad: vec2<f32>,              // 168
 };
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -181,6 +187,94 @@ fn glow(uv: vec2<f32>, t: f32, density: f32, offset: vec2<f32>) -> f32 {
     return acc * density;
 }
 
+// ---------- 时钟 ----------
+
+/// 圆角矩形的有符号距离：负数在内部。
+fn rounded_box_sdf(p: vec2<f32>, center: vec2<f32>, half_size: vec2<f32>, radius: f32) -> f32 {
+    let q = abs(p - center) - half_size + vec2<f32>(radius);
+    return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+}
+
+fn rounded_box_mask(p: vec2<f32>, center: vec2<f32>, half_size: vec2<f32>, radius: f32) -> f32 {
+    return 1.0 - smoothstep(-0.012, 0.012, rounded_box_sdf(p, center, half_size, radius));
+}
+
+/// 七段数字。`p` 是数字框内的归一化坐标（0..1，左上角）。
+fn clock_digit_mask(digit: f32, p: vec2<f32>) -> f32 {
+    if (p.x < -0.08 || p.x > 1.08 || p.y < -0.08 || p.y > 1.08) {
+        return 0.0;
+    }
+    // 位序：a=1 b=2 c=4 d=8 e=16 f=32 g=64
+    var masks = array<u32, 10>(63u, 6u, 91u, 79u, 102u, 109u, 125u, 7u, 127u, 111u);
+    let bits = masks[u32(clamp(digit, 0.0, 9.0) + 0.5)];
+    let horizontal = vec2<f32>(0.25, 0.042);
+    let vertical = vec2<f32>(0.042, 0.17);
+    var value = 0.0;
+    if ((bits & 1u) != 0u) {
+        value = max(value, rounded_box_mask(p, vec2<f32>(0.5, 0.07), horizontal, 0.035));
+    }
+    if ((bits & 2u) != 0u) {
+        value = max(value, rounded_box_mask(p, vec2<f32>(0.93, 0.27), vertical, 0.035));
+    }
+    if ((bits & 4u) != 0u) {
+        value = max(value, rounded_box_mask(p, vec2<f32>(0.93, 0.73), vertical, 0.035));
+    }
+    if ((bits & 8u) != 0u) {
+        value = max(value, rounded_box_mask(p, vec2<f32>(0.5, 0.93), horizontal, 0.035));
+    }
+    if ((bits & 16u) != 0u) {
+        value = max(value, rounded_box_mask(p, vec2<f32>(0.07, 0.73), vertical, 0.035));
+    }
+    if ((bits & 32u) != 0u) {
+        value = max(value, rounded_box_mask(p, vec2<f32>(0.07, 0.27), vertical, 0.035));
+    }
+    if ((bits & 64u) != 0u) {
+        value = max(value, rounded_box_mask(p, vec2<f32>(0.5, 0.5), horizontal, 0.035));
+    }
+    return value;
+}
+
+struct ClockMasks {
+    digits: f32,
+    panel: f32,
+}
+
+/// 右上角的 HH:MM。单位是「数字高度」：1.0 = 一个数字高。
+fn clock_masks(uv: vec2<f32>) -> ClockMasks {
+    let digit_height = 0.072;
+    let digit_width = 0.56;
+    let total_width = 2.66;
+    let anchor = vec2<f32>(P.clock_pos.x * P.screen_aspect, P.clock_pos.y);
+    let base = anchor - vec2<f32>(total_width * digit_height, 0.0);
+    let p = (uv * vec2<f32>(P.screen_aspect, 1.0) - base) / digit_height;
+
+    let hour = floor(P.clock_time.x + 0.5);
+    let minute = floor(P.clock_time.y + 0.5);
+    let h1 = floor(hour / 10.0);
+    let h0 = hour - h1 * 10.0;
+    let m1 = floor(minute / 10.0);
+    let m0 = minute - m1 * 10.0;
+
+    var digits = 0.0;
+    digits = max(digits, clock_digit_mask(h1, (p - vec2<f32>(0.0, 0.0)) / vec2<f32>(digit_width, 1.0)));
+    digits = max(digits, clock_digit_mask(h0, (p - vec2<f32>(0.64, 0.0)) / vec2<f32>(digit_width, 1.0)));
+    digits = max(digits, clock_digit_mask(m1, (p - vec2<f32>(1.40, 0.0)) / vec2<f32>(digit_width, 1.0)));
+    digits = max(digits, clock_digit_mask(m0, (p - vec2<f32>(2.04, 0.0)) / vec2<f32>(digit_width, 1.0)));
+    let colon = max(
+        rounded_box_mask(p, vec2<f32>(1.30, 0.34), vec2<f32>(0.042, 0.042), 0.042),
+        rounded_box_mask(p, vec2<f32>(1.30, 0.66), vec2<f32>(0.042, 0.042), 0.042),
+    );
+    digits = max(digits, colon);
+
+    let panel = rounded_box_mask(
+        p,
+        vec2<f32>(1.32, 0.50),
+        vec2<f32>(1.48, 0.62),
+        0.16,
+    );
+    return ClockMasks(digits, panel);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 壁纸的时钟故意走得慢:0.03 是"几乎不动"的底噪,速度拉满也只有 0.33。
@@ -233,6 +327,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     color = color * mix(1.0, vignette, P.vignette);
 
     color = color * (0.45 + 0.85 * P.brightness);
+    // 对比度绕 0.5 中灰旋转，冷暖只动 R/B 两端 —— 比整体加色更不容易把肤色带脏
+    color = (color - vec3<f32>(0.5)) * P.contrast + vec3<f32>(0.5);
+    color = color + vec3<f32>(P.warmth * 0.045, P.warmth * 0.012, -P.warmth * 0.045);
+
+    // 时钟最后画：它不该被暗角压暗，也不该跟着画面一起被曝光拉低
+    if (P.clock_style > 0.5) {
+        let clock = clock_masks(in.uv);
+        color = mix(color, vec3<f32>(0.0), clock.panel * 0.30 * P.clock_opacity);
+        color = mix(color, vec3<f32>(1.0), clock.digits * P.clock_opacity);
+    }
 
     return vec4<f32>(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }

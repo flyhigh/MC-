@@ -134,6 +134,36 @@ struct ActivePhoto {
     base_brightness: f32,
 }
 
+impl ActivePhoto {
+    /// 编辑面板改了任何一项之后，把新值同步进这一帧的参数。
+    ///
+    /// 视频的速度不在这里 —— 它改的是播放器每帧推进多少时间（见 `VideoPlayback::tick`），
+    /// 重新编码视频既慢又会让画面多损失一代画质。
+    fn apply_edit(&mut self) {
+        let edit = self.photo.edit;
+        self.params.speed =
+            (self.photo.motion.speed * edit.speed).clamp(0.0, mcwp_spec::MotionRecipe::SPEED_MAX);
+        self.params.brightness = (self.base_brightness * edit.brightness).clamp(0.2, 1.6);
+        self.params.contrast = edit.contrast;
+        self.params.warmth = edit.warmth;
+        self.params.vignette = edit.vignette;
+        self.params.clock_style = edit.clock.index() as f32;
+        self.params.clock_opacity = if edit.clock == mcwp_spec::ClockStyle::Digital {
+            0.86
+        } else {
+            0.0
+        };
+    }
+
+    /// 每帧都会更新的两样：时钟读数和亮度。亮度不能只在编辑时算一次 ——
+    /// 全局亮度以后若从托盘改，这里必须跟着走。
+    fn tick_params(&mut self, hour: f32, minute: f32) {
+        self.params.clock_time = [hour, minute];
+        self.params.brightness =
+            (self.base_brightness * self.photo.edit.brightness).clamp(0.2, 1.6);
+    }
+}
+
 /// 正在放的视频。
 ///
 /// 它是个**拉模式**的播放器(见 `mcwp_video::Player`):主循环每帧问它"该换下一帧了吗",
@@ -148,7 +178,7 @@ struct VideoPlayback {
     elapsed: f32,
     /// 这段多长(秒),来自解码器。
     duration: f32,
-    /// **第一帧**的像素。循环点两端都向它收口(见 `LOOP_FADE_SECS`)。
+    /// **循环起点**的像素。接缝两端都向它收口(见 `LOOP_FADE_SECS`)。
     first: Vec<u8>,
     /// 混合用的缓冲。只在接缝那一小段用到 —— 复用同一个 `Vec`,
     /// 别每帧再 `to_vec()` 一次(1080p 一帧 8 MB,一秒 30 次就是 250 MB/s 的无谓分配)。
@@ -160,7 +190,14 @@ struct VideoPlayback {
     /// 就是"动图怎么这么暗"。这里只做一件事:把视频拉回原图的曝光,绝不压暗。
     display_gain: f32,
     /// 片头要跳过的帧数(片头从黑场淡入时不为 0)。
-    skip_frames: usize,
+    loop_start_frame: usize,
+    /// 不包含这一帧。播到它之前就回到 `loop_start_frame`。
+    loop_end_frame: usize,
+    /// 接缝两端的内容位移(按当前解码尺寸算好的像素值)。
+    seam_dx: f32,
+    seam_dy: f32,
+    /// 位移是否足够可信。不可信时退回普通淡入，别把静止画面推歪。
+    seam_translate: bool,
 }
 
 /// 循环点前后各用多长一段向第一帧收口。
@@ -194,17 +231,56 @@ impl VideoPlayback {
         path: &std::path::Path,
         screen: (u32, u32),
         target_mean: Option<f32>,
+        seam: Option<mcwp_spec::photo::LoopSeam>,
     ) -> Result<Self> {
         let mut player = mcwp_video::Player::open(path, screen)
             .with_context(|| format!("打开视频失败:{}", path.display()))?;
         let info = player.info();
         let step = player.frame_interval().max(0.001);
-        let (frame, skip_frames) = first_display_frame(&mut player, info.duration.as_secs_f32())?;
+        let (_, stable_start) = first_display_frame(&mut player, info.duration.as_secs_f32())?;
+        let total_frames = ((info.duration.as_secs_f32() / step).floor() as usize).max(1);
+
+        // 分析结果只在它确实落在稳定片头之后、并且区间足够长时采用。
+        // 否则退回旧行为：从稳定片头放到片尾。
+        let mut loop_start_frame = stable_start.min(total_frames.saturating_sub(1));
+        let mut loop_end_frame = total_frames;
+        let mut seam_dx = 0.0f32;
+        let mut seam_dy = 0.0f32;
+        let mut seam_translate = false;
+        if let Some(seam) = seam {
+            let start = seam.start_frame as usize;
+            let end = seam.end_frame as usize;
+            if start >= stable_start && end > start + 2 && start < total_frames {
+                loop_start_frame = start;
+                loop_end_frame = end.min(total_frames);
+                seam_dx = seam.dx * info.width as f32;
+                seam_dy = seam.dy * info.height as f32;
+                seam_translate = seam.score <= 0.22 && (seam_dx.abs() + seam_dy.abs()) >= 1.0;
+                tracing::info!(
+                    "循环接缝:第 {}-{} 帧 · 位移 ({:.1}, {:.1})px · 分数 {:.3}{}",
+                    loop_start_frame,
+                    loop_end_frame,
+                    seam_dx,
+                    seam_dy,
+                    seam.score,
+                    if seam_translate { "" } else { " · 位移补偿未启用" }
+                );
+            }
+        }
+        let loop_end_frame = loop_end_frame.max(loop_start_frame + 2).min(total_frames);
+
+        // 从接缝起点重新取一次像素。`first_display_frame` 为了判断黑场淡入可能已经
+        // 走过了几帧，返回的像素不一定正好是 `loop_start_frame` 那一张。
+        player.seek_to_frame(loop_start_frame)?;
+        let frame = player
+            .next_frame()?
+            .map(|pixels| pixels.to_vec())
+            .ok_or_else(|| anyhow::anyhow!("视频里一帧画面都没有"))?;
         let first_mean = rgb_mean(&frame);
         let display_gain = display_gain_for(target_mean, first_mean);
         let first = scale_rgb(&frame, display_gain);
         renderer.set_video_frame(info.width, info.height, &first)?;
-        let duration = (info.duration.as_secs_f32() - skip_frames as f32 * step).max(step);
+        let duration = ((loop_end_frame - loop_start_frame) as f32 * step).max(step);
         Ok(Self {
             player,
             remaining: 0.0,
@@ -213,7 +289,11 @@ impl VideoPlayback {
             first,
             scratch: Vec::new(),
             display_gain,
-            skip_frames,
+            loop_start_frame,
+            loop_end_frame,
+            seam_dx,
+            seam_dy,
+            seam_translate,
         })
     }
 
@@ -221,8 +301,8 @@ impl VideoPlayback {
     ///
     /// `delta` 是**这一帧实际过了多久**(不是"应该在多久之后")——暂停几分钟再继续时,
     /// 这里会一次性收到一个很大的 delta,所以下面要把欠下的帧数夹住(见"落后就丢帧")。
-    fn tick(&mut self, renderer: &mut Renderer, delta: f32) -> Result<()> {
-        self.remaining += delta;
+    fn tick(&mut self, renderer: &mut Renderer, delta: f32, speed: f32) -> Result<()> {
+        self.remaining += delta * speed.clamp(0.1, 4.0);
         let step = self.player.frame_interval();
         if self.remaining < step {
             return Ok(());
@@ -232,14 +312,24 @@ impl VideoPlayback {
         self.remaining = (self.remaining - step).min(step);
 
         let info = self.player.info();
-        // 强度按**这一帧的时间**算,然后时间往后走一帧:刚开头那一帧的时间是 0(强度也是 0),
-        // 一循环完立刻归零,不会在接缝上多算一帧。
-        // 结尾向首帧收、开头从首帧展开。两个窗口不会同时出现(短片会按 1/4 收窄),
-        // 取较大的那个即可:在两端都是 alpha=1,离开端点后平滑衰减到 0。
-        let alpha = loop_fade_alpha(self.elapsed, self.duration)
-            .max(loop_intro_alpha(self.elapsed, self.duration));
+        // 结尾向循环起点收、开头从循环起点展开。两个窗口不会同时出现
+        // (短片会按 1/4 收窄),取较大的那个即可。
+        let frame_time = (self.elapsed + step).min(self.duration);
+        let outro = loop_fade_alpha(frame_time, self.duration);
+        let intro = loop_intro_alpha(frame_time, self.duration);
         let gain = self.display_gain;
-        let skip_frames = self.skip_frames;
+        let seam_dx = self.seam_dx;
+        let seam_dy = self.seam_dy;
+        let seam_translate = self.seam_translate;
+
+        // 下一帧已经越过循环终点：先回到起点，不再多解片尾后面那几帧。
+        if self.player.frame_index() >= self.loop_end_frame
+            || self.elapsed + step >= self.duration - 1e-4
+        {
+            self.restart(renderer)?;
+            return Ok(());
+        }
+
         self.elapsed = (self.elapsed + step).min(self.duration);
         // 借用要拆开:`next_frame` 会把 `player` 借走,而贴帧还要用 `first` / `scratch`。
         let mut restarted = false;
@@ -250,44 +340,53 @@ impl VideoPlayback {
             ..
         } = self;
         match player.next_frame()? {
-            Some(pixels) => present_frame(
-                renderer,
-                info.width,
-                info.height,
-                pixels,
-                alpha,
-                gain,
-                first,
-                scratch,
-            )?,
-            // 放完了:**从头再来**。生图服务商给的只有十秒左右,循环播放才像一张壁纸;
-            // 停在最后一帧会让桌面看起来"死"了。最后那几帧已经淡回第一帧(见 `LOOP_FADE_SECS`),
-            // 所以这一次重头开始是**接得上**的 —— 原来这里是一记硬切,用户看到的就是那一下跳。
-            None => {
-                player.rewind()?;
-                restarted = true;
-                // 回到片头后同样跳过淡入段。`first` 已经是**校正过曝光**的基准帧,
-                // 所以这里直接贴它,不再乘一次增益 —— 接缝两边才是同一个像素值。
-                for _ in 0..skip_frames.max(1) {
-                    if player.next_frame()?.is_none() {
-                        break;
-                    }
+            Some(pixels) => {
+                if outro > 0.0 && seam_translate {
+                    present_seam_frame(
+                        renderer,
+                        info.width,
+                        info.height,
+                        pixels,
+                        outro,
+                        gain,
+                        first,
+                        seam_dx,
+                        seam_dy,
+                        scratch,
+                    )?;
+                } else {
+                    present_frame(
+                        renderer,
+                        info.width,
+                        info.height,
+                        pixels,
+                        outro.max(intro),
+                        gain,
+                        first,
+                        scratch,
+                    )?;
                 }
-                present_frame(
-                    renderer,
-                    info.width,
-                    info.height,
-                    first,
-                    0.0,
-                    1.0,
-                    first,
-                    scratch,
-                )?;
+            }
+            // 解码器提前结束（时长估计不准）：同样回到接缝起点。
+            None => {
+                restarted = true;
             }
         }
         if restarted {
-            self.elapsed = 0.0;
+            self.restart(renderer)?;
         }
+        Ok(())
+    }
+
+    /// 回到循环起点。`first` 已经是曝光校正后的基准帧，直接贴它。
+    fn restart(&mut self, renderer: &mut Renderer) -> Result<()> {
+        self.player.seek_to_frame(self.loop_start_frame)?;
+        // 把起点这一帧真正读掉，下一次 `tick` 才会从下一帧继续。
+        let _ = self.player.next_frame()?;
+        let info = self.player.info();
+        renderer.set_video_frame(info.width, info.height, &self.first)?;
+        self.elapsed = 0.0;
+        self.remaining = 0.0;
         Ok(())
     }
 }
@@ -472,6 +571,311 @@ fn compose_video_frame(
     true
 }
 
+/// 接缝帧：把“运动区域”沿分析出的整体位移对齐后再混合。
+///
+/// 和 `present_frame` 的区别只在接缝这一小段：普通淡入是两个不同位置的画面互相叠，
+/// 云会变成两层；这里让两端沿位移路径采样，同一朵云在中间重合。
+fn present_seam_frame(
+    renderer: &mut Renderer,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    alpha: f32,
+    gain: f32,
+    first: &[u8],
+    dx: f32,
+    dy: f32,
+    scratch: &mut Vec<u8>,
+) -> Result<()> {
+    if compose_seam_translated(
+        pixels, first, alpha, gain, dx, dy, width, height, scratch,
+    ) {
+        renderer.set_video_frame(width, height, scratch)?;
+    } else {
+        renderer.set_video_frame(width, height, pixels)?;
+    }
+    Ok(())
+}
+
+/// 位移补偿 + 运动区域遮罩。返回 `false` 表示这一帧不用改。
+///
+/// `alpha = 1` 时直接返回循环起点帧，保证接缝严格闭合。
+#[allow(clippy::too_many_arguments)]
+fn compose_seam_translated(
+    pixels: &[u8],
+    first: &[u8],
+    alpha: f32,
+    gain: f32,
+    dx: f32,
+    dy: f32,
+    width: u32,
+    height: u32,
+    scratch: &mut Vec<u8>,
+) -> bool {
+    let expected = width as usize * height as usize * 4;
+    if width < 2
+        || height < 2
+        || pixels.len() < expected
+        || first.len() < expected
+    {
+        return false;
+    }
+    let alpha = if alpha.is_finite() {
+        alpha.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let gain = if gain.is_finite() {
+        gain.clamp(0.5, 2.0)
+    } else {
+        1.0
+    };
+    if alpha >= 0.999 {
+        scratch.clear();
+        scratch.extend_from_slice(&first[..expected]);
+        return true;
+    }
+    if alpha <= 0.001 && (gain - 1.0).abs() <= 0.002 {
+        return false;
+    }
+    let max_dx = width as f32 * 0.5;
+    let max_dy = height as f32 * 0.5;
+    let dx = if dx.is_finite() {
+        dx.clamp(-max_dx, max_dx)
+    } else {
+        0.0
+    };
+    let dy = if dy.is_finite() {
+        dy.clamp(-max_dy, max_dy)
+    } else {
+        0.0
+    };
+    // 位移很小时不需要大动干戈；1~2px 就让补偿逐步生效。
+    let shift_strength = (dx.abs().max(dy.abs()) / 2.0).clamp(0.0, 1.0);
+    let mask = build_seam_mask(pixels, first, gain, width, height, dx, dy);
+    scratch.clear();
+    scratch.resize(expected, 0);
+    let width_usize = width as usize;
+    let height_usize = height as usize;
+    for y in 0..height_usize {
+        for x in 0..width_usize {
+            let index = y * width_usize + x;
+            let offset = index * 4;
+            let end = [
+                pixels[offset] as f32 * gain,
+                pixels[offset + 1] as f32 * gain,
+                pixels[offset + 2] as f32 * gain,
+            ];
+            let start = [
+                first[offset] as f32,
+                first[offset + 1] as f32,
+                first[offset + 2] as f32,
+            ];
+            // 静止区域：两端本来就一样，普通淡入即可，绝不能跟着位移走。
+            let mut base = [0.0f32; 3];
+            for channel in 0..3 {
+                base[channel] = end[channel] + (start[channel] - end[channel]) * alpha;
+            }
+
+            // 运动区域：让两端沿位移路径采样，同一朵云在中间重合。
+            let end_sample = sample_rgba_wrapped(
+                pixels,
+                width,
+                height,
+                x as f32 + dx * alpha,
+                y as f32 + dy * alpha,
+            );
+            let start_sample = sample_rgba_wrapped(
+                first,
+                width,
+                height,
+                x as f32 - dx * (1.0 - alpha),
+                y as f32 - dy * (1.0 - alpha),
+            );
+            let end_sample = [
+                end_sample[0] * gain,
+                end_sample[1] * gain,
+                end_sample[2] * gain,
+            ];
+            // 遮罩在低分辨率上算好并沿位移方向膨胀过：它覆盖的是云从旧位置
+            // 飘到新位置之间**整段扫过的区域**，而不只是两端像素差最大的位置。
+            let mask = sample_mask_bilinear(&mask, x, y, width, height) * shift_strength;
+            for channel in 0..3 {
+                let moved = end_sample[channel]
+                    + (start_sample[channel] - end_sample[channel]) * alpha;
+                let value = base[channel] + (moved - base[channel]) * mask;
+                scratch[offset + channel] = value.round().clamp(0.0, 255.0) as u8;
+            }
+            scratch[offset + 3] = 255;
+        }
+    }
+    true
+}
+
+/// 接缝运动遮罩。分辨率很低，只用来回答“这块区域该不该跟着位移走”。
+struct SeamMask {
+    width: usize,
+    height: usize,
+    values: Vec<f32>,
+}
+
+fn build_seam_mask(
+    pixels: &[u8],
+    first: &[u8],
+    gain: f32,
+    width: u32,
+    height: u32,
+    dx: f32,
+    dy: f32,
+) -> SeamMask {
+    let mask_width = (width as usize / 8).clamp(16, 160).min(width as usize);
+    let mask_height = ((height as usize * mask_width) / width.max(1) as usize)
+        .max(8)
+        .min(height as usize);
+    let mut values = vec![0.0f32; mask_width * mask_height];
+    for my in 0..mask_height {
+        let y0 = my * height as usize / mask_height;
+        let y1 = ((my + 1) * height as usize / mask_height).max(y0 + 1);
+        for mx in 0..mask_width {
+            let x0 = mx * width as usize / mask_width;
+            let x1 = ((mx + 1) * width as usize / mask_width).max(x0 + 1);
+            let mut sum = 0.0f32;
+            let mut samples = 0usize;
+            for y in (y0..y1.min(height as usize)).step_by(2) {
+                for x in (x0..x1.min(width as usize)).step_by(2) {
+                    let offset = (y * width as usize + x) * 4;
+                    let diff = (pixels[offset] as f32 * gain - first[offset] as f32)
+                        .abs()
+                        .max((pixels[offset + 1] as f32 * gain - first[offset + 1] as f32).abs())
+                        .max((pixels[offset + 2] as f32 * gain - first[offset + 2] as f32).abs());
+                    sum += diff;
+                    samples += 1;
+                }
+            }
+            if samples > 0 {
+                values[my * mask_width + mx] = smoothstep01((sum / samples as f32 - 4.0) / 24.0);
+            }
+        }
+    }
+    // 位移 8px 左右时，膨胀半径约 1 个遮罩格；20px 时约 2~3 格。
+    // 这样云从旧位置到新位置之间的空档也会被标成“运动中”。
+    let radius = ((dx.abs().max(dy.abs()) * mask_width as f32 / width.max(1) as f32) * 0.5)
+        .ceil() as usize;
+    if radius > 0 {
+        // 先做最大值膨胀，保证旧位置到新位置之间没有空洞；再轻微模糊一下边缘。
+        dilate_max(&mut values, mask_width, mask_height, radius);
+        box_blur(&mut values, mask_width, mask_height, radius.min(2).max(1));
+    }
+    SeamMask {
+        width: mask_width,
+        height: mask_height,
+        values,
+    }
+}
+
+/// 可分离的最大值滤波（膨胀）。窗口半径按位移算，负责把“运动扫过的区域”连成片。
+fn dilate_max(values: &mut [f32], width: usize, height: usize, radius: usize) {
+    if radius == 0 || width == 0 || height == 0 {
+        return;
+    }
+    let mut temp = vec![0.0f32; values.len()];
+    for y in 0..height {
+        let row = y * width;
+        for x in 0..width {
+            let start = x.saturating_sub(radius);
+            let end = (x + radius).min(width - 1);
+            temp[row + x] = values[row + start..=row + end]
+                .iter()
+                .copied()
+                .fold(0.0f32, f32::max);
+        }
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let start = y.saturating_sub(radius);
+            let end = (y + radius).min(height - 1);
+            values[y * width + x] = (start..=end)
+                .map(|sample| temp[sample * width + x])
+                .fold(0.0f32, f32::max);
+        }
+    }
+}
+
+/// 可分离的均值模糊。窗口半径同时承担“膨胀”和“羽化”两个作用。
+fn box_blur(values: &mut [f32], width: usize, height: usize, radius: usize) {
+    if radius == 0 || width == 0 || height == 0 {
+        return;
+    }
+    let mut temp = vec![0.0f32; values.len()];
+    for y in 0..height {
+        let row = y * width;
+        for x in 0..width {
+            let mut sum = 0.0;
+            let mut count = 0usize;
+            let start = x.saturating_sub(radius);
+            let end = (x + radius).min(width - 1);
+            for sample in start..=end {
+                sum += values[row + sample];
+                count += 1;
+            }
+            temp[row + x] = sum / count as f32;
+        }
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = 0.0;
+            let mut count = 0usize;
+            let start = y.saturating_sub(radius);
+            let end = (y + radius).min(height - 1);
+            for sample in start..=end {
+                sum += temp[sample * width + x];
+                count += 1;
+            }
+            values[y * width + x] = sum / count as f32;
+        }
+    }
+}
+
+fn sample_mask_bilinear(mask: &SeamMask, x: usize, y: usize, width: u32, height: u32) -> f32 {
+    if mask.width == 0 || mask.height == 0 {
+        return 0.0;
+    }
+    let mx = ((x as f32 + 0.5) * mask.width as f32 / width.max(1) as f32 - 0.5)
+        .clamp(0.0, (mask.width - 1) as f32);
+    let my = ((y as f32 + 0.5) * mask.height as f32 / height.max(1) as f32 - 0.5)
+        .clamp(0.0, (mask.height - 1) as f32);
+    let x0 = mx.floor() as usize;
+    let y0 = my.floor() as usize;
+    let x1 = (x0 + 1).min(mask.width - 1);
+    let y1 = (y0 + 1).min(mask.height - 1);
+    let tx = mx - x0 as f32;
+    let ty = my - y0 as f32;
+    let top = mask.values[y0 * mask.width + x0] * (1.0 - tx)
+        + mask.values[y0 * mask.width + x1] * tx;
+    let bottom = mask.values[y1 * mask.width + x0] * (1.0 - tx)
+        + mask.values[y1 * mask.width + x1] * tx;
+    top * (1.0 - ty) + bottom * ty
+}
+
+/// 横向环绕、纵向夹边地取一个像素。云层适合横向绕回；纵向绕回会把地景翻到天上。
+fn sample_rgba_wrapped(pixels: &[u8], width: u32, height: u32, x: f32, y: f32) -> [f32; 3] {
+    let x = x.round() as i32;
+    let y = y.round() as i32;
+    let x = x.rem_euclid(width as i32) as u32;
+    let y = y.clamp(0, height as i32 - 1) as u32;
+    let offset = ((y * width + x) * 4) as usize;
+    [
+        pixels[offset] as f32,
+        pixels[offset + 1] as f32,
+        pixels[offset + 2] as f32,
+    ]
+}
+
+fn smoothstep01(value: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    value * value * (3.0 - 2.0 * value)
+}
+
 /// 一轮「做成动态壁纸」跑完的产物。
 ///
 /// 和 `PhotoPayload` 是**两件事**,不是一个东西加个字段:生图那轮的产物是"一张图的字节",
@@ -512,6 +916,13 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_secs())
         .unwrap_or(0)
+}
+
+/// 本地时间的 `(小时, 分钟)`。时钟画在着色器里，所以这里只给两个数。
+fn local_hour_minute() -> (f32, f32) {
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+    let time = unsafe { GetLocalTime() };
+    (time.wHour as f32, time.wMinute as f32)
 }
 
 /// 新消息:先记进会话,再跑。
@@ -658,7 +1069,20 @@ fn show_video(
     screen: (u32, u32),
     brightness: f32,
 ) -> Result<ActivePhoto> {
-    let video = VideoPlayback::open(renderer, path, screen, source_mean_for(&photo))?;
+    // 「无缝循环」默认关闭：不勾选时连同接缝元数据都不交给播放器，走的就是
+    // 加接缝之前的整段播放 + 首尾 0.8 秒收口。
+    let seam = if photo.edit.seamless_loop {
+        photo.loop_seam
+    } else {
+        None
+    };
+    let video = VideoPlayback::open(
+        renderer,
+        path,
+        screen,
+        source_mean_for(&photo),
+        seam,
+    )?;
     Ok(ActivePhoto {
         // 参数用 `from_video`:关掉 Ken Burns 和效果层(见那里的说明)
         params: PhotoParams::from_video(&photo, screen.0, screen.1, brightness),
@@ -666,6 +1090,36 @@ fn show_video(
         video: Some(video),
         base_brightness: brightness,
     })
+}
+
+/// 编辑面板改了「无缝循环」：按新开关重新开一次播放器。
+///
+/// 只在这一项真的变化时调用 —— 拖滑杆的事件每次都会来，重新解码视频会把滑杆拖成幻灯片。
+/// 重新开而不是热改现有的 `VideoPlayback`：切换后循环起点/终点、首帧基准都不同，
+/// 重建这一小块状态比在播放中途逐项打补丁可靠。
+fn reopen_video(
+    renderer: &mut Renderer,
+    active: &mut ActivePhoto,
+    screen: (u32, u32),
+    brightness: f32,
+) -> Result<()> {
+    let entry = photos::load(&active.photo.id)?;
+    let path = entry.video.as_deref().context("这一条没有视频文件")?;
+    let seam = if active.photo.edit.seamless_loop {
+        active.photo.loop_seam
+    } else {
+        None
+    };
+    let video = VideoPlayback::open(
+        renderer,
+        path,
+        screen,
+        source_mean_for(&active.photo),
+        seam,
+    )?;
+    active.video = Some(video);
+    active.base_brightness = brightness;
+    Ok(())
 }
 
 /// 起一轮「做成动态壁纸」,返回一行给面板看的话。
@@ -1226,6 +1680,32 @@ fn video_payload_from_bytes(
         }
         Ok((info, pixels, seam_gain_for(&first, &last)))
     });
+    // 循环接缝也是“成片的一部分”：在临时文件还在的时候顺手算掉，
+    // 免得播放端每次打开壁纸都要重新解一遍整段。算不出来不影响入库。
+    let loop_seam = match mcwp_video::analyze_loop(&temp, (320, 320)) {
+        Ok(Some(seam)) => {
+            tracing::info!(
+                "循环接缝:第 {}-{} 帧 · 位移 ({:.3}, {:.3}) · 分数 {:.3}",
+                seam.start_frame,
+                seam.end_frame,
+                seam.dx,
+                seam.dy,
+                seam.score
+            );
+            Some(mcwp_spec::photo::LoopSeam {
+                start_frame: seam.start_frame,
+                end_frame: seam.end_frame,
+                dx: seam.dx,
+                dy: seam.dy,
+                score: seam.score,
+            })
+        }
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!("循环接缝分析失败(不影响入库):{err:#}");
+            None
+        }
+    };
     // 解完就删。失败也删 —— 中间产物留在盘上,下次"文件被占着"的怪事就说不清了。
     let _ = std::fs::remove_file(&temp);
     let (info, pixels, seam_gain) =
@@ -1259,6 +1739,7 @@ fn video_payload_from_bytes(
         // 不用再去看一遍图;而"这张动效是怎么来的"也留了个痕迹。
         motion_plan: plan,
         seam_gain,
+        loop_seam,
         ..Photo::default()
     };
     // **id 必须重新生成**:接着用原图那个 id 的话,这条视频的封面(`<id>.png`)
@@ -2176,6 +2657,118 @@ fn run_video_selftest(path: &str, screen: (u32, u32)) -> Result<()> {
     Ok(())
 }
 
+/// `--loop-analyze <mp4>`：只分析接缝，不建窗口、不改库。
+///
+/// 除了一行接缝数据，还会把起始帧、结束帧、普通淡入 50% 和位移补偿后的
+/// 25/50/75% 写成 PNG。接缝是不是“云对齐了”，看这几张比看一段视频快。
+fn run_loop_analyze(path: &str) -> Result<()> {
+    let path = std::path::Path::new(path);
+    let started = Instant::now();
+    let seam = mcwp_video::analyze_loop(path, (320, 320))?;
+    println!("分析用时:{:.2}s", started.elapsed().as_secs_f32());
+    let Some(seam) = seam else {
+        println!("没找到可用的循环接缝（帧数太少，或这段视频本身没有重复）");
+        return Ok(());
+    };
+    println!(
+        "接缝:第 {} → {} 帧 · 位移 ({:.4}, {:.4}) · 分数 {:.4}",
+        seam.start_frame, seam.end_frame, seam.dx, seam.dy, seam.score
+    );
+
+    // 预览用更高的解码尺寸：320p 只能用来算数，看不出云边有没有糊。
+    let mut player = mcwp_video::Player::open(path, (960, 960))?;
+    let info = player.info();
+    player.seek_to_frame(seam.start_frame as usize)?;
+    let start = player
+        .next_frame()?
+        .map(|pixels| pixels.to_vec())
+        .ok_or_else(|| anyhow::anyhow!("取不到接缝起始帧"))?;
+    player.seek_to_frame(seam.end_frame as usize)?;
+    let end = player
+        .next_frame()?
+        .map(|pixels| pixels.to_vec())
+        .ok_or_else(|| anyhow::anyhow!("取不到接缝结束帧"))?;
+    let dx = seam.dx * info.width as f32;
+    let dy = seam.dy * info.height as f32;
+
+    let dir = std::env::temp_dir().join("mcwp-loop-preview");
+    std::fs::create_dir_all(&dir).context("建预览目录失败")?;
+    write_preview_png(&dir, "start.png", &start, info.width, info.height)?;
+    write_preview_png(&dir, "end.png", &end, info.width, info.height)?;
+
+    let mut simple = Vec::new();
+    compose_video_frame(&end, &start, 0.5, 1.0, &mut simple);
+    write_preview_png(&dir, "simple50.png", &simple, info.width, info.height)?;
+    for alpha in [0.25f32, 0.5, 0.75] {
+        let mut moved = Vec::new();
+        compose_seam_translated(
+            &end,
+            &start,
+            alpha,
+            1.0,
+            dx,
+            dy,
+            info.width,
+            info.height,
+            &mut moved,
+        );
+        write_preview_png(
+            &dir,
+            &format!("moved{:02}.png", (alpha * 100.0) as u32),
+            &moved,
+            info.width,
+            info.height,
+        )?;
+    }
+    println!("预览目录:{}", dir.display());
+    Ok(())
+}
+
+/// `--loop-apply <库 id>`：把分析结果写回已有视频壁纸的 JSON，方便先拿旧成片验证。
+fn run_loop_apply(id: &str) -> Result<()> {
+    let entry = photos::load(id).with_context(|| format!("库里找不到这张:{id}"))?;
+    let path = entry
+        .video
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("「{}」不是视频壁纸", entry.photo.title))?;
+    let seam = mcwp_video::analyze_loop(path, (320, 320))?;
+    let stored = seam.map(|seam| mcwp_spec::photo::LoopSeam {
+        start_frame: seam.start_frame,
+        end_frame: seam.end_frame,
+        dx: seam.dx,
+        dy: seam.dy,
+        score: seam.score,
+    });
+    let saved = photos::save_loop_seam(&entry, stored)?;
+    println!("已写入:{}", entry.meta.display());
+    match saved.loop_seam {
+        Some(seam) => println!(
+            "「{}」循环接缝:第 {} → {} 帧 · 位移 ({:.4}, {:.4}) · 分数 {:.4}",
+            saved.title, seam.start_frame, seam.end_frame, seam.dx, seam.dy, seam.score
+        ),
+        None => println!("「{}」没有找到可用接缝，已清空旧值", saved.title),
+    }
+    Ok(())
+}
+
+fn write_preview_png(
+    dir: &std::path::Path,
+    name: &str,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<()> {
+    let bitmap = mcwp_image::Bitmap {
+        width,
+        height,
+        rgba: rgba.to_vec(),
+    };
+    let bytes = bitmap.encode_png().context("预览图编不成 PNG")?;
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).with_context(|| format!("写预览图失败:{}", path.display()))?;
+    Ok(())
+}
+
 /// 面板要显示的「当前壁纸」。
 ///
 /// 从 `Photo` 派生出面板要的那几个字段(标题 / 短提示 / 动效摘要 / 调色板 / 身份串),
@@ -2312,6 +2905,7 @@ fn library_entry(source: photos::Entry) -> LibraryEntry {
         // 卡片的主色用照片自己提出来的强调色 —— 面板玻璃也跟着它染色,
         // 所以切壁纸的时候整个面板的色调会一起变,而不是只有壁纸变了
         accent: mcwp_ui::glass_colors(&photo.palette).accent(),
+        edit: photo.edit,
         thumb: thumb_pixels(&source),
     };
     LibraryEntry { view, source }
@@ -2435,6 +3029,10 @@ struct Args {
     /// 只解一段 mp4、打印几帧的统计就退出(不建窗口)—— 视频解码那条路唯一的自检入口。
     /// 它解的是**任意 mp4 文件**,不是库里的条目:解码器坏了和库坏了是两件事,分开测。
     video_selftest: Option<String>,
+    /// `--loop-analyze <mp4>`:只分析循环接缝并写一组预览图,不建窗口。
+    loop_analyze: Option<String>,
+    /// `--loop-apply <库 id>`:分析库里一条视频并把接缝写回它的 JSON。
+    loop_apply: Option<String>,
     stats_interval: Duration,
 }
 
@@ -2464,6 +3062,8 @@ impl Args {
             video_fetch: None,
             animate: None,
             video_selftest: None,
+            loop_analyze: None,
+            loop_apply: None,
             stats_interval: Duration::from_secs(5),
         };
         let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -2574,6 +3174,14 @@ impl Args {
                     args.video_selftest = value.cloned();
                     i += 2;
                 }
+                "--loop-analyze" => {
+                    args.loop_analyze = value.cloned();
+                    i += 2;
+                }
+                "--loop-apply" => {
+                    args.loop_apply = value.cloned();
+                    i += 2;
+                }
                 "--attach" => {
                     match value.and_then(|v| AttachMode::parse(v)) {
                         Some(mode) => args.attach_mode = mode,
@@ -2614,7 +3222,9 @@ fn main() -> Result<()> {
         || args.motion_plan.is_some()
         || args.animate_save.is_some()
         || args.video_fetch.is_some()
-        || args.video_selftest.is_some();
+        || args.video_selftest.is_some()
+        || args.loop_analyze.is_some()
+        || args.loop_apply.is_some();
     if !is_diagnostic_run && !claim_single_instance() {
         return Ok(());
     }
@@ -2656,6 +3266,14 @@ fn main() -> Result<()> {
     if let Some(path) = args.video_selftest.as_deref() {
         // 屏幕尺寸在这里只用来定"解出来缩到多大" —— 还不知道真实屏幕,按 1080p 给
         run_video_selftest(path, (1920, 1080))?;
+        return Ok(());
+    }
+    if let Some(path) = args.loop_analyze.as_deref() {
+        run_loop_analyze(path)?;
+        return Ok(());
+    }
+    if let Some(id) = args.loop_apply.as_deref() {
+        run_loop_apply(id)?;
         return Ok(());
     }
     #[cfg(not(feature = "dev-tools"))]
@@ -3307,6 +3925,80 @@ fn main() -> Result<()> {
                         }
                     }
                 }
+                // 编辑面板拖滑杆：只改正在显示的那张，不写盘 —— 拖一次写一次 JSON 既慢，
+                // 也会在用户还没决定时就把旧设置覆盖掉。点「保存」才落盘。
+                mcwp_ui::UiEvent::PreviewWallpaperEdit(edit) => {
+                    if let Some(photo) = active.as_mut() {
+                        let loop_switched = photo.photo.edit.seamless_loop != edit.seamless_loop;
+                        photo.photo.edit = edit;
+                        photo.apply_edit();
+                        if loop_switched && photo.photo.kind.is_video() {
+                            let has_seam = photo.photo.loop_seam.is_some();
+                            match reopen_video(&mut renderer, photo, screen, brightness) {
+                                Ok(()) => {
+                                    if let Some(handle) = &panel {
+                                        if edit.seamless_loop && !has_seam {
+                                            handle.set_status("这条视频没有循环接缝，仍按原片播放");
+                                        } else {
+                                            handle.set_status(if edit.seamless_loop {
+                                                "无缝循环:开"
+                                            } else {
+                                                "无缝循环:关"
+                                            });
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!("切换无缝循环失败:{err:?}");
+                                    if let Some(handle) = &panel {
+                                        handle.set_status(format!(
+                                            "切换无缝循环失败:{}",
+                                            brief(&format!("{err:#}"))
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                mcwp_ui::UiEvent::SaveWallpaperEdit => {
+                    let Some(active_photo) = active.as_mut() else {
+                        if let Some(handle) = &panel {
+                            handle.set_status("现在没有可保存的壁纸");
+                        }
+                        continue;
+                    };
+                    let id = active_photo.photo.id.clone();
+                    let title = active_photo.photo.title.clone();
+                    let edit = active_photo.photo.edit;
+                    let status = match photos::load(&id) {
+                        Ok(entry) => match photos::save_edit(&entry, edit) {
+                            Ok(saved) => {
+                                active_photo.photo.edit = saved.edit;
+                                active_photo.apply_edit();
+                                library = scan_library();
+                                format!("已保存「{title}」的壁纸设置")
+                            }
+                            Err(err) => {
+                                tracing::warn!("保存「{title}」的设置失败:{err:?}");
+                                format!("保存失败:{}", brief(&format!("{err:#}")))
+                            }
+                        },
+                        Err(err) => {
+                            tracing::warn!("保存「{title}」的设置时找不到库记录:{err:?}");
+                            format!("保存失败:{}", brief(&format!("{err:#}")))
+                        }
+                    };
+                    tracing::info!("{status}");
+                    if let Some(handle) = &panel {
+                        handle.refresh(panel_state(
+                            active.as_ref().map(|it| &it.photo),
+                            &sessions,
+                            &library,
+                        ));
+                        handle.set_status(status);
+                    }
+                }
                 // 「做成动态壁纸」:库格子的右键菜单带下标,库页工具栏那颗钮认**当前那张**。
                 mcwp_ui::UiEvent::MakeVideo(index) => {
                     video_id += 1;
@@ -3742,10 +4434,14 @@ fn main() -> Result<()> {
             // 认得出是"还没画"的占位色,继续重画同一帧只是白烧 GPU 和电。
             if let Some(photo) = &mut active {
                 photo.params.time = clock;
+                let (hour, minute) = local_hour_minute();
+                photo.tick_params(hour, minute);
                 // 视频:该换帧了就把新的一帧贴上去(`tick` 自己按视频帧率判断)。
                 // 它和"每帧都画一次"是两件事 —— 桌面 60fps,视频只有 31fps。
                 let failure = match photo.video.as_mut() {
-                    Some(video) => video.tick(&mut renderer, delta).err(),
+                    Some(video) => video
+                        .tick(&mut renderer, delta, photo.photo.edit.speed)
+                        .err(),
                     None => None,
                 };
                 if let Some(err) = failure {
@@ -3754,9 +4450,6 @@ fn main() -> Result<()> {
                     tracing::warn!("视频放不下去了({err:?}),先停在当前这一帧");
                     photo.video = None;
                 }
-                // 曝光校正在 `VideoPlayback::tick` 里烘进视频像素,不能再走渲染器的全局亮度:
-                // 否则最后一帧已经淡回首帧,还会被再乘一次曝光增益,循环点反而多出一记亮度跳。
-                photo.params.brightness = photo.base_brightness;
                 renderer.render(&photo.params)?;
                 frames_in_window += 1;
                 rendered_total += 1;
@@ -3933,6 +4626,51 @@ mod tests {
 
         // 既不用混、也不用校 → 不拷帧,直接走原像素那条快路。
         assert!(!compose_video_frame(&video, &first, 0.0, 1.0, &mut out));
+    }
+
+    fn stripe_frame(width: u32, height: u32, stripe_x: u32) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                // 背景不是纯 0：这样“静止区域保持原样”才测得出。
+                let value = if x == stripe_x && y == height / 2 {
+                    255
+                } else {
+                    20
+                };
+                rgba.extend_from_slice(&[value, value, value, 255]);
+            }
+        }
+        rgba
+    }
+
+    #[test]
+    fn 位移接缝把同一内容在中间对齐() {
+        let (width, height) = (32, 8);
+        let start = stripe_frame(width, height, 10);
+        let end = stripe_frame(width, height, 14);
+        let mut out = Vec::new();
+        assert!(compose_seam_translated(
+            &end, &start, 0.5, 1.0, 4.0, 0.0, width, height, &mut out
+        ));
+        let at = |x: u32| out[((height / 2) * width + x) as usize * 4] as i32;
+        assert!(at(12) > 200, "中点应该只剩一条对齐后的云：{}", at(12));
+        assert!(at(10) < 40, "旧位置不该留重影：{}", at(10));
+        assert!(at(14) < 40, "新位置不该留重影：{}", at(14));
+        // 静止的背景行完全不受位移影响
+        assert_eq!(out[(width * 4) as usize], 20);
+    }
+
+    #[test]
+    fn 位移接缝的末端严格等于起点帧() {
+        let (width, height) = (32, 8);
+        let start = stripe_frame(width, height, 10);
+        let end = stripe_frame(width, height, 14);
+        let mut out = Vec::new();
+        assert!(compose_seam_translated(
+            &end, &start, 1.0, 0.9, 4.0, 0.0, width, height, &mut out
+        ));
+        assert_eq!(out, start);
     }
 
     /// 短片别整段都在淡 —— 那等于整段都不对劲,所以窗口按片子长度的 1/4 收窄。

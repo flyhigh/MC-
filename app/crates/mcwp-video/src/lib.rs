@@ -37,6 +37,10 @@ use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 use windows::Win32::System::Variant::VT_I8;
 use windows::core::{GUID, PCWSTR};
 
+mod loop_seam;
+
+pub use loop_seam::{LoopSeam, analyze_loop};
+
 /// 一段视频的基本信息。`width`/`height` 是**解码输出的**尺寸(已经被 `limit` 夹过),
 /// 不是文件里写的那个原始尺寸 —— 渲染器要按它算纹理和画面比例。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -62,6 +66,9 @@ pub struct Player {
     reader: IMFSourceReader,
     /// 已经读到结尾了。到结尾之后再 `next` 直接返回 `None`,不再问 MF
     done: bool,
+    /// 当前已经解出多少帧。循环接缝要“回到第 N 帧”而不是回到 0,
+    /// 这里记的是**下一次 `next_frame` 会给出的帧号**。
+    frame_index: usize,
 }
 
 impl Player {
@@ -125,6 +132,7 @@ impl Player {
             buffer: vec![0; width as usize * height as usize * 4],
             reader,
             done: false,
+            frame_index: 0,
             info,
         })
     }
@@ -136,6 +144,11 @@ impl Player {
     /// 每帧之间该隔多久(秒)。
     pub fn frame_interval(&self) -> f32 {
         1.0 / self.info.fps.max(1.0)
+    }
+
+    /// 下一次 `next_frame` 会给出的帧号（从 0 开始）。
+    pub fn frame_index(&self) -> usize {
+        self.frame_index
     }
 
     /// 解下一帧。`Ok(None)` = **已经放完了**(调用方决定是 `rewind` 重头再来还是停住)。
@@ -183,6 +196,7 @@ impl Player {
         // **先解锁再报错**:`?` 提前返回会把缓冲锁死,下一次 Lock 直接失败
         unsafe { buffer.Unlock() }?;
         converted?;
+        self.frame_index += 1;
         Ok(Some(&self.buffer))
     }
 
@@ -203,6 +217,21 @@ impl Player {
                 .context("把视频倒回开头失败")?
         };
         self.done = false;
+        self.frame_index = 0;
+        Ok(())
+    }
+
+    /// 跳到第 `frame` 帧之前：调用方随后的一次 `next_frame` 得到的就是这一帧。
+    ///
+    /// 实现上先回到 0 再顺解，而不是直接 `SetCurrentPosition`：视频只有几秒，
+    /// 顺解二十来帧比“seek 到关键帧再猜偏移”可靠得多，也不依赖编码器关键帧布局。
+    pub fn seek_to_frame(&mut self, frame: usize) -> Result<()> {
+        self.rewind()?;
+        while self.frame_index < frame {
+            if self.next_frame()?.is_none() {
+                break;
+            }
+        }
         Ok(())
     }
 }

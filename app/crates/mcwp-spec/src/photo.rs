@@ -315,6 +315,93 @@ pub enum PhotoKind {
     Video,
 }
 
+/// 壁纸上的时钟。首版只有「关 / 数字」两档 —— 字体不跟着壁纸走，所以数字是
+/// 着色器画出来的七段码，而不是一段文字。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClockStyle {
+    #[default]
+    Off,
+    Digital,
+}
+
+impl ClockStyle {
+    /// 传给 `photo.wgsl` 的编号。0 = 不画。
+    pub fn index(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::Digital => 1,
+        }
+    }
+
+    /// 认不出的写法一律回「关」—— 和 `MotionKind` 一个态度：手写 JSON 拼错一个词，
+    /// 最坏应该是"时钟没开"，而不是整张壁纸从库里消失。
+    pub fn from_id(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "digital" => Self::Digital,
+            _ => Self::Off,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ClockStyle {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::from_id(&raw))
+    }
+}
+
+/// 一张壁纸自己的编辑设置。
+///
+/// 这些值**不改画面文件**：视频还是那段 mp4，图还是那张 png，所有调整都在播放 /
+/// 后处理时生效。因此改速度不会重新编码、改亮度也不会把原图压暗 —— 随时能改回来。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WallpaperEdit {
+    /// 播放速度倍率（静图是推拉速度，视频是整段播放速度）
+    pub speed: f32,
+    /// 单张壁纸的亮度倍率，和全局亮度相乘
+    pub brightness: f32,
+    /// 对比度，1.0 = 原样
+    pub contrast: f32,
+    /// 冷暖：-1 偏冷，0 原样，1 偏暖
+    pub warmth: f32,
+    /// 暗角强度 0~1
+    pub vignette: f32,
+    /// 时钟样式（默认关闭，老壁纸不受影响）
+    pub clock: ClockStyle,
+    /// 视频是否使用离线分析出的循环接缝。**默认关闭**：不勾选时仍按原片
+    /// 整段播放（首尾 0.8 秒收口），和加接缝之前的行为完全一样。
+    pub seamless_loop: bool,
+}
+
+impl Default for WallpaperEdit {
+    fn default() -> Self {
+        Self {
+            speed: 1.0,
+            brightness: 1.0,
+            contrast: 1.0,
+            warmth: 0.0,
+            vignette: 0.55,
+            clock: ClockStyle::Off,
+            seamless_loop: false,
+        }
+    }
+}
+
+impl WallpaperEdit {
+    pub const SPEED_MIN: f32 = 0.5;
+    pub const SPEED_MAX: f32 = 2.0;
+
+    pub fn normalize(&mut self) {
+        self.speed = clamp_unit(self.speed, Self::SPEED_MIN, Self::SPEED_MAX).unwrap_or(1.0);
+        self.brightness = clamp_unit(self.brightness, 0.6, 1.4).unwrap_or(1.0);
+        self.contrast = clamp_unit(self.contrast, 0.6, 1.4).unwrap_or(1.0);
+        self.warmth = clamp_unit(self.warmth, -1.0, 1.0).unwrap_or(0.0);
+        self.vignette = clamp01(self.vignette).unwrap_or(0.55);
+    }
+}
+
 impl PhotoKind {
     pub fn is_video(self) -> bool {
         matches!(self, PhotoKind::Video)
@@ -326,6 +413,48 @@ impl PhotoKind {
             PhotoKind::Image => "静图",
             PhotoKind::Video => "动态壁纸",
         }
+    }
+}
+
+/// 视频循环接缝。`start_frame` 和 `end_frame` 是**同一段视频里的两帧**：
+/// 播放从 `start_frame` 开始，到 `end_frame` 前结束，再从 `start_frame` 接回去。
+///
+/// `dx` / `dy` 是从起点到终点、画面内容整体移动的**宽高比例**（不是像素）。
+/// 播放器按自己的解码尺寸乘回去，所以同一份元数据在 1080p / 4K 下都能用。
+/// 为正表示内容向右/向下移动；接缝混合时会把两端沿这条位移对齐，
+/// 而不是整帧互相淡入造成重影。
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoopSeam {
+    pub start_frame: u32,
+    /// 不包含这一帧；播放到它之前就回到 `start_frame`。
+    pub end_frame: u32,
+    pub dx: f32,
+    pub dy: f32,
+    /// 对齐后的平均差异，0 最好。播放端可以按它决定要不要启用位移补偿。
+    pub score: f32,
+}
+
+impl LoopSeam {
+    /// 位移最多按半帧算。再大就不是“云在飘”，而是镜头/场景已经换了。
+    pub fn normalize(&mut self) {
+        if !self.dx.is_finite() {
+            self.dx = 0.0;
+        }
+        if !self.dy.is_finite() {
+            self.dy = 0.0;
+        }
+        if !self.score.is_finite() {
+            self.score = 1.0;
+        }
+        self.dx = self.dx.clamp(-0.5, 0.5);
+        self.dy = self.dy.clamp(-0.5, 0.5);
+        self.score = self.score.clamp(0.0, 1.0);
+    }
+
+    /// 至少两帧才构成一段可循环的区间。
+    pub fn is_valid(&self) -> bool {
+        self.end_frame > self.start_frame
     }
 }
 
@@ -353,14 +482,14 @@ pub struct Photo {
     pub kind: PhotoKind,
     /// 视频多长(毫秒)。静图恒为 0 —— 面板上那一行"5.1 秒"就来自它。
     pub duration_ms: u32,
-    /// 循环点的**曝光校正**:播放到结尾时该给画面乘的增益(1.0 = 不用校)。
+    /// **旧版**的循环曝光校正量(末帧/首帧亮度比)。
     ///
-    /// 为什么会有这个数:图生视频给的片子常常**一路变亮或变暗**(实测同一条片子的末帧
-    /// 比首帧亮 10%),切回开头就是一次亮度跳。播放时按这个系数把整段的曝光慢慢拉回一致,
-    /// 那点差就摊在十秒里,而不是堆在接缝那一瞬间(见 §11.22)。
+    /// 2026-10-17 起播放端**不再使用它**:把首末帧的比值摊到整段,遇到“片头暗、后面亮”
+    /// 的片子会把整段压暗三分之一(森林那条 `0.75` 就是这么来的)。现在播放端按
+    /// “原图平均亮度 / 稳定首帧平均亮度”算一个只提不压的 `display_gain`,并跳过片头黑场淡入。
     ///
-    /// 它是**量出来的**,不是猜的:入库时把整段解一遍,拿首帧与末帧的平均亮度算比值。
-    /// 老记录没有这个字段,缺省是 1.0(不校)—— 不能是 0.0,那会让整段画面全黑。
+    /// 字段保留是为了读旧 JSON 不报错;新记录仍会写一个值,但只当诊断痕迹。
+    /// 缺省是 1.0(不校)—— 不能是 0.0,旧代码会让整段画面全黑。
     #[serde(default = "default_seam_gain")]
     pub seam_gain: f32,
     /// 这张图"该怎么动"的**元素级**方案(见 `MotionPlan`)。
@@ -378,6 +507,13 @@ pub struct Photo {
     /// 这个字段就是那根线 —— 会话里那颗「生成动图」靠它变成"已是动图"
     /// (见 `mcwp-ui` 里那份 `VIDEOS`)。不落盘的话,重启一次这个标记就没了。
     pub origin_id: String,
+    /// 视频循环接缝。静图、没分析过的旧视频都是 `None`。
+    /// 有值时播放器会从 `start_frame` 开始、到 `end_frame` 前接回去，并用
+    /// `dx`/`dy` 做位移补偿混合（见 `LoopSeam`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_seam: Option<LoopSeam>,
+    /// 用户对这张壁纸做的播放 / 光影 / 时钟调整
+    pub edit: WallpaperEdit,
 }
 
 impl Default for Photo {
@@ -398,6 +534,8 @@ impl Default for Photo {
             motion_plan: MotionPlan::default(),
             origin_id: String::new(),
             seam_gain: default_seam_gain(),
+            loop_seam: None,
+            edit: WallpaperEdit::default(),
         }
     }
 }
@@ -442,10 +580,15 @@ impl Photo {
         self.palette = palette;
         self.motion.normalize();
         self.motion_plan.normalize();
+        self.edit.normalize();
         // 没量过 / 量出来是坏值 → 不校(1.0)。**别当成"不用管"**:0.0 会让画面全黑,
         // 而它是 f32 的 `Default`,所以老记录、手写 JSON 都可能带一个 0 进来。
         if !self.seam_gain.is_finite() || self.seam_gain <= 0.0 {
             self.seam_gain = default_seam_gain();
+        }
+        if let Some(mut seam) = self.loop_seam {
+            seam.normalize();
+            self.loop_seam = seam.is_valid().then_some(seam);
         }
         if self.width == 0 {
             self.width = 1920;
@@ -459,6 +602,7 @@ impl Photo {
         // 静图不该带时长:留着它会让面板显示"静图 · 5.1 秒"这种自相矛盾的话
         if !self.kind.is_video() {
             self.duration_ms = 0;
+            self.loop_seam = None;
         }
     }
 
@@ -765,6 +909,102 @@ mod tests {
     fn 老记录里没有出处字段读成空串() {
         let photo = Photo::parse(r#"{ "id": "6ad1d17f953432f9", "prompt": "雪山湖" }"#).unwrap();
         assert_eq!(photo.origin_id, "");
+    }
+
+    #[test]
+    fn 老记录没有编辑设置时保持原画面() {
+        let photo = Photo::parse(r#"{ "id": "6ad1d17f953432f9", "prompt": "雪山湖" }"#).unwrap();
+        assert_eq!(photo.edit, WallpaperEdit::default());
+        assert_eq!(photo.edit.speed, 1.0);
+        assert_eq!(photo.edit.brightness, 1.0);
+        assert_eq!(photo.edit.contrast, 1.0);
+        assert_eq!(photo.edit.warmth, 0.0);
+        assert_eq!(photo.edit.clock, ClockStyle::Off);
+        assert!(!photo.edit.seamless_loop);
+    }
+
+    #[test]
+    fn 无缝循环开关默认关闭且能记住() {
+        let photo = Photo::parse(
+            r#"{ "prompt": "云", "kind": "video", "edit": { "seamless_loop": true } }"#,
+        )
+        .unwrap();
+        assert!(photo.edit.seamless_loop);
+        let again = Photo::parse(&photo.to_pretty_json()).unwrap();
+        assert!(again.edit.seamless_loop);
+    }
+
+    #[test]
+    fn 老记录没有循环接缝() {
+        let photo = Photo::parse(r#"{ "id": "6ad1d17f953432f9", "prompt": "雪山湖" }"#).unwrap();
+        assert_eq!(photo.loop_seam, None);
+    }
+
+    #[test]
+    fn 循环接缝会被夹回合理范围() {
+        let photo = Photo::parse(
+            r#"{
+              "prompt": "云",
+              "kind": "video",
+              "loop_seam": {
+                "start_frame": 12,
+                "end_frame": 80,
+                "dx": 9.0,
+                "dy": -9.0,
+                "score": 4.0
+              }
+            }"#,
+        )
+        .unwrap();
+        let seam = photo.loop_seam.unwrap();
+        assert_eq!(seam.start_frame, 12);
+        assert_eq!(seam.end_frame, 80);
+        assert_eq!(seam.dx, 0.5);
+        assert_eq!(seam.dy, -0.5);
+        assert_eq!(seam.score, 1.0);
+    }
+
+    #[test]
+    fn 倒置的循环区间会被丢掉() {
+        let photo = Photo::parse(
+            r#"{
+              "prompt": "云",
+              "kind": "video",
+              "loop_seam": { "start_frame": 80, "end_frame": 12 }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(photo.loop_seam, None);
+    }
+
+    #[test]
+    fn 编辑设置越界会被夹回来() {
+        let photo = Photo::parse(
+            r#"{
+              "prompt": "城市夜景",
+              "edit": {
+                "speed": 99.0,
+                "brightness": -1.0,
+                "contrast": 8.0,
+                "warmth": -9.0,
+                "vignette": 4.0,
+                "clock": "digital"
+              }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(photo.edit.speed, WallpaperEdit::SPEED_MAX);
+        assert_eq!(photo.edit.brightness, 0.6);
+        assert_eq!(photo.edit.contrast, 1.4);
+        assert_eq!(photo.edit.warmth, -1.0);
+        assert_eq!(photo.edit.vignette, 1.0);
+        assert_eq!(photo.edit.clock, ClockStyle::Digital);
+    }
+
+    #[test]
+    fn 未知时钟样式回退到关闭() {
+        let photo = Photo::parse(r#"{ "prompt": "x", "edit": { "clock": "翻页钟" } }"#).unwrap();
+        assert_eq!(photo.edit.clock, ClockStyle::Off);
     }
 
     #[test]

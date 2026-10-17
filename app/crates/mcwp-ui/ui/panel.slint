@@ -92,6 +92,9 @@ export struct ChatMessage {
     mine: bool,
     text: string,
     photo: string,
+    /// 上一次给这张图做动图失败时留下的**任务号**。空串 = 没有可免费取回的任务。
+    /// 它跟着会话落盘:重启程序之后那条回复下面的「免费取回」仍然点得到。
+    video-task: string,
 }
 
 // 面板侧要画的一条消息:`ChatMessage` 是**存起来**的那份(只有 id),这里多带来已经装好的
@@ -114,6 +117,10 @@ export struct ChatBubble {
     /// 靠这个字段,那条回复下面就不会再画「生成动图」:再点一次是**再花一次钱**买同一张图的
     /// 另一段片子,而用户看到的画面几乎没变 —— 这种事得让界面挡住,不能只靠提示语。
     video: bool,
+    /// 上一次给这张图做动图失败时留下的任务号(空串 = 没有)。
+    ///
+    /// 有它时那颗钮画成「免费取回」:**只轮询、只下载,不重新提交**,所以不会再花一次钱。
+    video-task: string,
 }
 
 // 左栏里的一条历史对话。
@@ -796,12 +803,17 @@ component MessageRow inherits HorizontalLayout {
     // **正在给它做动图**。由根上那条 `animating-id` 命中的行点亮,这里只是个入参 ——
     // 不做任何"我点过没有"的本地记忆:那种记忆和真实状态一定会漂(任务在壁纸侧跑)。
     in property <bool> animating: false;
+    // 上一次给这张图做动图失败时留下的任务号(空串 = 没有)。
+    // 有它时按钮变成「免费取回」:只查那条已经提交过的任务,不重新提交。
+    in property <string> video-task: "";
 
     callback preview();
     callback menu-requested(length, length);
     // 「生成动图」:把这条回复配的那张(id)交给图生视频。递**id**不是行号 ——
     // 行号在消息增删 / 切会话之后会指到别处,id 不会(和预览图那个右键菜单同一个道理)。
     callback animate();
+    // 「免费取回」:照上次失败留下的任务号把成片捡回来,不再花一次钱。
+    callback fetch-video();
 
     // 「正在生成动图」那几个点:每 400ms 走一格,0 → 1 → 2 → 3 → 0。
     //
@@ -903,7 +915,10 @@ component MessageRow inherits HorizontalLayout {
                 spacing: 8px;
 
                 Text {
-                    text: "点一下看大图 · 右键可设为壁纸";
+                    // 有任务号时这行也要说清楚:接下来点的是"取回",不是"重花钱"。
+                    text: root.video-task != ""
+                        ? "上次没出片 · 不重复扣费"
+                        : "点一下看大图 · 右键可设为壁纸";
                     color: Glass.label-3;
                     font-size: 10px;
                     horizontal-alignment: left;
@@ -931,7 +946,7 @@ component MessageRow inherits HorizontalLayout {
 
                 // 正在做:一句话 + 会走的点。固定宽度,免得点一变长整行就跟着抖
                 if (!root.video && root.animating) : Text {
-                    text: root.busy-label;
+                    text: root.video-task != "" ? "正在免费取回..." : root.busy-label;
                     color: root.accent;
                     font-size: 10px;
                     width: 96px;
@@ -942,13 +957,18 @@ component MessageRow inherits HorizontalLayout {
                 }
 
                 if (!root.video && !root.animating) : Pill {
-                    text: "生成动图";
+                    // 失败过就优先给「免费取回」:那条任务服务商那边可能已经做完了,
+                    // 再点「生成动图」等于重新提交、再花一次钱。
+                    text: root.video-task != "" ? "免费取回" : "生成动图";
                     box-width: 76px;
                     box-height: 22px;
                     ink-size: 10px;
                     accent: root.accent;
                     ink: Glass.label;
-                    clicked => { root.animate(); }
+                    clicked => {
+                        if (root.video-task != "") { root.fetch-video(); }
+                        else { root.animate(); }
+                    }
                 }
             }
 
@@ -1077,6 +1097,156 @@ component ChoiceRow inherits HorizontalLayout {
         horizontal-stretch: 1;
     }
 }
+
+// 壁纸编辑里的一条整数滑杆。用整数百分比而不是浮点：跨到 Rust 的只有六个 int，
+// 每次拖动不会因为浮点表示误差把"1.00x"回填成"0.999x"。
+component EditSlider inherits Rectangle {
+    in property <string> label: "";
+    in property <int> minimum: 0;
+    in property <int> maximum: 100;
+    in-out property <int> value: 100;
+    in property <color> accent: #0A84FF;
+
+    callback edited();
+
+    height: 34px;
+    background: transparent;
+
+    property <length> track-x: 68px;
+    property <length> track-w: max(36px, root.width - 138px);
+    property <int> ratio: (root.value - root.minimum) * 100 / max(1, root.maximum - root.minimum);
+    property <length> knob-x: root.track-x + root.track-w * root.ratio / 100 - 6px;
+
+    Text {
+        x: 0px;
+        width: 64px;
+        height: 100%;
+        text: root.label;
+        color: Glass.label-2;
+        font-size: 11px;
+        vertical-alignment: center;
+    }
+
+    Rectangle {
+        x: root.track-x;
+        y: 15px;
+        width: root.track-w;
+        height: 4px;
+        border-radius: 2px;
+        background: Glass.hairline;
+    }
+
+    Rectangle {
+        x: root.track-x;
+        y: 15px;
+        width: max(0px, root.knob-x + 6px - root.track-x);
+        height: 4px;
+        border-radius: 2px;
+        background: root.accent.with-alpha(0.75);
+    }
+
+    Rectangle {
+        x: root.knob-x;
+        y: 9px;
+        width: 12px;
+        height: 16px;
+        border-radius: 6px;
+        background: #FFFFFFFF;
+    }
+
+    Text {
+        x: parent.width - 62px;
+        width: 62px;
+        height: 100%;
+        text: root.value + "%";
+        color: Glass.label-3;
+        font-size: 10px;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+    }
+
+    track-touch := TouchArea {
+        x: root.track-x;
+        y: 0px;
+        width: root.track-w;
+        height: 100%;
+        mouse-cursor: pointer;
+
+        function set-from-pointer() {
+            let percent = Math.max(0, Math.min(100, self.mouse-x * 100 / max(1px, root.track-w)));
+            root.value = root.minimum + (root.maximum - root.minimum) * percent / 100;
+            root.edited();
+        }
+
+        moved => { self.set-from-pointer(); }
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) { self.set-from-pointer(); }
+        }
+    }
+}
+
+// 壁纸编辑里的一个勾选项。勾选状态由外部回填（Rust 保存的是每张壁纸自己的
+// `WallpaperEdit`），所以这里只负责画和把点击交出去。
+//
+// 勾是两根旋转的细矩形画的，不用 `✓` 字形：内嵌字体是子集化的，缺字时是静默空白
+// （见文件头的字体说明）；路径 `Path` 在软件渲染器里又是 TODO。旋转+矩形在这套渲染器里
+// 是支持的，画法最稳。
+component EditCheck inherits Rectangle {
+    in property <string> label: "";
+    in-out property <bool> checked: false;
+    in property <color> accent: #0A84FF;
+    in property <bool> enabled: true;
+
+    callback toggled();
+
+    height: 34px;
+    background: transparent;
+    opacity: root.enabled ? 1 : 0.45;
+
+    Rectangle {
+        x: 0px;
+        y: 9px;
+        width: 16px;
+        height: 16px;
+        border-radius: 4px;
+        background: root.checked ? root.accent : Glass.fill;
+        border-width: 1px;
+        border-color: root.checked ? root.accent : Glass.hairline;
+        animate background { duration: 120ms; easing: ease-out; }
+    }
+    // 勾选态:方框里再压一块白色内芯。不用 `✓` 字形(子集字体缺字是静默空白),
+    // 也不用旋转(1.13 的 `rotation-angle` 只许加在 Image / Text 上)。
+    Rectangle {
+        x: 4px;
+        y: 13px;
+        width: 8px;
+        height: 8px;
+        border-radius: 2px;
+        background: #FFFFFFFF;
+        opacity: root.checked ? 1 : 0;
+        animate opacity { duration: 120ms; easing: ease-out; }
+    }
+    Text {
+        x: 24px;
+        width: parent.width - 24px;
+        height: 100%;
+        text: root.label;
+        color: Glass.label-2;
+        font-size: 11px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    touch := TouchArea {
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => {
+            if (root.enabled) {
+                root.checked = !root.checked;
+                root.toggled();
+            }
+        }
+    }
+}
+
 export component Panel inherits Window {
     // —— 会话视图:左栏历史 + 右栏消息 ——
     in property <[ConversationItem]> conversations;
@@ -1093,6 +1263,18 @@ export component Panel inherits Window {
     in property <int> library-current-index: -1;
     // 当前那张的标题:删除前要问一句"删的是哪张"。
     in property <string> library-current-title: "";
+    // 壁纸编辑:面板里的滑杆值(整数百分比)。真正生效与落盘都由壁纸侧做,
+    // 这里只是"用户正在拖到哪儿"的投影。
+    in-out property <bool> edit-open: false;
+    in-out property <int> edit-speed: 100;
+    in-out property <int> edit-brightness: 100;
+    in-out property <int> edit-contrast: 100;
+    in-out property <int> edit-warmth: 0;
+    in-out property <int> edit-vignette: 55;
+    in-out property <int> edit-clock: 0;
+    // 「无缝循环」只对视频有意义；静图时整行不出现。
+    in property <bool> edit-is-video: false;
+    in-out property <bool> edit-seamless: false;
     // 「删除」的二次确认:开着的时候盖一层确认框。
     in-out property <bool> confirm-delete: false;
 
@@ -1237,12 +1419,17 @@ export component Panel inherits Window {
     // 壁纸库:点了某一张 / 切进库页时想要一份最新的列表
     callback open-wallpaper(int);
     callback refresh-library();
+    // 壁纸编辑:拖动时实时预览，点保存时才写回这张壁纸的 JSON
+    callback preview-wallpaper-edit(int, int, int, int, int, int, bool);
+    callback save-wallpaper-edit();
     // 壁纸库那一格的右键菜单:删掉第 `index` 张
     callback delete-wallpaper(int);
     // 「做成动态壁纸」:把第 `index` 张静图交给图生视频(跑几十秒,结果回来再上屏)
     callback make-video(int);
     // 同一件事,但来自**会话里那条回复下面**那颗钮:递的是那张图的 id(理由见 MessageRow)
     callback animate-photo(string);
+    // 「免费取回」:任务号 + 那张图的 id。壁纸侧照任务号去服务商那里取,不重新提交。
+    callback fetch-video(string, string);
     // 同一件事,但对象是**当前挂着的那张**(库页工具栏上那颗钮;不用先去网格里找它)
     callback make-video-current();
     // 把「现在桌面上那张壁纸」抬进来当作一张新的(生图之前先有东西可看)
@@ -1269,6 +1456,20 @@ export component Panel inherits Window {
             root.send-message(root.draft);
             root.draft = "";
         }
+    }
+
+    // 把六条滑杆的当前值一起送给壁纸侧。分开发六次会导致中间态（比如速度已变、
+    // 亮度还是上一帧）闪一下；一次送完整组，画面只会看到最终组合。
+    function push-edit() {
+        root.preview-wallpaper-edit(
+            root.edit-speed,
+            root.edit-brightness,
+            root.edit-contrast,
+            root.edit-warmth,
+            root.edit-vignette,
+            root.edit-clock,
+            root.edit-seamless,
+        );
     }
 
     // 关掉右键菜单
@@ -1751,6 +1952,7 @@ export component Panel inherits Window {
                                 has-shot: msg.has-shot;
                                 photo-gone: msg.photo-gone;
                                 video: msg.video;
+                                video-task: msg.video-task;
                                 // "这一行是不是正在做动图":比的是 id。壁纸侧每起一轮 / 收一轮
                                 // 都会把那个 id 灌进来(见 `PanelHandle::set_animating`)
                                 animating: msg.photo-id != "" && msg.photo-id == root.animating-id;
@@ -1758,6 +1960,7 @@ export component Panel inherits Window {
                                 preview => { root.open-photo(msg.photo-id); }
                                 menu-requested(x, y) => { root.open-shot-menu(i, x, y); }
                                 animate => { root.animate-photo(msg.photo-id); }
+                                fetch-video => { root.fetch-video(msg.video-task, msg.photo-id); }
                             }
                         }
                     }
@@ -1806,6 +2009,17 @@ export component Panel inherits Window {
                             VerticalLayout {
                                 alignment: center;
                                 Pill {
+                                    text: root.edit-open ? "收起编辑" : "编辑";
+                                    box-width: 82px;
+                                    accent: root.accent;
+                                    enabled: root.library-current-index >= 0;
+                                    clicked => { root.edit-open = !root.edit-open; }
+                                }
+                            }
+
+                            VerticalLayout {
+                                alignment: center;
+                                Pill {
                                     text: "导入图片";
                                     box-width: 92px;
                                     clicked => { root.import-wallpaper(); }
@@ -1839,6 +2053,152 @@ export component Panel inherits Window {
                                     text: "用当前壁纸";
                                     accent: root.accent;
                                     clicked => { root.adopt-wallpaper(); }
+                                }
+                            }
+                        }
+
+                        // 壁纸编辑：只对**当前挂着的那张**生效。点库里另一张会先把它换上来，
+                        // 编辑值也会跟着那次 `refresh` 回填成那张自己的设置 —— 不会串。
+                        if root.edit-open && root.library-current-index >= 0 : Rectangle {
+                            height: 208px;
+                            border-radius: Glass.r-card;
+                            background: #00000038;
+                            border-width: 1px;
+                            border-color: Glass.hairline-dim;
+
+                            VerticalLayout {
+                                padding: 12px;
+                                spacing: 4px;
+
+                                HorizontalLayout {
+                                    height: 30px;
+                                    spacing: 8px;
+
+                                    Text {
+                                        text: "壁纸编辑 · " + root.library-current-title;
+                                        color: Glass.label;
+                                        font-size: 13px;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                        horizontal-stretch: 1;
+                                    }
+
+                                    VerticalLayout {
+                                        alignment: center;
+                                        Pill {
+                                            text: "保存";
+                                            box-width: 64px;
+                                            box-height: 26px;
+                                            accent: root.accent;
+                                            clicked => { root.save-wallpaper-edit(); }
+                                        }
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    spacing: 2px;
+
+                                    HorizontalLayout {
+                                        spacing: 22px;
+                                        EditSlider {
+                                            label: "速度";
+                                            minimum: 50;
+                                            maximum: 200;
+                                            value <=> root.edit-speed;
+                                            accent: root.accent;
+                                            horizontal-stretch: 1;
+                                            edited => { root.push-edit(); }
+                                        }
+                                        EditSlider {
+                                            label: "亮度";
+                                            minimum: 60;
+                                            maximum: 140;
+                                            value <=> root.edit-brightness;
+                                            accent: root.accent;
+                                            horizontal-stretch: 1;
+                                            edited => { root.push-edit(); }
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 22px;
+                                        EditSlider {
+                                            label: "对比度";
+                                            minimum: 60;
+                                            maximum: 140;
+                                            value <=> root.edit-contrast;
+                                            accent: root.accent;
+                                            horizontal-stretch: 1;
+                                            edited => { root.push-edit(); }
+                                        }
+                                        EditSlider {
+                                            label: "冷暖";
+                                            minimum: -100;
+                                            maximum: 100;
+                                            value <=> root.edit-warmth;
+                                            accent: root.accent;
+                                            horizontal-stretch: 1;
+                                            edited => { root.push-edit(); }
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 22px;
+                                        EditSlider {
+                                            label: "暗角";
+                                            minimum: 0;
+                                            maximum: 100;
+                                            value <=> root.edit-vignette;
+                                            accent: root.accent;
+                                            horizontal-stretch: 1;
+                                            edited => { root.push-edit(); }
+                                        }
+                                        HorizontalLayout {
+                                            height: 34px;
+                                            spacing: 8px;
+                                            horizontal-stretch: 1;
+
+                                            Text {
+                                                text: "时钟";
+                                                color: Glass.label-2;
+                                                font-size: 11px;
+                                                width: 64px;
+                                                vertical-alignment: center;
+                                            }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                Pill {
+                                                    text: root.edit-clock == 1 ? "开" : "关";
+                                                    box-width: 54px;
+                                                    box-height: 24px;
+                                                    ink-size: 11px;
+                                                    accent: root.accent;
+                                                    clicked => {
+                                                        root.edit-clock = root.edit-clock == 1 ? 0 : 1;
+                                                        root.push-edit();
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if root.edit-is-video : HorizontalLayout {
+                                        height: 34px;
+                                        spacing: 8px;
+
+                                        EditCheck {
+                                            label: "无缝循环";
+                                            checked <=> root.edit-seamless;
+                                            accent: root.accent;
+                                            horizontal-stretch: 1;
+                                            toggled => { root.push-edit(); }
+                                        }
+                                        Text {
+                                            width: 84px;
+                                            text: root.edit-seamless ? "接缝区间" : "原片整段";
+                                            color: Glass.label-3;
+                                            font-size: 10px;
+                                            horizontal-alignment: right;
+                                            vertical-alignment: center;
+                                        }
+                                    }
                                 }
                             }
                         }

@@ -242,6 +242,8 @@ impl Sessions {
             text: text.into(),
             // 用户那句话本身不带图(图是回复那一轮画出来的)
             photo: Default::default(),
+            // 用户消息不会有"上一次做动图失败"的任务号
+            video_task: Default::default(),
         });
         // 自己刚说过话的会话不该挂着未读点
         session.unread = false;
@@ -270,6 +272,8 @@ impl Sessions {
             mine: false,
             text: text.into(),
             photo: photo.unwrap_or_default().to_string().into(),
+            // 新回复还没有做过动图
+            video_task: Default::default(),
         });
         // 等回复的时候用户可能已经切走了:那就挂个未读点,别让人错过
         if id != active {
@@ -277,6 +281,32 @@ impl Sessions {
         }
         self.changed();
         true
+    }
+
+    /// 记下(或清掉)某张图"上一次做动图失败"的任务号。
+    ///
+    /// 同一张图可能出现在多条消息里(用户重发、或者几轮回复都配了同一张),
+    /// 所以这里按**图 id** 扫全部会话,而不是只改当前这一条。
+    ///
+    /// 只有真改到了才 `changed()`:失败回调每轮都走这里,没命中就不该白抬一次
+    /// revision、让面板整块重画。
+    pub fn set_video_task(&mut self, photo_id: &str, task: Option<&str>) {
+        let next = task.unwrap_or_default();
+        let mut changed = false;
+        for session in &mut self.items {
+            for message in &mut session.messages {
+                if message.photo.as_str() != photo_id {
+                    continue;
+                }
+                if message.video_task.as_str() != next {
+                    message.video_task = next.to_string().into();
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.changed();
+        }
     }
 
     /// 这个会话还在吗?「继续」之前问一句 —— 用户完全可能在暂停期间把它删了,
@@ -486,6 +516,12 @@ struct StoredMessage {
     /// 不算破坏性改动,见 `SCHEMA_VERSION` 的说明)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     photo: Option<String>,
+    /// 上一次给这张图做动图失败时留下的任务号。空 = 没有可免费取回的任务。
+    ///
+    /// 它跟着消息落盘,所以重启程序之后那颗「免费取回」还在:
+    /// 服务商那边的任务不会因为我们关掉窗口就消失,任务号丢了才是真的找不回来。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    video_task: Option<String>,
 }
 
 /// 缺 `role` 的消息按回复算:真正要紧的是文本,最坏也就是左右显示反了。
@@ -510,6 +546,10 @@ impl StoredMessage {
                 id if id.is_empty() => None,
                 id => Some(id),
             },
+            video_task: match message.video_task.to_string() {
+                id if id.is_empty() => None,
+                id => Some(id),
+            },
         }
     }
 
@@ -518,6 +558,43 @@ impl StoredMessage {
             mine: self.role == ROLE_USER,
             text: self.text.into(),
             photo: self.photo.unwrap_or_default().into(),
+            video_task: self.video_task.unwrap_or_default().into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StoredMessage;
+
+    /// 老会话文件里没有 `video_task`。读回来必须是空串,不能把整份历史判成坏档。
+    #[test]
+    fn 老会话没有任务号也能读() {
+        let stored: StoredMessage =
+            serde_json::from_str(r#"{"role":"assistant","text":"雪山","photo":"abc123"}"#)
+                .expect("老消息应该能读");
+        let message = stored.into_ui();
+        assert_eq!(message.video_task.as_str(), "");
+        assert_eq!(message.photo.as_str(), "abc123");
+    }
+
+    /// 任务号要能原样落盘再读回来 —— 重启之后「免费取回」靠的就是这一份。
+    #[test]
+    fn 任务号跟着会话落盘() {
+        let message = mcwp_ui::ChatMessage {
+            mine: false,
+            text: "没做成".into(),
+            photo: "abc123".into(),
+            video_task: "202610171348220fe19afc8efd4a58".into(),
+        };
+        let stored = StoredMessage::from_ui(&message);
+        let json = serde_json::to_string(&stored).expect("应该能序列化");
+        assert!(json.contains(r#""video_task":"202610171348220fe19afc8efd4a58""#));
+
+        let back: StoredMessage = serde_json::from_str(&json).expect("应该能读回来");
+        assert_eq!(
+            back.into_ui().video_task.as_str(),
+            "202610171348220fe19afc8efd4a58"
+        );
     }
 }
