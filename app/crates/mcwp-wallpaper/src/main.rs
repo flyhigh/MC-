@@ -1854,7 +1854,7 @@ fn run_motion_selftest(id: &str) -> Result<()> {
     );
     println!("{prompt}");
     println!(
-        "\n(真要出片还得花 1 元/次:「{}」+ 单图首帧 + quality 档 + 10 秒)",
+        "\n(真要出片还得花 1 元/次:「{}」+ 单图首帧 + quality 档 + 5 秒)",
         mcwp_ai::DEFAULT_VIDEO_MODEL
     );
     Ok(())

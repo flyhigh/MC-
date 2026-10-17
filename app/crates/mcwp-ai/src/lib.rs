@@ -1138,21 +1138,14 @@ impl Videos {
                     });
                 }
                 VideoProgress::Failed(reason) => {
-                    // 把任务号写进报错:实测(2026-10-16/17)`task_status: FAIL` 的正文里
-                    // **一个字的解释都没有**(只有一个空 message),想知道为什么挂、或者去要回
-                    // 那 1 元,手里只有这个号。原样贴的 `reason` 留在后面当"现场"。
-                    //
-                    // "等了多久"必须一起写:2026-10-17 那几次是**熬了 10 分钟**才 FAIL,而成功
-                    // 那次只用了 10.4 秒。等很久才失败基本就是服务商那边排队/过载(同一时段拿
-                    // 另一个视频模型探,提交直接被 429 挡回来:code 1305「访问量过大」),
-                    // 不是请求体写错了 —— 报错里得让用户能分辨这一点。
+                    // 这是**终态**,不是"还没轮到你"。`--video-fetch` 再查也只会回到 FAIL。
+                    // 2026-10-17 的实测:同一张图的付费任务熬了 36 分钟才 FAIL,免费任务同图
+                    // 20 分钟仍 PROCESSING,说明是服务端排队/过载,不是提示词或图片格式错误。
                     let waited = started.elapsed().as_secs();
                     return Err(anyhow::Error::new(VideoTaskFailure {
                         task_id: id.to_string(),
                         message: format!(
-                            "服务商说这条视频没生成出来(任务 {id},等了 {waited} 秒,他们没给原因):{reason}\
-                             —— 拖这么久才 FAIL 多半是他们那边排队/过载。过一会儿用 \
-                             `--video-fetch {id} <库 id>` 免费取回,**别重提**(重提要再花一次钱)"
+                            "服务商已把这条视频判定为失败(任务 {id},等了 {waited} 秒):{reason} —— 这是终态,免费取回不会恢复。请换时段重试,或在设置里换一个视频模型;重试会重新计费(当前已改为 5 秒)"
                         ),
                     }));
                 }
@@ -2609,7 +2602,7 @@ struct ResponseMessage {
 ///
 /// `quality` / `watermark_enabled` / `duration` / `with_audio` 是显式写出来的参数:
 /// - `quality: "quality"` —— 不传时服务商默认 `speed`;壁纸要画面质量,不是抢几十秒;
-/// - `duration: 10` —— 5 秒和 10 秒**同价**(1 元/次),而素材长一倍,头的抖动和尾的漂移都能丢;
+/// - `duration: 5` —— 5 秒和 10 秒同价,但 10 秒更容易排队、漂移,也更难在服务端高峰出片;
 /// - `with_audio: false` —— 壁纸不放声音,带音轨只是白白胖一圈。
 #[derive(Debug, Serialize)]
 struct VideoRequest<'a> {
@@ -2643,8 +2636,10 @@ enum VideoImage<'a> {
 /// 显式选 `quality`。这和"1 元/次"同价,只是出片更慢。
 const VIDEO_QUALITY: &str = "quality";
 
-/// 一条片子的时长(秒)。文档里**只支持 5 和 10**,而且两者同价 —— 那就没有理由选短的。
-const VIDEO_DURATION_SECS: u32 = 10;
+/// 一条片子的时长(秒)。文档只支持 5 和 10,两者同价。
+/// 2026-10-17 起改为 5 秒:CogVideoX-3 的高峰期在 10 秒任务上连续 FAIL,同图的免费任务也长期
+/// 卡在 PROCESSING;5 秒官方支持、同价、服务端压力更小,循环接缝仍由播放器淡化处理。
+pub const VIDEO_DURATION_SECS: u32 = 5;
 
 /// 图生视频接口**认的那几档尺寸** —— 服务商给的清单(接口文档里就是这七个枚举),不是算出来的。
 ///
@@ -3803,7 +3798,7 @@ mod tests {
         // `size` **必须**报出去:留空时服务端按原图比例推,某些比例会推出奇数长边然后 FAIL
         // (见 `VIDEO_SIZES`)。这条钉住"它一直在请求体里",别再被谁当成可选项删掉。
         assert_eq!(one["size"], "1920x1080");
-        assert_eq!(one["duration"], 10);
+        assert_eq!(one["duration"], 5);
         assert_eq!(one["with_audio"], false);
         // `quality` 不传就是 `speed`;动态壁纸必须显式选质量优先。
         assert_eq!(one["quality"], "quality");
