@@ -1140,7 +1140,7 @@ impl Videos {
                 VideoProgress::Failed(reason) => {
                     // 这是**终态**,不是"还没轮到你"。`--video-fetch` 再查也只会回到 FAIL。
                     // 2026-10-17 的实测:同一张图的付费任务熬了 36 分钟才 FAIL,免费任务同图
-                    // 20 分钟仍 PROCESSING,说明是服务端排队/过载,不是提示词或图片格式错误。
+                    // 十多分钟仍 PROCESSING,说明是服务端排队/过载,不是提示词或图片格式错误。
                     let waited = started.elapsed().as_secs();
                     return Err(anyhow::Error::new(VideoTaskFailure {
                         task_id: id.to_string(),
