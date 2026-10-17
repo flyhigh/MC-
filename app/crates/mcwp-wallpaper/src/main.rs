@@ -561,7 +561,8 @@ fn start_video_run_visible(
 /// 1. **看图**(免费视觉模型)写一份**元素级**方案:灯在哪儿怎么闪、车流朝哪边走(`plan_motion_vision`)。
 ///    这一步是"画面真的活起来"和"整张图被推近"之间的分水岭 —— 看不到画面的模型只会写万能运镜。
 /// 2. 把方案拼成**图生视频那句提示词**(`video_prompt`);方案是空的就退回老路(文本模型 / 通用运镜)。
-/// 3. **图生视频**:首尾帧都给这张图(**闭环**)+ 10 秒(见 `mcwp_ai::animate_looped`)。
+/// 3. **图生视频**:只把这张图当**首帧** + 10 秒(见 `mcwp_ai::animate`)。
+///    不再把同一张图当尾帧:实测首尾同图会把运动锁死成近乎静帧(见 §11.31)。
 /// 4. 把 mp4 落成临时文件、解出第一帧当封面。
 ///
 /// 第 4 步为什么要绕一下:解码器是从**文件**读的(Media Foundation 没有"从内存解一段视频"
@@ -580,7 +581,9 @@ fn animate_photo(
     // 1 · 元素级方案。库里已经存过一份就**直接用** —— 同一张图重做一遍时不必再看第二眼,
     //     两次分析给的元素也未必一样(见 `MotionPlan` 的说明)。
     let plan = match chat {
-        Some(_) if !source.motion_plan.is_empty() => source.motion_plan.clone(),
+        // 只复用**带 caption 的**新方案。老资产里只有 elements,那正是"只动光影"的旧提示词,
+        // 拿它继续出片等于把已经修掉的毛病又跑一遍;视觉模型免费,重新看一次更划算。
+        Some(_) if source.motion_plan.has_caption() => source.motion_plan.clone(),
         Some(chat) => chat.plan_motion_vision(&source, &image_bytes),
         None => mcwp_spec::MotionPlan::default(),
     };
@@ -596,18 +599,27 @@ fn animate_photo(
     };
     tracing::info!(
         "这一轮的动效提示词({}):{motion}",
-        if plan.is_empty() { "通用" } else { "元素级" }
+        if plan.is_empty() {
+            "通用"
+        } else if plan.has_caption() {
+            "caption"
+        } else {
+            "元素级兜底"
+        }
     );
     // 方案**写回原图那一份**:它的主人是这张图(见 `photos::save_motion_plan`)。
     // 只在这张图还没有方案时写 —— 库里已经有一份就说明是"拿来用"的那条路,不用重复写。
-    if !plan.is_empty() && source.motion_plan.is_empty() {
+    if !plan.is_empty() && !source.motion_plan.has_caption() {
         if let Err(err) = photos::save_motion_plan(entry, &plan) {
             // 写不进去不该让整条链路失败:方案已经在内存里,片子照样能做
             tracing::warn!("动效方案没写回库里那张({err:#})");
         }
     }
-    // 3 · **首尾帧**(首帧=尾帧=这张图)逼模型把画面绕回起点,循环才接得上;时长要 10 秒
-    //     (和 5 秒同价,素材翻倍 —— 头尾的抖动都能丢)。
+    // 3 · **只发首帧**。曾经的"首尾帧都给同一张图"听起来最稳,实测却把模型锁成近乎静帧:
+    //     首尾一模一样,它只要把画面保持住就能交差,草和树叶根本不动(光流均值 0.06)。
+    //     多轮对照(同一张图,提示词都要求实体运动):单图 quality 档 2.92、speed 档 8.79,
+    //     首尾同图 0.06 —— 这是把"元素真的动"救回来的关键一步。
+    //     循环接缝交给播放器的 0.8 秒淡回第一帧(见 `LOOP_FADE_SECS`)。
     //
     // 3.5 · 提交前把图收拾成"服务商自己推得动"的比例:它按"短边 1080 × 图片比例、向下取整"推
     //       成片尺寸,推出奇数长边时 H.264 编不出来。**这不是 2026-10-16 那几次 FAIL 的病根**
@@ -635,7 +647,7 @@ fn animate_photo(
         }
     };
     let image_url = mcwp_ai::image_data_url(&submit_bytes);
-    let generated = videos.animate_looped(&image_url, &motion, screen)?;
+    let generated = videos.animate(&image_url, &motion, screen)?;
     video_payload_from_bytes(&source, plan, generated.bytes, screen)
 }
 
@@ -1290,7 +1302,7 @@ fn run_motion_selftest(id: &str) -> Result<()> {
     println!("\n---- 这一步之后会发给图生视频的提示词({} 字)----", prompt.chars().count());
     println!("{prompt}");
     println!(
-        "\n(真要出片还得花 1 元/次:「{}」+ 首尾帧同一个文件 + 10 秒)",
+        "\n(真要出片还得花 1 元/次:「{}」+ 单图首帧 + quality 档 + 10 秒)",
         mcwp_ai::DEFAULT_VIDEO_MODEL
     );
     Ok(())
@@ -1553,10 +1565,11 @@ fn run_video_selftest(path: &str, screen: (u32, u32)) -> Result<()> {
     );
     // 循环点:把**头尾那两帧差多少**量出来。
     //
-    // 为什么要量:首尾帧闭环这件事从外部看只有一个信号 —— 播放完那一下跳不跳。
+    // 为什么要量:循环接缝从外部看只有一个信号 —— 播放完那一下跳不跳。
+    // 现在视频按单图首帧生成,尾帧本来就不会自动回到起点,播放器要靠淡回第一帧收口。
     // 盯着桌面等十秒去判,既看不准又受当时画面影响;而"末帧离首帧有多远"是个数。
-    // 再拿"首帧到中点那帧"当基线,这个数才有尺度:两者相当 = 闭环根本没生效
-    // (模型没往起点绕,或者首尾帧那一路被退回成单图提交了)。
+    // 再拿"首帧到中点那帧"当基线,这个数才有尺度:两者相当 = 尾帧没有绕回起点,
+    // 接缝完全靠播放器的淡入淡出兜着(单图提交的常态,见 §11.31)。
     let halfway = {
         player.rewind()?;
         let target = frames / 2;
@@ -1593,7 +1606,7 @@ fn run_video_selftest(path: &str, screen: (u32, u32)) -> Result<()> {
     } else if seam <= span * 0.6 {
         println!("  → 头尾明显比半途近,但没到「绕回」:淡回能盖住跳变,看得出画面在往回并");
     } else {
-        println!("  → 头尾和半途一样远:**闭环没生效**(模型没绕回起点,或首尾帧被退回成单图提交)");
+        println!("  → 头尾和半途一样远:**尾帧没回到起点**(单图首帧生成的常态,靠播放器淡回第一帧)");
     }
     // 倒回开头再解一帧:循环播放全靠这一步,而它在 MF 上是最容易"静默不生效"的一处
     player.rewind()?;

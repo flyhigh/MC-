@@ -200,6 +200,12 @@ pub struct MotionElement {
     pub area: String,
     /// 它怎么动:亮灭闪烁 / 从左往右流动 / 缓慢飘移 / 被风吹起…
     pub action: String,
+    /// 这个元素的一句**完整英文动作句**(8~16 词)。
+    ///
+    /// 为什么要单独一句:`kind + action` 直接拼会出 "grass ripple outward" 这种
+    /// 主谓不一致的句子。本地拼装时优先用 `sentence`;没有才退回 `kind + action`。
+    #[serde(default)]
+    pub sentence: String,
 }
 
 /// 一张图"动起来"的方案:**整体镜头 + 逐个元素**。
@@ -215,6 +221,27 @@ pub struct MotionPlan {
     /// 整体镜头:固定机位 / 缓慢推近 / 轻微环绕…
     pub camera: String,
     pub elements: Vec<MotionElement>,
+    /// 可选的一段**完整英文描述**。
+    ///
+    /// 2026-10-17 起主路不是它:视觉模型只给 `scene` + `elements`,最终长描述由
+    /// `mcwp_ai::compose_scene_caption` 在本地拼(见 §11.31)。这个字段留着两个用途:
+    /// ①兼容/诊断时模型直接给整段;②非空时 `video_prompt` 优先用它。
+    ///
+    /// 老资产里没有这个字段 → 反序列化成空串。
+    #[serde(default)]
+    pub caption: String,
+    /// 一段**英文场景锚点**(12~24 词),由视觉模型写。
+    ///
+    /// 最终提示词由 `scene` + `elements` 在本地拼成完整英文段落:
+    ///
+    /// `A quiet forest path at dusk. The camera remains locked off. In the upper left,
+    /// tree leaves sway back and forth... Each motion completes one full visible cycle...`
+    ///
+    /// 为什么不直接让模型写整段:免费视觉模型两次会漏掉不同的元素、还会把
+    /// "The camera remains locked off" 放到最后。结构化输出 + 本地拼装更稳,
+    /// 元素一个都不会丢,顺序也固定。
+    #[serde(default)]
+    pub scene: String,
 }
 
 impl MotionPlan {
@@ -228,19 +255,35 @@ impl MotionPlan {
     pub fn normalize(&mut self) {
         self.camera = self.camera.trim().to_string();
         self.elements.retain(|element| {
-            !element.kind.trim().is_empty() && !element.action.trim().is_empty()
+            !element.kind.trim().is_empty()
+                && (!element.action.trim().is_empty() || !element.sentence.trim().is_empty())
         });
         self.elements.truncate(Self::MAX_ELEMENTS);
         for element in &mut self.elements {
             element.kind = element.kind.trim().to_string();
             element.area = element.area.trim().to_string();
             element.action = element.action.trim().to_string();
+            element.sentence = element.sentence.trim().chars().take(300).collect();
         }
+        // caption 是最终要发出去的那段话。模型偶尔会带围栏/引号/换行,这里只做最基本的
+        // 收口;真正截到 512 字、按句子边界收尾在 `mcwp_ai::video_prompt` 里做。
+        // 上限给到 2000 字只是防跑飞,不参与接口限制。
+        self.caption = self.caption.trim().chars().take(2000).collect();
+        self.scene = self.scene.trim().chars().take(300).collect();
     }
 
-    /// 一个元素都没有 —— 该退回"通用运镜"那种写法。
+    /// 一个元素都没有、也没有 caption —— 该退回"通用运镜"那种写法。
     pub fn is_empty(&self) -> bool {
-        self.elements.is_empty()
+        self.elements.is_empty() && self.caption.trim().is_empty() && self.scene.trim().is_empty()
+    }
+
+    /// 有没有**能直接出片**的方案:`caption` 非空,或者 `scene` + `elements` 都有。
+    ///
+    /// 老资产只有 `elements`(没有 `scene`/`caption`);那种方案正是"只动光影"的来源,
+    /// 不能再复用,必须重新看图。
+    pub fn has_caption(&self) -> bool {
+        !self.caption.trim().is_empty()
+            || (!self.scene.trim().is_empty() && !self.elements.is_empty())
     }
 }
 

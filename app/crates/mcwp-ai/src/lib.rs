@@ -130,13 +130,25 @@ const VIDEO_POLL_INTERVAL: Duration = Duration::from_secs(8);
 /// 一条视频最多等多久。
 ///
 /// 实测差得极远:闲的时候 61 s 就出片,2026-10-16 那天同样一条 10 秒片**等了 7 分钟**
-/// 还在 PROCESSING(`--video-fetch` 亲自查到过)。所以给到 15 分钟 ——
-/// 到点还是报错,不让面板上那颗「做成动态壁纸」永远转下去;真超了也别慌,
-/// 任务号会跟着报错一起打出来,`--video-fetch <任务号> <库 id>` 能把它捡回来。
-const VIDEO_WAIT_TIMEOUT: Duration = Duration::from_secs(900);
+/// 还在 PROCESSING(`--video-fetch` 亲自查到过);2026-10-17 的 `quality` 档甚至跑了
+/// **16 分 49 秒**才 SUCCESS。所以给到 30 分钟 —— 到点还是报错,不让面板上那颗
+/// 「做成动态壁纸」永远转下去;真超了也别慌,任务号会跟着报错一起打出来,
+/// `--video-fetch <任务号> <库 id>` 能把它捡回来。
+const VIDEO_WAIT_TIMEOUT: Duration = Duration::from_secs(1800);
 
-/// 动效提示词最长多少字。图生视频那句**只描述"怎么动"**,不需要长;太长反而会被当成分镜。
-const MAX_MOTION_PROMPT_CHARS: usize = 200;
+/// 动效提示词最长多少字。
+///
+/// 旧值 200 是按"一句短清单"定的;现在这条路改成**英文长描述**(官方 CogVideoX
+/// 就是在长提示词下训练的),200 字会把一段 60 词的英文直接砍半。接口对 `prompt`
+/// 的硬上限是 512 字符,所以这里和 `MAX_VIDEO_PROMPT_CHARS` 对齐。
+const MAX_MOTION_PROMPT_CHARS: usize = 512;
+
+/// 所有动效提示词共用的收尾。
+///
+/// 不能只写 `seamless`:那只是"看起来不跳",视频模型完全可能理解成"整段几乎不动"。
+/// 这里把动作幅度和位置钉死 —— 中段最大、末帧回到起始姿态;再把曝光、色彩和光照锁住,
+/// 避免模型用"太阳落山 / 整体明暗变化"来伪造运动。
+const MOTION_LOOP_TAIL: &str = "Each motion completes one full visible cycle and returns to its starting pose; no camera movement, zoom, pan or orbit, and exposure and color stay fixed.";
 
 /// 提交被"服务商在忙"挡回来时的退避(秒)。
 ///
@@ -799,6 +811,11 @@ impl Videos {
     }
 
     /// 提交一条**首尾帧**任务:首帧和尾帧同一张图(见 `VideoImage`)。
+    ///
+    /// **2026-10-17 起壁纸不再走这条。** 首尾都给同一张图时,模型只要"保持画面"就能
+    /// 同时满足首帧和尾帧,实测运动被压成近乎静帧(多轮对照:首尾同图 0.06,
+    /// 单图 quality 2.92 / speed 8.79,见 §11.31)。
+    /// 保留它是为了接口兼容和诊断,不要拿它做壁纸。
     pub fn submit_looped(
         &self,
         image_url: &str,
@@ -815,19 +832,24 @@ impl Videos {
         screen: (u32, u32),
     ) -> Result<String> {
         let size = size_field(video_size_for(screen));
-        let body = serde_json::to_string(&VideoRequest {
-            model: self.cfg.model.as_str(),
-            prompt,
-            image_url,
-            size: size.as_str(),
-            duration: VIDEO_DURATION_SECS,
-            with_audio: false,
-        })?;
         let url = format!("{}/videos/generations", self.root());
         // 忙的时候(429)退避重提:这一单没被受理、不计费,所以重提**不亏钱**;
         // 换成"接下了再 FAIL"那种就不能这么干(见 `SUBMIT_BUSY_BACKOFF`)。
         let mut busy = 0;
+        // 无水印是用户已经签过免责声明的路径;万一账号没开通,服务商会 4xx 拒绝。
+        // 和生图那条一样退回带水印重提一次,而不是让整个按钮失败。
+        let mut watermark = false;
         loop {
+            let body = serde_json::to_string(&VideoRequest {
+                model: self.cfg.model.as_str(),
+                prompt,
+                image_url,
+                quality: VIDEO_QUALITY,
+                watermark_enabled: watermark,
+                size: size.as_str(),
+                duration: VIDEO_DURATION_SECS,
+                with_audio: false,
+            })?;
             let mut response = self
                 .agent
                 .post(&url)
@@ -859,6 +881,15 @@ impl Videos {
                         truncate(&raw, 160)
                     ));
                 }
+                if !watermark && is_watermark_refusal(status.as_u16(), &raw) {
+                    tracing::warn!(
+                        "视频去水印被拒({}:{}) —— 退回带水印重提一次",
+                        status.as_u16(),
+                        truncate(&raw, 120)
+                    );
+                    watermark = true;
+                    continue;
+                }
                 return Err(anyhow!(
                     "图生视频接口返回 {}:{}",
                     status.as_u16(),
@@ -871,7 +902,11 @@ impl Videos {
                 return Err(anyhow!("图生视频接口没给任务号:{}", truncate(&raw, 200)));
             }
             // 尺寸写进日志:出片尺寸和这里报的不是一回事时(服务商可能自己改),这一行是唯一线索
-            tracing::info!("图生视频任务已提交:{}(要 {size})", task.id);
+            tracing::info!(
+                "图生视频任务已提交:{}(要 {size} · {VIDEO_QUALITY} · {})",
+                task.id,
+                if watermark { "带水印" } else { "无水印" }
+            );
             return Ok(task.id);
         }
     }
@@ -945,14 +980,13 @@ impl Videos {
         self.animate_with(image_url, prompt, false, screen)
     }
 
-    /// 同上,但**先按首尾帧提交**(首尾都给这张图 → 画面绕回起点,循环才接得上)。
+    /// 同上,但**先按首尾帧提交**(首尾都给这张图)。
     ///
-    /// 为什么带降级:首尾帧是 `cogvideox-3` 的能力,换个模型(或者用户自己在设置里填了别家)
-    /// 可能不认这个形状,那时**退回单图重提一次**,而不是让整颗按钮失败 ——
-    /// 认不认首尾帧这件事,只有发出去才知道。
+    /// **不要用它做壁纸。** 2026-10-17 的多轮对照出片证明"首尾同图"会把运动锁死:
+    /// 同一张图、提示词都要求实体运动时,首尾帧 0.06,单图 quality 2.92 / speed 8.79
+    /// (光流均值)。壁纸现在走 `animate`(单图首帧),接缝由播放器的 0.8 秒淡回第一帧兜住。
     ///
-    /// 注意降级会**多花一次提交**:两轮里只要有一轮被受理,就只算一次出片。
-    /// 提交被拒(4xx)时服务商不会计费,所以这里亏的是几秒,不是钱。
+    /// 保留它是因为接口能力本身还在、诊断时可能要复现旧行为;不是给产品路径用的。
     pub fn animate_looped(
         &self,
         image_url: &str,
@@ -1413,9 +1447,19 @@ impl Client {
             Ok(mut plan) => {
                 plan.normalize();
                 if plan.is_empty() {
-                    tracing::warn!("动效分析没认出任何元素,退回通用运镜:{}", truncate(&raw, 200));
+                    tracing::warn!("动效分析没认出任何元素,退回通用描述:{}", truncate(&raw, 200));
                 } else {
-                    tracing::info!("动效方案:镜头={} · {}个元素", plan.camera, plan.elements.len());
+                    tracing::info!(
+                        "动效方案:镜头={} · {}个元素 · scene {} 字 / caption {} 字 / 最终提示词 {} 字",
+                        plan.camera,
+                        plan.elements.len(),
+                        plan.scene.chars().count(),
+                        plan.caption.chars().count(),
+                        video_prompt(&plan).chars().count()
+                    );
+                    if !plan.has_caption() {
+                        tracing::warn!("视觉模型没给 caption,只能退回元素拼接:{}", truncate(&raw, 200));
+                    }
                 }
                 plan
             }
@@ -1631,20 +1675,25 @@ motion 的四个数都是 0~1:intensity 是效果强弱,zoom 是画面推近幅�
 /// 它只听得到这句话。所以这里要说清楚三件事:写的是"怎么动"不是"画了什么"、只写一句、
 /// 以及一串"绝对不要出现"的东西(文字 / 水印 / 分镜切换,都是这一段喂出来的视频常见的翻车点)。
 const MOTION_SYSTEM_PROMPT: &str = "\
-你在为「图生视频」写提示词。用户会给你一张**已经画好的图**的描述,你要写的不是画面里有什么\
-(那个模型已经看得见了),而是**它该怎么动**。\n\
-只写一句话,不超过 60 字,内容只允许落在下面三类里:\n\
-1. 镜头:缓慢推近 / 缓慢拉远 / 左右平移 / 轻微环绕 / 固定机位\n\
-2. 画面内的自然运动:云在飘、水面泛起波纹、雾气缓缓流动、树叶轻晃、光影缓慢变化\n\
-3. 节奏:整体缓慢、平稳\n\
-**绝对不要出现**:画面里有什么东西、文字、字母、数字、水印、logo、人脸特写、人物主体、\
-分镜切换、剧烈缩放、闪烁。\n\
-只输出这一句话本身:不要解释、不要加引号、不要 JSON、不要 markdown、不要换行。";
+你在为「动态壁纸」写图生视频提示词。用户会给你一张**已经画好的图**的文字描述;\
+你看不到像素,所以只能写描述里确实提到过的东西,不要编。\n\
+只输出**一段英文**,55~85 个词,不要解释、不要加引号、不要 JSON、不要 markdown。\n\
+必须满足:\n\
+1. 第一句先点一下场景,紧接着写 \"The camera remains locked off.\";\n\
+2. 找出描述里**能物理移动的 3~5 样东西**(云、雾、水面、树叶、草、花、车流、人群、\
+   飞鸟、衣摆、头发、窗帘、烟……),每样都写清楚位置和一个现在时动词;\n\
+3. 动词要具体、看得出来:drifts slowly right / sways back and forth / flutters /\n\
+   ripples outward / rustles / billows / streams past / glides;\n\
+4. 不要只写光影变化 —— 至少有两样是实体在动;\n\
+5. 不要镜头切换、不要缩放/平移/环绕、不要出现新物体、不要文字、不要画风词;\n\
+6. 最后一句写 \"Each motion completes one full visible cycle and returns to its starting pose; no camera movement, zoom, pan or orbit, and exposure and color stay fixed.\"。";
 
 /// 交给模型的"这张图是什么"。
 fn motion_request(photo: &Photo) -> String {
     format!(
-        "这张壁纸叫「{}」,画面描述是:{}\n请写一句它该怎么动的提示词。",
+        "这张壁纸叫「{}」,画面描述是:{}\n\
+         请写一段英文的图生视频提示词:让描述里能动的实体真的动起来,\
+         不要只写光影变化。",
         photo.title, photo.prompt
     )
 }
@@ -1655,42 +1704,59 @@ fn motion_request(photo: &Photo) -> String {
 /// 否则模型很可能顺着提示词复述一遍画面,而不是去看像素(它连画面里有没有车都不知道)。
 fn motion_vision_request(photo: &Photo) -> String {
     format!(
-        "这张壁纸叫「{}」,生成它时那句提示词是:{}\n\
-         请**看这张图**,写下它会怎么动。",
+        "Image title (Chinese): 「{}」\n\
+         Original generation prompt (Chinese): {}\n\
+         Look at the image itself, not the text. The Chinese text is only context;\n\
+         translate everything you see into English.\n\
+         List 4-5 movers across sky, midground and foreground, with at least 3 physical objects.\n\
+         Do not describe only changing light: leaves, grass, clouds, water, traffic, fabric\n\
+         and hair must actually move. Output English only (except area).",
         photo.title, photo.prompt
     )
 }
 
-/// 看图写方案的题目。**这里的每一句都是在修一个已经看到过的毛病**:
-/// - "只写图里看得到的东西":小模型爱自由发挥,给雪山湖加车流;
-/// - "九宫格"定位置:让它给像素框只会拿到编出来的数,而"左中"人和模型都说得准;
-/// - 每句限长:它习惯写小作文,一段话就把 512 字吃光了,还挤掉了别的元素;
-/// - 只输出 JSON:和生图那一步同一个态度(见文件头)。
+/// 看图写方案的题目。2026-10-17 重写:模型只输出**结构化的英文场景 + 英文实体动作**,
+/// 最终那段英文长描述由本地按固定结构拼(见 `compose_scene_caption`)。
+///
+/// 为什么不再让模型直接写整段:
+/// - CogVideoX 官方 i2v 要的是"从首帧开始的一段完整画面描述"(见 `inference/convert_demo.py`);
+/// - 但免费视觉模型两次会漏掉不同的元素,还把 "camera remains locked off" 放到最后;
+/// - 旧版中文短清单 + "所有动作必须来回" 又把动作压成"阳光一明一暗 / 树影摇摆"。
+///
+/// 现在模型只负责"看见什么、它怎么动"这两件它擅长的事,句子结构和顺序由本地保证。
 const VISION_SYSTEM_PROMPT: &str = "\
-你在为「动态壁纸」做动效分析。用户会给你**一张图**,你要写的是**它该怎么动**。\n\
-先看图:哪里是灯、哪里是路、天上是云还是星、有没有水面、有没有人和飞鸟。\n\
+你在为「动态壁纸」写**图生视频**提示词。用户会给你一张图,这张图就是视频的**第一帧**。\n\
+先扫四个层次:天空 → 远景 → 中景 → 前景。找**能物理移动的东西**:\n\
+云、雾、烟、雨雪、水面/波纹、树叶、树枝、草、蕨类、花、旗子、窗帘、衣摆、头发、\n\
+人群、车流、飞鸟、昆虫、火焰、浮尘。\n\
 然后**只输出一份 JSON**,不要解释、不要 markdown 代码块、不要多余的字:\n\
-{\"camera\":\"固定机位或缓慢推近或轻微环绕(挑一个)\",\
-\"elements\":[{\"kind\":\"元素名\",\"area\":\"九宫格位置\",\"action\":\"它怎么动\"}]}\n\
+{\"camera\":\"固定机位\",\"scene\":\"English scene anchor, 12-24 words\",\"elements\":[{\"kind\":\"English noun phrase\",\"area\":\"左下\",\"action\":\"short English verb phrase\",\"sentence\":\"One complete present-tense English sentence, 8-16 words\"}]}\n\
 规则:\n\
-1. **只写图里看得见的东西**。图里没有车就别写车流 —— 编出来的动作会让生成的视频里凭空出现东西。\n\
-2. `area` 只能是这十个之一:左上、上中、右上、左中、正中、右中、左下、下中、右下、全图。\n\
-3. `action` 要具体、要短(12 字以内),**而且不要重复元素名** —— 它是谓语,不是短语:\n\
-   写\"一明一暗地闪烁\",不要写\"灯光逐个亮灭闪烁\";写\"向右缓慢飘移\",不要写\"云向右缓慢飘移\"。\n\
-3b. 动作必须是**来回**的(闪烁、呼吸、荡漾、摇曳、飘来飘去):十秒结束时画面要能\n\
-   回到开头的样子。**不要写单向走到底的动作** —— \"逐个点亮\"\"越来越亮\"\"逐渐升起\"\n\
-   \"向右一直飘\"\"一路驶过\"都会让整段片子越走越远,循环回去就是一记明显的跳\n\
-   (实测:一句\"逐个亮灭\"让末帧整体比首帧亮了 10%,接缝差 14.2,比自然运动本身还大)。\n\
-   不知道怎么改就加\"来回\":云写\"缓缓飘来飘去\"不写\"向右一直飘\";车流写\"一辆接一辆驶过\"\n\
-   不写\"整队开走\";灯光写\"一明一暗地闪烁\"不写\"依次点亮\"。\n\
-4. 挑**最该动的 2~5 个**元素,按\"动了最出效果\"排前面。照着画面找:\n\
-   城市 / 街景 → 灯光、车流、招牌;天空 → 云、飞鸟;水面 → 波纹、倒影;\n\
-   植物 → 树叶、花海被风吹动;人物 → 衣摆、头发;室内 → 窗帘、烛火、烟雾。\n\
-   有就写,没有就**别编** —— 宁可只写两三个真的看得见的。\n\
-5. 动作要**缓慢、持续、可循环**(壁纸是长时间看的,剧烈运动会抢注意力);\n\
-   不要写镜头切换、不要写画面里出现新东西、不要写文字。\n\
-6. **只写会动的东西**。\"小木屋保持静止\"这种是凑数:它占了字数,而且视频模型可能反过来\
-   去动它。画面里只有两处会动,就只写两处。";
+1. **只写图里看得见的东西**。图里没有车就别写车流;编出来的动作会让视频里凭空出现东西。\n\
+2. `area` 只能逐字使用这十个中文值之一:左上、上中、右上、左中、正中、右中、左下、下中、右下、全图。\n\
+   不要写 sky / foreground / midground / center 这类英文,**中文值写错这条元素就无效**。\n\
+3. **必须列 4~5 个元素**,其中**至少 3 个是实体**(云/水/植物/车/人/鸟/烟/衣摆……)。\n\
+   太阳、夕阳、光线、光晕、阴影、曝光、亮度、色彩变化都**不算实体**,不要把它们写成元素。\n\
+   画面里真的只有两三样会动,就写两三样,但**至少 2 个实体**,不能只写光影。\n\
+4. **元素顺序前景优先**:先写草、蕨类、花、衣摆等前景,再写树/车/人群等中景,\n\
+   最后写云/鸟等天空元素。前景有植物或地面,至少写一个前景元素。\n\
+5. `scene` 写 **12~24 个英文词**:地点 + 地形 + 前景/中景/天空的主要实体,\n\
+   例如 \"A dense forest with a winding dirt path, thick ferns and tall trees on both sides\";\n\
+   不要写时间、日落、阳光、光晕、阴影、曝光、色调或 mood,也不要写 \"English\" 这个词。\n\
+   `scene`、`kind`、`action` 必须是英文,中文标题和中文描述只是上下文,不要用中文回答。\n\
+6. `sentence` 是**每个元素一句完整英文**,8~16 词,主语 + 现在时强动词 + 方向/幅度。\n\
+   必须写出方向或幅度:back and forth / from left to right / outward / upward /\n\
+   in large waves / deeply / strongly / continuously / across the frame。\n\
+   不要只写\"sway gently\",要写\"sway strongly back and forth\";\n\
+   草和蕨类写 bends deeply / ripples in visible waves,树叶写 shakes and rustles continuously,\n\
+   云写 streams steadily across the sky。\n\
+   例:Thin clouds stream steadily to the left across the orange sky.\n\
+   语法必须正确(grass 用 bends/ripples,不用 bend/ripple)。\n\
+   **不要用 subtle / subtly / tiny / faint / slight / gentle / gently / softly /\n\
+   gracefully** 形容主要动作;也不要写\"保持不变\"\"静止\"来凑数。\n\
+   `action` 只是给诊断看的短动词短语,caption 真正用的是 `sentence`。\n\
+7. `camera` 一律写\"固定机位\":壁纸不需要运镜,画面里的东西自己动才是重点。\n\
+8. 不要镜头切换、不要缩放/平移/环绕、不要出现新物体、不要文字、不要画风词。";
 
 /// 把元素级方案拼成**图生视频那句提示词**。
 ///
@@ -1719,14 +1785,24 @@ fn trim_repeated_prefix<'a>(kind: &str, action: &'a str) -> &'a str {
     }
 }
 ///
-/// 为什么由本地拼、而不是直接把 JSON 丢给视频模型:视频模型不认识我们的数据结构,
-/// 它只吃一句自然语言;JSON 塞进去它会当成"要画这些东西"的清单。
+/// 把动效方案变成**发给视频模型的那一句**。
 ///
-/// 最后那句"结尾回到起始画面"是**给接缝用的**:我们要的是循环播放,
-/// 画面在末尾回到开头,接缝才看不清(见 §11.22 的"闭环")。
+/// 主路是 `plan.caption`:视觉模型写好的英文长描述。为什么不再本地拼 ——
+/// 官方 CogVideoX 的 i2v 提示词是"从首帧开始的一段完整画面描述",元素清单拼出来的
+/// 短句没有足够动作语义,实测只会让画面做光影呼吸。
+///
+/// `caption` 为空时才退回元素拼接(老资产 / 模型漏字段),再空就退回通用描述。
 pub fn video_prompt(plan: &MotionPlan) -> String {
     if plan.is_empty() {
         return fallback_motion_prompt().to_string();
+    }
+    let caption = plan.caption.trim();
+    if !caption.is_empty() {
+        return fit_video_caption(caption);
+    }
+    // 新方案:模型给 scene + 英文 elements,本地拼成官方要的英文长描述。
+    if !plan.scene.trim().is_empty() && !plan.elements.is_empty() {
+        return compose_scene_caption(plan);
     }
     let camera = if plan.camera.trim().is_empty() {
         "固定机位"
@@ -1736,45 +1812,377 @@ pub fn video_prompt(plan: &MotionPlan) -> String {
     let elements: Vec<String> = plan
         .elements
         .iter()
-        .map(|MotionElement { kind, area, action }| {
-            // 动作里那个重复的元素名要先削掉,不然会拼出"正中灯光灯光逐个亮灭闪烁"
-            let action = trim_repeated_prefix(kind, action);
-            format!("{area}{kind}{action}")
-        })
+        .map(
+            |MotionElement {
+                 kind, area, action, ..
+             }| {
+                // 动作里那个重复的元素名要先削掉,不然会拼出"正中灯光灯光逐个亮灭闪烁"
+                let action = trim_repeated_prefix(kind, action);
+                format!("{area}{kind}{action}")
+            },
+        )
         .collect();
-    // **先给收尾那句留出位置,再拿剩下的长度去装元素**。
-    //
-    // 原来是"整句拼完再截断",而截断砍掉的是**尾巴** —— 元素一多,被砍掉的那句恰好是
-    // "结尾回到起始画面"。那是循环能不能接上的一半(见 §11.22);少一个元素只是少动一处,
-    // 但闭环指令没了,十秒之后那一记跳就回来了。
-    //
-    // 收尾里那句"亮度、色彩和构图保持稳定"是**量出来的**:头一回出片末帧比首帧整体亮了
-    // 10%(93.3 → 103.2),接缝差 14.2,比画面自己的自然运动还大 —— 全是"逐个点亮"
-    // 这种单向动作攒出来的。动作来回是视觉模型那边教的,这句是给视频模型兜底的。
     let head = format!("镜头{camera}。画面里:");
-    let tail = "。所有动作都是来回的,画面整体亮度、色彩和构图在整段里保持稳定,\
-                不要越来越亮或越来越暗;整体缓慢平稳,结尾回到起始画面,镜头与光线回到原位。";
-    // 再减 1:`truncate` 真切断的时候会补一个"…",那个字也占长度(实测超了 1 个字)
+    let tail = "。动作连续、轻缓,构图、色彩和光线保持稳定,结尾回到起始画面。";
     let budget =
         MAX_VIDEO_PROMPT_CHARS.saturating_sub(head.chars().count() + tail.chars().count() + 1);
     format!("{head}{}{tail}", truncate(&elements.join(";"), budget))
 }
 
-/// 模型没答上来时用的通用运镜。**必须是一句真能用的话**:这条路是兜底,
-/// 用户点完按钮总得有东西动起来,而不是弹一句"模型没接上"。
-/// 公开出去是因为调用方也可能直接用它:没配对话模型时,图生视频那条路照样要能跑。
-pub fn fallback_motion_prompt() -> &'static str {
-    "镜头缓慢推近,画面里的云与雾缓缓流动、水面有细微波纹、光影轻微变化,整体平稳自然的慢镜头"
+/// 把 `scene` + 英文 `elements` 拼成一段完整的英文图生视频描述。
+///
+/// 顺序是固定的:
+/// 1. 场景锚点(8~15 词);
+/// 2. `The camera remains locked off.` —— 壁纸不做运镜;
+/// 3. 每个元素一句 `In the <位置>, <元素> <动作>.`;
+/// 4. 闭环句。
+///
+/// **先给闭环句留位置,再塞元素**:宁可少写一个元素,也不能让 512 字把
+/// `MOTION_LOOP_TAIL` 截掉 —— 那是循环接缝的一半(见 §11.22)。
+fn compose_scene_caption(plan: &MotionPlan) -> String {
+    const TAIL: &str = MOTION_LOOP_TAIL;
+    let scene = clean_scene_anchor(&plan.scene);
+    let mut text = if scene.is_empty() {
+        String::new()
+    } else {
+        format!("{scene}.")
+    };
+    if !text.is_empty() {
+        text.push(' ');
+    }
+    text.push_str("The camera remains locked off.");
+
+    // **前景优先**。视觉模型即使被要求"先前景",仍会把 clouds 写在第一句;
+    // 视频模型对前几句最敏感,天空排前面就会只做云/光的变化。这里按位置强制排序,
+    // 同一层内保留模型给的顺序。
+    let mut elements: Vec<&MotionElement> = plan.elements.iter().collect();
+    elements.sort_by_key(|element| motion_layer_order(element));
+    let mut kept = 0usize;
+    for element in elements {
+        // 旧方案里可能有 `kind: Sunset / sentence: The sun sets...`。
+        // 它会把视频模型带回"太阳落山、整体明暗变化";这种伪运动直接丢掉。
+        if is_light_only_mover(element) {
+            continue;
+        }
+        let kind = element.kind.trim().trim_end_matches(['.', '。']);
+        let action = trim_repeated_prefix(kind, element.action.trim())
+            .trim_end_matches(['.', '。'])
+            .trim();
+        // 优先用模型写的完整句(主谓一致);没有才退回 "位置 + 元素 + 动作"。
+        let sentence = element.sentence.trim().trim_end_matches(['.', '。']).trim();
+        let sentence = if !sentence.is_empty() {
+            format!("{sentence}.")
+        } else if !kind.is_empty() && !action.is_empty() {
+            let area = area_phrase(&element.area);
+            format!("{area}, {kind} {action}.")
+        } else {
+            continue;
+        };
+        let needed = text.chars().count() + 1 + sentence.chars().count() + 1 + TAIL.chars().count();
+        if needed > MAX_VIDEO_PROMPT_CHARS {
+            break;
+        }
+        text.push(' ');
+        text.push_str(&sentence);
+        kept += 1;
+    }
+    if kept == 0 {
+        return fallback_motion_prompt().to_string();
+    }
+    text.push(' ');
+    text.push_str(TAIL);
+    truncate_at_sentence(&strengthen_motion(&text), MAX_VIDEO_PROMPT_CHARS)
 }
 
-/// 把模型那句回复收干净:去围栏、去引号、只留第一行、限长。
+/// 清理视觉模型给的场景锚点。
 ///
-/// 免费模型很爱加一层 ``` 或者"提示词:"这样的前缀;而 `image_url` 那一侧只吃一句话,
-/// 多出来的字会变成视频里莫名其妙的东西,所以宁可在本地削干净。
+/// 免费模型实际返过 `English forest path at dusk` —— 它会把提示词里的
+/// "English scene anchor" 当成正文抄下来;而 `at dusk / at sunset / warm sunlight`
+/// 这类词会把视频模型往"太阳落山、整体明暗变化"上带,正是这次要修的病。
+/// 这里只做确定性的清洗:去 `English` 前缀、去时间/光线短语、压空格、首字母大写。
+fn clean_scene_anchor(raw: &str) -> String {
+    let mut text = raw.trim().trim_matches(['"', '\u{201c}', '\u{201d}']).trim().to_string();
+    if text
+        .get(..7)
+        .is_some_and(|head| head.eq_ignore_ascii_case("english"))
+    {
+        let rest = &text[7..];
+        if rest.is_empty() || rest.chars().next().is_some_and(|ch| ch.is_whitespace()) {
+            text = rest.trim_start().to_string();
+        }
+    }
+
+    for phrase in [
+        " at dusk",
+        " at sunset",
+        " at sunrise",
+        " during sunset",
+        " during sunrise",
+        " in the evening",
+        " in the morning",
+        " at golden hour",
+        " in golden hour",
+        " with warm sunlight",
+        " with sunlight",
+        " in warm light",
+    ] {
+        loop {
+            let lower = text.to_ascii_lowercase();
+            let Some(at) = lower.find(phrase) else { break };
+            text.replace_range(at..at + phrase.len(), "");
+        }
+    }
+
+    let text = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(['.', '。', ',', '，'])
+        .to_string();
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
+/// 把模型爱用的"弱动作"副词换成更明确的词。
+///
+/// 免费视觉模型即使被明确禁止,还是会写 "sway gently" / "bend gracefully"。
+/// 这些词会让视频模型理解成"几乎不动",正是用户看到的"只有光影在变"。
+/// 只换这一小撮高频词,不动句子结构:
+/// gently → steadily, softly → visibly, gracefully → rhythmically,
+/// lazily → slowly, slightly → clearly, subtly → clearly, faintly → clearly。
+fn strengthen_motion(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut word = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphabetic() || ch == '\'' {
+            word.push(ch);
+        } else {
+            out.push_str(&stronger_word(&word));
+            word.clear();
+            out.push(ch);
+        }
+    }
+    out.push_str(&stronger_word(&word));
+
+    // 只把副词换强还不够。`grass bends rhythmically`、`clouds drift slowly` 这种句子
+    // 语法正确但幅度听起来很小,视频模型就真的只给一点点位移。这里把最常见的弱动作
+    // 短语换成能看出幅度的写法(见 §11.31 的对照出片:quality 档已锁住镜头,但草叶
+    // 的局部位移偏小,需要把动词本身写重)。
+    out.replace("bends rhythmically", "bends deeply")
+        .replace("bend rhythmically", "bend deeply")
+        .replace("sway steadily", "sway strongly")
+        .replace("sway slowly", "sway strongly back and forth")
+        .replace("drift slowly", "stream steadily")
+        .replace("drift steadily", "stream steadily")
+        .replace("rustle steadily", "rustle continuously")
+        .replace("flutter steadily", "flutter continuously")
+}
+
+fn stronger_word(word: &str) -> &str {
+    if word.is_empty() {
+        return word;
+    }
+    match word.to_ascii_lowercase().as_str() {
+        "gently" => "steadily",
+        "softly" => "visibly",
+        "gracefully" => "rhythmically",
+        "lazily" => "slowly",
+        "slightly" => "clearly",
+        "subtly" => "clearly",
+        "faintly" => "clearly",
+        _ => word,
+    }
+}
+
+/// 这个元素是不是"光"而不是实体。
+///
+/// 只看 `kind` 的英文词元,避免把 `sunflowers`(向日葵)误判成 `sun`。
+/// `light breeze` 这种形容词也不会被误伤,因为这里看的是元素名。
+fn is_light_only_mover(element: &MotionElement) -> bool {
+    let kind = element.kind.to_ascii_lowercase();
+    kind.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .any(|token| {
+            matches!(
+                token,
+                "sun"
+                    | "sunlight"
+                    | "sunset"
+                    | "sunrise"
+                    | "glow"
+                    | "light"
+                    | "lighting"
+                    | "shadow"
+                    | "shadows"
+                    | "exposure"
+                    | "brightness"
+                    | "color"
+                    | "colour"
+                    | "flare"
+            )
+        })
+}
+
+/// 运动元素所在的画面层次:0 前景 / 1 中景 / 2 天空。
+///
+/// 视觉模型有时给中文九宫格,有时直接给 `foreground / midground / sky`;两种都认。
+/// 认不出来时看元素名(草、蕨、花 vs 云、鸟),再不行就放中景。
+fn motion_layer_order(element: &MotionElement) -> u8 {
+    let area = element.area.trim().to_ascii_lowercase();
+    if matches!(area.as_str(), "左下" | "下中" | "右下")
+        || area.contains("foreground")
+        || area.contains("front")
+        || area.contains("lower")
+    {
+        return 0;
+    }
+    if matches!(area.as_str(), "左上" | "上中" | "右上")
+        || area.contains("sky")
+        || area.contains("upper")
+        || area.contains("background")
+    {
+        return 2;
+    }
+    if matches!(area.as_str(), "左中" | "正中" | "右中" | "全图")
+        || area.contains("midground")
+        || area.contains("middle")
+        || area.contains("center")
+    {
+        return 1;
+    }
+
+    let kind = element.kind.to_ascii_lowercase();
+    if ["grass", "fern", "flower", "bush", "fabric", "hair"]
+        .iter()
+        .any(|word| kind.contains(word))
+    {
+        return 0;
+    }
+    if ["cloud", "bird", "smoke", "sky"]
+        .iter()
+        .any(|word| kind.contains(word))
+    {
+        return 2;
+    }
+    1
+}
+
+/// 九宫格位置 → 英文句首。认不出来的(模型偶尔给英文)就原样用。
+fn area_phrase(area: &str) -> String {
+    match area.trim() {
+        "左上" => "In the upper left".to_string(),
+        "上中" => "Across the upper center".to_string(),
+        "右上" => "In the upper right".to_string(),
+        "左中" => "Along the left side".to_string(),
+        "正中" => "In the center".to_string(),
+        "右中" => "Along the right side".to_string(),
+        "左下" => "In the lower left".to_string(),
+        "下中" => "Across the lower center".to_string(),
+        "右下" => "In the lower right".to_string(),
+        "全图" => "Across the whole frame".to_string(),
+        other if !other.is_empty() => other.to_string(),
+        _ => "In the scene".to_string(),
+    }
+}
+
+/// 视频接口对 `prompt` 的硬上限是 512 字符。Caption 超了不能直接拦腰砍:
+/// 半句英文会让模型把后半截当成新指令。优先在最后一个句号处收口。
+fn truncate_at_sentence(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut acc = String::new();
+    let mut last_end_bytes = 0usize;
+    let mut last_end_chars = 0usize;
+    let mut count = 0usize;
+    for ch in text.chars() {
+        if count >= max {
+            break;
+        }
+        acc.push(ch);
+        count += 1;
+        if matches!(ch, '.' | '!' | '?' | '。' | '！' | '？') {
+            last_end_bytes = acc.len();
+            last_end_chars = count;
+        }
+    }
+    // 至少留一半内容才值得按句子收;否则硬截 + 省略号,免得只剩一个短句。
+    if last_end_chars * 2 >= max {
+        acc.truncate(last_end_bytes);
+    } else {
+        while acc.chars().count() + 1 > max {
+            acc.pop();
+        }
+        acc.push('…');
+    }
+    acc
+}
+
+/// 把视觉模型给的 `caption` 收成一条能直接发的提示词。
+///
+/// 三件事必须兜住:
+/// - 模型爱加 ``` 和引号,直接发过去会变成画面里的怪东西;
+/// - 没有 "camera" 就补一句固定机位 —— 壁纸不需要运镜;
+/// - 没有闭环句就补一句,接缝才不容易被看出来。
+fn fit_video_caption(raw: &str) -> String {
+    let mut body = raw.trim();
+    if let Some(rest) = body.strip_prefix("```json") {
+        body = rest;
+    } else if let Some(rest) = body.strip_prefix("```") {
+        body = rest;
+    }
+    if let Some(rest) = body.strip_suffix("```") {
+        body = rest;
+    }
+    let mut text = body
+        .trim()
+        .trim_matches(['\"', '\u{201c}', '\u{201d}'])
+        .trim()
+        .to_string();
+    let lower = text.to_ascii_lowercase();
+    if !lower.contains("camera") && !text.contains("镜头") {
+        text = format!("The camera remains locked off. {text}");
+    }
+    let lower = text.to_ascii_lowercase();
+    if !lower.contains("full visible cycle") && !text.contains("无缝")
+    {
+        const TAIL: &str = MOTION_LOOP_TAIL;
+        let budget = MAX_VIDEO_PROMPT_CHARS.saturating_sub(TAIL.chars().count() + 1);
+        text = truncate_at_sentence(&text, budget);
+        text.push(' ');
+        text.push_str(TAIL);
+    }
+    truncate_at_sentence(&strengthen_motion(&text), MAX_VIDEO_PROMPT_CHARS)
+}
+
+/// 模型没答上来时用的通用描述。**必须是一段真能用的话**:这条路是兜底,
+/// 用户点完按钮总得有东西动起来,而不是弹一句"模型没接上"。
+///
+/// 旧版是"镜头缓慢推近 + 云/水/光影"的中文短句;现在改成英文长描述,和主路同一个形状。
+/// 用 "Where present" 限定,是怕图里没有水面/烟时模型硬加。
+pub fn fallback_motion_prompt() -> &'static str {
+    "The camera remains locked off on this scene. Where present, thin clouds drift across the sky, tree canopies and leaves sway and rustle, grass and ferns bend and spring back, water surfaces ripple outward, and loose fabric, hair or smoke moves with the air. Each motion completes one full visible cycle and returns to its starting pose; no camera movement, zoom, pan or orbit, and exposure and color stay fixed."
+}
+
+/// 把模型那句回复收干净:去围栏、去引号、把换行接成一段、限长。
+///
+/// 免费模型很爱加一层 ``` 或者"提示词:"这样的前缀;而现在这条路要的是**一整段英文**,
+/// 只取第一行会把 60 词的描述砍成半句。
 fn clean_motion_reply(text: &str) -> String {
-    // 逐行看:跳过围栏那一行、摘掉"提示词:"这类前缀,取**第一行还有内容**的当正文。
-    // 不能只 `find` "不以提示词开头的行" —— 正文和前缀写在同一行是很常见的返法。
-    const PREFIXES: [&str; 6] = ["提示词:", "提示词：", "输出:", "输出：", "Prompt:", "prompt:"];
+    const PREFIXES: [&str; 6] = [
+        "提示词:",
+        "提示词：",
+        "输出:",
+        "输出：",
+        "Prompt:",
+        "prompt:",
+    ];
     let mut picked = String::new();
     for raw in text.lines() {
         let mut line = raw.trim().trim_start_matches(['#', '*', '-']).trim();
@@ -1788,10 +2196,13 @@ fn clean_motion_reply(text: &str) -> String {
             }
         }
         let line = line.trim_matches(['"', '\u{201c}', '\u{201d}']).trim();
-        if !line.is_empty() {
-            picked = line.to_string();
-            break;
+        if line.is_empty() {
+            continue;
         }
+        if !picked.is_empty() {
+            picked.push(' ');
+        }
+        picked.push_str(line);
     }
     truncate(&picked, MAX_MOTION_PROMPT_CHARS)
 }
@@ -2009,10 +2420,11 @@ struct ResponseMessage {
 /// 图生视频的请求体。
 ///
 /// `image_url` 是那张图(base64 内联,见 `image_data_url`),**也可以是两张**:智谱的
-/// `cogvideox-3` 支持"首尾帧"(`image_url: [首帧, 尾帧]`),而我们要的正是它 ——
-/// 首帧和尾帧都给**同一张图**,模型就得把画面绕回起点,循环播放才接得上。
+/// `cogvideox-3` 支持"首尾帧"(`image_url: [首帧, 尾帧]`)。但**产品路径只发单图**:
+/// 首尾同图会把运动压成近乎静帧(§11.31),循环接缝改由播放器淡回第一帧。
 ///
-/// `duration` / `with_audio` 是显式写出来的两个可选参数:
+/// `quality` / `watermark_enabled` / `duration` / `with_audio` 是显式写出来的参数:
+/// - `quality: "quality"` —— 不传时服务商默认 `speed`;壁纸要画面质量,不是抢几十秒;
 /// - `duration: 10` —— 5 秒和 10 秒**同价**(1 元/次),而素材长一倍,头的抖动和尾的漂移都能丢;
 /// - `with_audio: false` —— 壁纸不放声音,带音轨只是白白胖一圈。
 #[derive(Debug, Serialize)]
@@ -2020,6 +2432,11 @@ struct VideoRequest<'a> {
     model: &'a str,
     prompt: &'a str,
     image_url: VideoImage<'a>,
+    /// `quality` 不传时服务商默认 `speed`(速度优先,质量稍低)。动态壁纸要的是运动和细节,
+    /// 不是早几十秒出片 —— 所以显式选 `quality`。
+    quality: &'a str,
+    /// 用户已签去水印免责声明。和生图一样默认关;被拒时 `submit_image` 会退回 `true` 重提。
+    watermark_enabled: bool,
     /// 要出多大的片子(清单里的一档,见 `VIDEO_SIZES`)。**不能空着** —— 服务端自己推的那条对
     /// 某些比例是必死,理由写在 `VIDEO_SIZES` 上。
     size: &'a str,
@@ -2031,12 +2448,16 @@ struct VideoRequest<'a> {
 ///
 /// 用 `untagged` 而不是"永远发数组":单图那条路是**实测跑通的形状**(见
 /// `DEFAULT_VIDEO_MODEL` 的记录),没理由为了新功能去动它。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 #[serde(untagged)]
 enum VideoImage<'a> {
     One(&'a str),
     Pair([&'a str; 2]),
 }
+
+/// 视频输出模式。文档写明默认是 `speed`;动态壁纸要的是画面质量和动作细节,
+/// 显式选 `quality`。这和"1 元/次"同价,只是出片更慢。
+const VIDEO_QUALITY: &str = "quality";
 
 /// 一条片子的时长(秒)。文档里**只支持 5 和 10**,而且两者同价 —— 那就没有理由选短的。
 const VIDEO_DURATION_SECS: u32 = 10;
@@ -2444,6 +2865,22 @@ mod tests {
         }
     }
 
+    /// 看图提示词必须明确排除"光影在动"这类伪运动,并让前景实体排在前面。
+    ///
+    /// 用户报的"生成的动图只是光影变化"就是从这条缝里出来的:模型会挑最安全、最容易
+    /// 描述的光线明暗,而不是草和树叶。规则一旦被删,症状会原样回来。
+    #[test]
+    fn 看图提示词禁止光影伪运动并优先前景() {
+        for forbidden in ["太阳", "夕阳", "光线", "光晕", "阴影", "曝光", "亮度"] {
+            assert!(
+                VISION_SYSTEM_PROMPT.contains(forbidden),
+                "提示词里没有排除「{forbidden}」"
+            );
+        }
+        assert!(VISION_SYSTEM_PROMPT.contains("元素顺序前景优先"));
+        assert!(VISION_SYSTEM_PROMPT.contains("至少 2 个实体"));
+    }
+
     /// 生图响应只认 `data[0].url`,但它真实的形状比这花哨得多,多一层嵌套不能把解析搞崩。
     #[test]
     fn 生图响应能挑出图片地址() {
@@ -2531,9 +2968,27 @@ mod tests {
         // 只有围栏、没有正文时返回空串,由调用方回退到通用运镜
         assert!(clean_motion_reply("```json\n```").is_empty());
         // 太长会截断(`truncate` 会在尾巴上加一个省略号,所以是 max + 1)
-        let long = clean_motion_reply(&"推".repeat(500));
+        let long = clean_motion_reply(&"推".repeat(600));
         assert!(long.ends_with('…'));
         assert!(long.chars().count() <= MAX_MOTION_PROMPT_CHARS + 1);
+    }
+
+    /// 免费模型爱写 "bends gracefully / drift lazily" 这种幅度很小的句子。
+    /// 只换副词不够,要把动作短语本身换强,否则 quality 档会把镜头锁住后几乎不动。
+    #[test]
+    fn 弱动作短语会被换成看得出幅度的写法() {
+        assert_eq!(
+            strengthen_motion("Grass bends gracefully in the wind."),
+            "Grass bends deeply in the wind."
+        );
+        assert_eq!(
+            strengthen_motion("Clouds drift lazily across the sky."),
+            "Clouds stream steadily across the sky."
+        );
+        assert_eq!(
+            strengthen_motion("Leaves sway gently in the breeze."),
+            "Leaves sway strongly in the breeze."
+        );
     }
 
     /// 视觉模型那份 JSON → 元素级提示词。
@@ -2549,13 +3004,17 @@ mod tests {
                     kind: "灯光".to_string(),
                     area: "左中".to_string(),
                     action: "窗口逐个亮灭闪烁".to_string(),
+                    sentence: String::new(),
                 },
                 MotionElement {
                     kind: "车流".to_string(),
                     area: "下中".to_string(),
                     action: "沿道路从右往左流动".to_string(),
+                    sentence: String::new(),
                 },
             ],
+            caption: String::new(),
+            scene: String::new(),
         };
         let prompt = video_prompt(&plan);
         assert!(prompt.contains("镜头固定机位"), "{prompt}");
@@ -2580,8 +3039,11 @@ mod tests {
                     kind: format!("元素{index}"),
                     area: "正中".to_string(),
                     action: "缓慢地来回摆动".repeat(20),
+                    sentence: String::new(),
                 })
                 .collect(),
+            caption: String::new(),
+            scene: String::new(),
         };
         let prompt = video_prompt(&plan);
         assert!(
@@ -2590,19 +3052,305 @@ mod tests {
             prompt.chars().count()
         );
         assert!(prompt.contains("结尾回到起始画面"), "{prompt}");
-        assert!(prompt.ends_with("镜头与光线回到原位。"), "{prompt}");
+        assert!(prompt.ends_with("结尾回到起始画面。"), "{prompt}");
     }
 
     /// 方案是空的(看图失败 / 没配视觉模型)→ 必须退回那句通用运镜,而不是发一句空提示词。
     #[test]
     fn 空方案退回通用运镜() {
-        assert_eq!(video_prompt(&MotionPlan::default()), fallback_motion_prompt());
+        assert_eq!(
+            video_prompt(&MotionPlan::default()),
+            fallback_motion_prompt()
+        );
         // 只有镜头、没有元素也算空:视频模型需要的是"哪儿在动",不是"机位怎么走"
         let camera_only = MotionPlan {
             camera: "缓慢推近".to_string(),
             elements: Vec::new(),
+            caption: String::new(),
+            scene: String::new(),
         };
         assert_eq!(video_prompt(&camera_only), fallback_motion_prompt());
+    }
+
+    /// 新方案:scene + 英文 elements 在本地拼成官方要的英文长描述。
+    ///
+    /// 钉住三件事:相机在最前面、每个元素的动作都进得去、闭环句没被挤掉。
+    #[test]
+    fn scene_和元素拼成英文长描述() {
+        let plan = MotionPlan {
+            camera: "固定机位".to_string(),
+            scene: "A quiet forest path at dusk with warm sunlight through tall trees".to_string(),
+            elements: vec![
+                MotionElement {
+                    kind: "tree leaves".to_string(),
+                    area: "左上".to_string(),
+                    action: "sway back and forth in a light breeze".to_string(),
+                    sentence: String::new(),
+                },
+                MotionElement {
+                    kind: "grass".to_string(),
+                    area: "右下".to_string(),
+                    action: "rustle and bend along the trail".to_string(),
+                    sentence: String::new(),
+                },
+                MotionElement {
+                    kind: "thin clouds".to_string(),
+                    area: "右上".to_string(),
+                    action: "drift slowly to the left".to_string(),
+                    sentence: String::new(),
+                },
+            ],
+            caption: String::new(),
+        };
+        let prompt = video_prompt(&plan);
+        assert!(
+            prompt.starts_with("A quiet forest path through tall trees"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("The camera remains locked off."),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("In the upper left, tree leaves sway back and forth"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("In the lower right, grass rustle and bend"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("In the upper right, thin clouds stream steadily"),
+            "{prompt}"
+        );
+        assert!(prompt.ends_with("no camera movement, zoom, pan or orbit, and exposure and color stay fixed."), "{prompt}");
+        assert!(
+            prompt.chars().count() <= MAX_VIDEO_PROMPT_CHARS,
+            "{}",
+            prompt.chars().count()
+        );
+    }
+
+    /// 视频模型对前几句最敏感。视觉模型常把 clouds 写在第一句,这里必须
+    /// 在本地改成前景草/蕨先出现,否则出片又会先动天空和光影。
+    #[test]
+    fn 前景元素排在天空前面() {
+        let plan = MotionPlan {
+            camera: "固定机位".to_string(),
+            scene: "A forest path".to_string(),
+            elements: vec![
+                MotionElement {
+                    kind: "clouds".to_string(),
+                    area: "sky".to_string(),
+                    action: "drift".to_string(),
+                    sentence: "Clouds drift across the sky.".to_string(),
+                },
+                MotionElement {
+                    kind: "tree leaves".to_string(),
+                    area: "midground".to_string(),
+                    action: "sway".to_string(),
+                    sentence: "Tree leaves sway back and forth.".to_string(),
+                },
+                MotionElement {
+                    kind: "grass".to_string(),
+                    area: "foreground".to_string(),
+                    action: "bend".to_string(),
+                    sentence: "Grass bends in visible waves.".to_string(),
+                },
+            ],
+            caption: String::new(),
+        };
+        let prompt = video_prompt(&plan);
+        let grass = prompt.find("Grass bends").expect("grass should be present");
+        let leaves = prompt.find("Tree leaves sway").expect("leaves should be present");
+        let clouds = prompt.find("Clouds drift").expect("clouds should be present");
+        assert!(grass < leaves && leaves < clouds, "{prompt}");
+        assert!(prompt.ends_with("no camera movement, zoom, pan or orbit, and exposure and color stay fixed."), "{prompt}");
+    }
+
+    /// 旧方案里的 `Sunset / The sun sets...` 不能再发给视频模型。
+    /// 实体保留,光影片段丢掉;全丢光时退回那条写实体运动的通用提示词。
+    #[test]
+    fn 光影片段会被丢掉() {
+        let plan = MotionPlan {
+            camera: "固定机位".to_string(),
+            scene: "A forest path".to_string(),
+            elements: vec![
+                MotionElement {
+                    kind: "Sunset".to_string(),
+                    area: "sky".to_string(),
+                    action: "rise".to_string(),
+                    sentence: "The sun sets on the horizon.".to_string(),
+                },
+                MotionElement {
+                    kind: "grass".to_string(),
+                    area: "foreground".to_string(),
+                    action: "bend".to_string(),
+                    sentence: "Grass bends back and forth in the wind.".to_string(),
+                },
+            ],
+            caption: String::new(),
+        };
+        let prompt = video_prompt(&plan);
+        assert!(!prompt.contains("sun sets"), "{prompt}");
+        assert!(prompt.contains("Grass bends back and forth"), "{prompt}");
+
+        let light_only = MotionPlan {
+            camera: "固定机位".to_string(),
+            scene: "A room".to_string(),
+            elements: vec![MotionElement {
+                kind: "Sunlight".to_string(),
+                area: "全图".to_string(),
+                action: "fade".to_string(),
+                sentence: "Sunlight fades across the room.".to_string(),
+            }],
+            caption: String::new(),
+        };
+        assert_eq!(video_prompt(&light_only), fallback_motion_prompt());
+    }
+
+    /// 免费模型会把 "English scene anchor" 抄进正文,也会带 `at dusk` 这类时间词。
+    /// 本地必须清掉,否则视频模型又会去动太阳和整体光线。
+    #[test]
+    fn 场景锚点会清掉英文前缀和光线时间词() {
+        assert_eq!(clean_scene_anchor("English forest path at dusk"), "Forest path");
+        assert_eq!(
+            clean_scene_anchor("a quiet lake at sunset with warm sunlight"),
+            "A quiet lake"
+        );
+        assert_eq!(clean_scene_anchor("森林小径"), "森林小径");
+    }
+
+    /// 元素带完整英文句时优先用完整句(主谓一致),不再本地拼 "位置 + 元素 + 动作"。
+    #[test]
+    fn 完整句优先于本地拼装() {
+        let plan = MotionPlan {
+            camera: "固定机位".to_string(),
+            scene: "A quiet forest path at sunset with warm light through tall trees".to_string(),
+            elements: vec![MotionElement {
+                kind: "thin clouds".to_string(),
+                area: "右上".to_string(),
+                action: "drift slowly left".to_string(),
+                sentence: "Thin clouds drift slowly to the left across the orange sky.".to_string(),
+            }],
+            caption: String::new(),
+        };
+        let prompt = video_prompt(&plan);
+        assert!(
+            prompt.contains("Thin clouds stream steadily to the left"),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("In the upper right, thin clouds"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("The camera remains locked off."),
+            "{prompt}"
+        );
+        assert!(prompt.ends_with("no camera movement, zoom, pan or orbit, and exposure and color stay fixed."), "{prompt}");
+    }
+
+    /// caption 是主路:有它就直接发,不再退回"镜头 + 元素"的短清单。
+    #[test]
+    fn caption_优先于元素拼接() {
+        let plan = MotionPlan {
+            camera: "缓慢推近".to_string(),
+            elements: vec![MotionElement {
+                kind: "灯光".to_string(),
+                area: "正中".to_string(),
+                action: "闪烁".to_string(),
+                sentence: String::new(),
+            }],
+            caption: "A forest path at dusk. The camera remains locked off. Ferns sway back and forth in a light breeze, while thin clouds drift slowly across the sky. Each motion completes one full visible cycle and returns to its starting pose; no camera movement, zoom, pan or orbit, and exposure and color stay fixed.".to_string(),
+            scene: String::new(),
+        };
+        let prompt = video_prompt(&plan);
+        assert!(prompt.starts_with("A forest path at dusk."), "{prompt}");
+        assert!(!prompt.contains("镜头缓慢推近"), "{prompt}");
+        assert!(prompt.contains("Ferns sway back and forth"), "{prompt}");
+        assert!(prompt.ends_with("no camera movement, zoom, pan or orbit, and exposure and color stay fixed."), "{prompt}");
+    }
+
+    /// caption 里没提相机 → 本地补一句固定机位;没提闭环 → 补一句闭环。
+    #[test]
+    fn caption_缺相机和闭环会补齐() {
+        let plan = MotionPlan {
+            camera: String::new(),
+            elements: Vec::new(),
+            caption: "Leaves rustle in the breeze and grass sways along the path.".to_string(),
+            scene: String::new(),
+        };
+        let prompt = video_prompt(&plan);
+        assert!(
+            prompt.starts_with("The camera remains locked off."),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Leaves rustle"), "{prompt}");
+        assert!(prompt.ends_with("no camera movement, zoom, pan or orbit, and exposure and color stay fixed."), "{prompt}");
+        assert!(prompt.chars().count() <= MAX_VIDEO_PROMPT_CHARS, "{prompt}");
+    }
+
+    /// caption 超过 512 字符 → 按句子边界收口,不能拦腰砍半句。
+    #[test]
+    fn caption_超长按句子收口() {
+        let caption = "A quiet forest path at dusk. The camera remains locked off. Ferns sway back and forth in a light breeze. Thin clouds drift slowly across the sky. Grass blades bend and spring back along both edges of the trail. Leaves flutter and rustle in the canopy above. Warm light shifts across the moss as the branches move. Distant branches bob gently against the orange horizon. A few small birds glide past above the treetops. Dust motes float through the low sunbeams. Each motion completes one full visible cycle and returns to its starting pose; no camera movement, zoom, pan or orbit, and exposure and color stay fixed. Extra sentence that should be cut off cleanly.";
+        let plan = MotionPlan {
+            camera: String::new(),
+            elements: Vec::new(),
+            caption: caption.to_string(),
+            scene: String::new(),
+        };
+        let prompt = video_prompt(&plan);
+        assert!(
+            prompt.chars().count() <= MAX_VIDEO_PROMPT_CHARS,
+            "{}",
+            prompt.chars().count()
+        );
+        assert!(prompt.ends_with('.'), "{prompt}");
+        assert!(!prompt.contains("Extra sentence"), "{prompt}");
+    }
+
+    /// 通用兜底也不能只剩光影:必须写清树叶/草/水面这些实体怎么动。
+    #[test]
+    fn 通用兜底写的是实体运动() {
+        let prompt = fallback_motion_prompt();
+        assert!(prompt.contains("camera remains locked off"), "{prompt}");
+        assert!(prompt.contains("leaves sway"), "{prompt}");
+        assert!(prompt.contains("ripple outward"), "{prompt}");
+        assert!(
+            prompt.chars().count() <= MAX_VIDEO_PROMPT_CHARS,
+            "{}",
+            prompt.chars().count()
+        );
+    }
+
+    /// 只有 caption 也算"有方案";老资产只有 elements 时 `has_caption` 必须是 false,
+    /// 这样 `animate_photo` 才会重新看图,而不是复用旧的两元素方案。
+    #[test]
+    fn 有无_caption_决定能不能复用旧方案() {
+        let legacy = MotionPlan {
+            camera: "固定机位".to_string(),
+            elements: vec![MotionElement {
+                kind: "阳光".to_string(),
+                area: "全图".to_string(),
+                action: "一明一暗".to_string(),
+                sentence: String::new(),
+            }],
+            caption: String::new(),
+            scene: String::new(),
+        };
+        assert!(!legacy.is_empty());
+        assert!(!legacy.has_caption());
+
+        let fresh = MotionPlan {
+            camera: String::new(),
+            elements: Vec::new(),
+            caption: "Leaves sway in the breeze.".to_string(),
+            scene: String::new(),
+        };
+        assert!(!fresh.is_empty());
+        assert!(fresh.has_caption());
     }
 
     /// 动作里又写了一遍元素名时不重复 —— 提示词里交代过"别重复",但模型不一定听。
@@ -2616,14 +3364,18 @@ mod tests {
                     kind: "灯光".to_string(),
                     area: "正中".to_string(),
                     action: "灯光逐个亮灭闪烁".to_string(),
+                    sentence: String::new(),
                 },
                 // 更隐蔽的那种:重合的只有"云"一个字
                 MotionElement {
                     kind: "云朵".to_string(),
                     area: "左上".to_string(),
                     action: "云向右缓慢飘移".to_string(),
+                    sentence: String::new(),
                 },
             ],
+            caption: String::new(),
+            scene: String::new(),
         };
         let prompt = video_prompt(&plan);
         assert!(prompt.contains("正中灯光逐个亮灭闪烁"), "{prompt}");
@@ -2642,23 +3394,32 @@ mod tests {
                     kind: " 云 ".to_string(),
                     area: "上中".to_string(),
                     action: " 向右缓慢飘移 ".to_string(),
+                    sentence: String::new(),
                 },
                 // 没有 action 的:丢掉
                 MotionElement {
                     kind: "车流".to_string(),
                     area: "下中".to_string(),
                     action: "   ".to_string(),
+                    sentence: String::new(),
                 },
                 // 没有 kind 的:丢掉
                 MotionElement {
                     kind: String::new(),
                     area: "左上".to_string(),
                     action: "闪烁".to_string(),
+                    sentence: String::new(),
                 },
             ],
+            caption: "  A forest path at dusk. The camera remains locked off.  ".to_string(),
+            scene: String::new(),
         };
         plan.normalize();
         assert_eq!(plan.camera, "固定机位");
+        assert_eq!(
+            plan.caption,
+            "A forest path at dusk. The camera remains locked off."
+        );
         assert_eq!(plan.elements.len(), 1);
         assert_eq!(plan.elements[0].kind, "云");
         assert_eq!(plan.elements[0].action, "向右缓慢飘移");
@@ -2670,6 +3431,7 @@ mod tests {
                 kind: format!("元素{index}"),
                 area: "正中".to_string(),
                 action: "动".to_string(),
+                sentence: String::new(),
             });
         }
         many.normalize();
@@ -2685,6 +3447,8 @@ mod tests {
             model: "cogvideox-3",
             prompt: "镜头固定",
             image_url: VideoImage::One("data:image/png;base64,AAA"),
+            quality: VIDEO_QUALITY,
+            watermark_enabled: false,
             size: "1920x1080",
             duration: VIDEO_DURATION_SECS,
             with_audio: false,
@@ -2696,11 +3460,17 @@ mod tests {
         assert_eq!(one["size"], "1920x1080");
         assert_eq!(one["duration"], 10);
         assert_eq!(one["with_audio"], false);
+        // `quality` 不传就是 `speed`;动态壁纸必须显式选质量优先。
+        assert_eq!(one["quality"], "quality");
+        // 用户已签去水印声明;默认无水印,被拒才由 `submit_image` 退回带水印。
+        assert_eq!(one["watermark_enabled"], false);
 
         let pair = serde_json::to_value(&VideoRequest {
             model: "cogvideox-3",
             prompt: "镜头固定",
             image_url: VideoImage::Pair(["data:image/png;base64,AAA", "data:image/png;base64,AAA"]),
+            quality: VIDEO_QUALITY,
+            watermark_enabled: false,
             size: "1920x1080",
             duration: VIDEO_DURATION_SECS,
             with_audio: false,
