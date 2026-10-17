@@ -92,6 +92,52 @@ impl Bitmap {
         }
     }
 
+    /// 按 `target_width : target_height` 的**精确比例**居中裁一刀:只丢边,不缩放、不重采样。
+    ///
+    /// 为什么非得"精确":图生视频的服务商拿"短边压到 1080 × 图片比例、向下取整"去推成片,
+    /// 比例差一个像素就可能把长边推回奇数,而奇数它编不出来、还一个字都不解释(见
+    /// `mcwp_ai::VIDEO_SIZES`)。所以这里先把目标比例约到最简再取**整数倍** ——
+    /// `16:9` 只会裁出 `16k × 9k`,推回去恰好是 1920(偶数)。
+    ///
+    /// 裁不出一个整数倍(图小得离谱)时原样返回:宁可让它按老样子失败,也不要凭空造出一张
+    /// 1×1 的图去提交。
+    pub fn crop_to_ratio(&self, target_width: u32, target_height: u32) -> Self {
+        let (width, height) = ratio_box(self.width, self.height, target_width, target_height);
+        if width == self.width && height == self.height {
+            return self.clone();
+        }
+        let x = (self.width - width) / 2;
+        let y = (self.height - height) / 2;
+        let row_bytes = (width * 4) as usize;
+        let mut rgba = Vec::with_capacity(row_bytes * height as usize);
+        for row in y..y + height {
+            let start = ((row * self.width + x) * 4) as usize;
+            rgba.extend_from_slice(&self.rgba[start..start + row_bytes]);
+        }
+        Self {
+            width,
+            height,
+            rgba,
+        }
+    }
+
+    /// 编成 JPEG(质量 0-100)。
+    ///
+    /// **只给"提交前必须改尺寸"那一段用**(见 `crop_to_ratio`):图已经被裁过、没有"原始
+    /// 字节"可留了,只能重编一次。用 JPEG 而不是 PNG,是因为它要内联进 base64 过网络 ——
+    /// 同样一张 1920×1080,PNG 能到几 MB,JPEG 只要几百 KB。
+    pub fn encode_jpeg(&self, quality: u8) -> Result<Vec<u8>> {
+        let rgba = image::RgbaImage::from_raw(self.width, self.height, self.rgba.clone())
+            .ok_or_else(|| anyhow::anyhow!("像素数和尺寸对不上:{}×{}", self.width, self.height))?;
+        // JPEG 没有 alpha 通道,先落到 RGB
+        let rgb = image::DynamicImage::ImageRgba8(rgba).to_rgb8();
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
+            .encode_image(&rgb)
+            .context("编 JPEG 失败")?;
+        Ok(out)
+    }
+
     /// 编成 PNG 字节。
     ///
     /// **只给缩略图用**:原图永远直接落盘、绝不重编码(重压一次只会让画面更糊,还白花一次
@@ -125,6 +171,32 @@ pub fn fit(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u3
     let scaled_width = ((width as f64 * scale).round() as u32).max(1);
     let scaled_height = ((height as f64 * scale).round() as u32).max(1);
     (scaled_width, scaled_height)
+}
+
+/// 落在 `width × height` 里、比例**精确等于** `target_width : target_height` 的最大居中框。
+///
+/// "精确"的代价是只能取整数倍(`16:9` → `16k × 9k`),换来的是推回去的长边一定落在整数上
+/// —— 见 `crop_to_ratio`。
+pub fn ratio_box(width: u32, height: u32, target_width: u32, target_height: u32) -> (u32, u32) {
+    if width == 0 || height == 0 || target_width == 0 || target_height == 0 {
+        return (width, height);
+    }
+    let divisor = gcd(target_width, target_height).max(1);
+    let (unit_width, unit_height) = (target_width / divisor, target_height / divisor);
+    let k = (width / unit_width).min(height / unit_height);
+    if k == 0 {
+        return (width, height);
+    }
+    (unit_width * k, unit_height * k)
+}
+
+fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let next = a % b;
+        a = b;
+        b = next;
+    }
+    a
 }
 
 #[cfg(test)]
@@ -164,6 +236,37 @@ mod tests {
         // 已经比限制小的图原样返回,不能放大
         let tiny = bitmap.thumbnail(4000, 4000);
         assert_eq!((tiny.width, tiny.height), (1920, 1080));
+    }
+
+    /// 裁出来的框必须是**精确**比例:服务商是拿它去推长边的,差一个像素就可能推回奇数。
+    #[test]
+    fn 按比例裁完是精确比例且只丢边() {
+        let bitmap = Bitmap::decode(&solid_png(1920, 1088, [120, 90, 60])).unwrap();
+        let cropped = bitmap.crop_to_ratio(1920, 1080);
+        assert_eq!((cropped.width, cropped.height), (1920, 1080));
+        assert_eq!(cropped.rgba.len(), 1920 * 1080 * 4);
+        // 竖屏:16:9 换成 9:16
+        let portrait = Bitmap::decode(&solid_png(1088, 1920, [10, 20, 30])).unwrap();
+        let cropped = portrait.crop_to_ratio(1080, 1920);
+        assert_eq!((cropped.width, cropped.height), (1080, 1920));
+        // 比例对不上的时候取"整数倍":1808×1136 裁到 16:9 是 1808×1017(= 113 × 16 / 9)
+        let odd = Bitmap::decode(&solid_png(1808, 1136, [1, 2, 3])).unwrap();
+        let cropped = odd.crop_to_ratio(1920, 1080);
+        assert_eq!((cropped.width, cropped.height), (1808, 1017));
+        assert_eq!(cropped.width as u64 * 1080, cropped.height as u64 * 1920);
+        // 比例已经对了就原样返回(不白搬一遍像素)
+        let same = bitmap.crop_to_ratio(1920, 1088);
+        assert_eq!((same.width, same.height), (1920, 1088));
+    }
+
+    /// 编出来的字节得能被当成 JPEG(服务商只认 PNG / JPEG,见 `image_data_url`)。
+    #[test]
+    fn 裁完能编成_jpeg() {
+        let bitmap = Bitmap::decode(&solid_png(64, 36, [200, 30, 40])).unwrap();
+        let bytes = bitmap.encode_jpeg(92).expect("该能编");
+        assert_eq!(&bytes[0..3], &[0xFF, 0xD8, 0xFF]);
+        let back = Bitmap::decode(&bytes).expect("自己编的自己得解得开");
+        assert_eq!((back.width, back.height), (64, 36));
     }
 
     #[test]

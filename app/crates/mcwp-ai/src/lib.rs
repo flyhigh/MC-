@@ -138,6 +138,18 @@ const VIDEO_WAIT_TIMEOUT: Duration = Duration::from_secs(900);
 /// 动效提示词最长多少字。图生视频那句**只描述"怎么动"**,不需要长;太长反而会被当成分镜。
 const MAX_MOTION_PROMPT_CHARS: usize = 200;
 
+/// 提交被"服务商在忙"挡回来时的退避(秒)。
+///
+/// 2026-10-17 实测,忙的时候提交直接回 `429`:
+/// `{"error":{"code":"1305","message":"该模型当前访问量过大,请您稍后再试"}}`。
+/// **收到 429 说明这一单根本没被受理、也没计费**,所以等一等再交是安全的;
+/// 而"接下了、跑十分钟再 FAIL"那种**绝对不能重提**(钱已经花了),见 `wait_and_download`。
+const SUBMIT_BUSY_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(45),
+];
+
 /// 图生视频接口对 `prompt` 的硬上限:512 个字符(智谱 `videos/generations` 的文档写的)。
 ///
 /// 和上面那个 200 是**两回事**:200 是"我们想要的克制"(一句运镜就够),
@@ -811,33 +823,57 @@ impl Videos {
             duration: VIDEO_DURATION_SECS,
             with_audio: false,
         })?;
-        let mut response = self
-            .agent
-            .post(&format!("{}/videos/generations", self.root()))
-            .header("Content-Type", "application/json")
-            .header("Authorization", &format!("Bearer {}", self.cfg.api_key))
-            .send(body.as_str())
-            .map_err(|err| anyhow!("提交图生视频失败:{err}"))?;
-        let status = response.status();
-        let raw = response
-            .body_mut()
-            .read_to_string()
-            .context("读图生视频响应失败")?;
-        if !status.is_success() {
-            return Err(anyhow!(
-                "图生视频接口返回 {}:{}",
-                status.as_u16(),
-                truncate(&raw, 300)
-            ));
+        let url = format!("{}/videos/generations", self.root());
+        // 忙的时候(429)退避重提:这一单没被受理、不计费,所以重提**不亏钱**;
+        // 换成"接下了再 FAIL"那种就不能这么干(见 `SUBMIT_BUSY_BACKOFF`)。
+        let mut busy = 0;
+        loop {
+            let mut response = self
+                .agent
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("Authorization", &format!("Bearer {}", self.cfg.api_key))
+                .send(body.as_str())
+                .map_err(|err| anyhow!("提交图生视频失败:{err}"))?;
+            let status = response.status();
+            let raw = response
+                .body_mut()
+                .read_to_string()
+                .context("读图生视频响应失败")?;
+            if !status.is_success() {
+                if status.as_u16() == 429 {
+                    if let Some(wait) = SUBMIT_BUSY_BACKOFF.get(busy) {
+                        busy += 1;
+                        tracing::warn!(
+                            "服务商在忙(429:{}) —— {} 秒后重提第 {busy} 次(这单没受理、不计费)",
+                            truncate(&raw, 120),
+                            wait.as_secs()
+                        );
+                        std::thread::sleep(*wait);
+                        continue;
+                    }
+                    return Err(anyhow!(
+                        "服务商现在太忙,连提了 {} 次都被挡回来(429):{}。过一会儿再点就行 —— \
+                         这一单没被受理,不花钱",
+                        busy + 1,
+                        truncate(&raw, 160)
+                    ));
+                }
+                return Err(anyhow!(
+                    "图生视频接口返回 {}:{}",
+                    status.as_u16(),
+                    truncate(&raw, 300)
+                ));
+            }
+            let task: VideoTask = serde_json::from_str(&raw)
+                .with_context(|| format!("图生视频响应里没有任务号:{}", truncate(&raw, 200)))?;
+            if task.id.trim().is_empty() {
+                return Err(anyhow!("图生视频接口没给任务号:{}", truncate(&raw, 200)));
+            }
+            // 尺寸写进日志:出片尺寸和这里报的不是一回事时(服务商可能自己改),这一行是唯一线索
+            tracing::info!("图生视频任务已提交:{}(要 {size})", task.id);
+            return Ok(task.id);
         }
-        let task: VideoTask = serde_json::from_str(&raw)
-            .with_context(|| format!("图生视频响应里没有任务号:{}", truncate(&raw, 200)))?;
-        if task.id.trim().is_empty() {
-            return Err(anyhow!("图生视频接口没给任务号:{}", truncate(&raw, 200)));
-        }
-        // 尺寸写进日志:出片尺寸和这里报的不是一回事时(服务商可能自己改),这一行是唯一线索
-        tracing::info!("图生视频任务已提交:{}(要 {size})", task.id);
-        Ok(task.id)
     }
 
     /// 问一次任务跑到哪了(见 `Videos` 的说明:判成功看 body,不看 HTTP 码)。
@@ -881,7 +917,15 @@ impl Videos {
                         .unwrap_or_default(),
                 })
             }
-            "FAIL" => Ok(VideoProgress::Failed(truncate(&raw, 200))),
+            "FAIL" => {
+                // **全文**打出来。服务商在 FAIL 的时候一个字都不解释(只有个空 message),
+                // 而 200 字的截断只够发一句给用户看的提示、不够定位问题 —— 2026-10-16 22:19
+                // 那次失败被截在 `{"choices":[{"finish_reason":"stop",...` 就没了,查了三轮
+                // 都没看见全文。这一行是"免费的复盘入口":任务号在手,`--video-fetch` 能反复
+                // 问同一个任务,所以现场必须留在日志里。
+                tracing::warn!("图生视频 FAIL(任务 {id})完整正文:{}", raw.trim());
+                Ok(VideoProgress::Failed(truncate(&raw, 200)))
+            }
             // PROCESSING 是实测见到的;别的状态一律当"还在跑"—— 宁可多等一轮,
             // 也不要把一个未知状态当成失败把任务扔掉(它可能已经把额度花了)。
             other => {
@@ -976,11 +1020,19 @@ impl Videos {
                     });
                 }
                 VideoProgress::Failed(reason) => {
-                    // 把任务号写进报错:实测(2026-10-16)`task_status: FAIL` 的正文里
+                    // 把任务号写进报错:实测(2026-10-16/17)`task_status: FAIL` 的正文里
                     // **一个字的解释都没有**(只有一个空 message),想知道为什么挂、或者去要回
                     // 那 1 元,手里只有这个号。原样贴的 `reason` 留在后面当"现场"。
+                    //
+                    // "等了多久"必须一起写:2026-10-17 那几次是**熬了 10 分钟**才 FAIL,而成功
+                    // 那次只用了 10.4 秒。等很久才失败基本就是服务商那边排队/过载(同一时段拿
+                    // 另一个视频模型探,提交直接被 429 挡回来:code 1305「访问量过大」),
+                    // 不是请求体写错了 —— 报错里得让用户能分辨这一点。
+                    let waited = started.elapsed().as_secs();
                     return Err(anyhow!(
-                        "服务商说这条视频没生成出来(任务 {id},他们没给原因):{reason}"
+                        "服务商说这条视频没生成出来(任务 {id},等了 {waited} 秒,他们没给原因):{reason}\
+                         —— 拖这么久才 FAIL 多半是他们那边排队/过载。过一会儿用 \
+                         `--video-fetch {id} <库 id>` 免费取回,**别重提**(重提要再花一次钱)"
                     ));
                 }
             }
@@ -1989,26 +2041,30 @@ enum VideoImage<'a> {
 /// 一条片子的时长(秒)。文档里**只支持 5 和 10**,而且两者同价 —— 那就没有理由选短的。
 const VIDEO_DURATION_SECS: u32 = 10;
 
-/// 图生视频接口**认的那几档尺寸** —— 这是服务商给的清单,不是我们算出来的。
+/// 图生视频接口**认的那几档尺寸** —— 服务商给的清单(接口文档里就是这七个枚举),不是算出来的。
 ///
-/// 为什么必须**显式**报一档,不能空着让服务端自己推:
+/// 它现在有两个用处:
+/// 1. 报给接口的 `size`(不在清单里的值会被拒);
+/// 2. 需要给条件图换比例时,从这里挑一档(`video_image_fix`)。
 ///
-/// 2026-10-16 实测,两张 `1920×1088` 的图(前后相隔一小时、内容毫不相干:一张二次元少女、
-/// 一张森林小径)提交之后都是 `task_status: FAIL`,而正文只是一个**空的 assistant 消息**:
-/// `{"choices":[{"finish_reason":"stop","index":0,"message":{"role":"assistant"}}],...}` ——
-/// 服务商一个字都不解释。同一天 `1808×1136` 的图出片正常,结果 `1718×1080`,正好是
-/// "短边压到 1080、长边按原图比例推"那条默认路。
+/// **2026-10-17 更正:上一轮把病因认错了,记在这里免得再走一遍。**
 ///
-/// 差别就在那条推出来的长边上,而且**服务商是向下取整的**(这不是猜的:`1080×1808/1136`
-/// 是 1718.87,它给的成片就是 1718):
+/// 现象是真的:两张 `1920×1088` 的图(二次元少女 / 森林小径)提交后都是 `task_status: FAIL`,
+/// 正文只有一个**空的 assistant 消息**;而同一天 `1808×1136` 的图出片正常、成片 `1718×1080`
+/// —— 正好是"短边压 1080、长边按原图比例、**向下取整**"这条默认路推出来的数
+/// (`1080 × 1808/1136 = 1718.87 → 1718`),而 `1920×1088` 会推成 `1905`(奇数)。
+/// 据此推断"奇数长边编不出来 → FAIL",并先后改了两版:显式报 `size`,再把图裁成 16:9。
 ///
-/// | 原图 | 推出来的长边 | 结果 |
-/// | --- | --- | --- |
-/// | 1808×1136 | 1718.87 → **1718** | 出片(偶数,编得出来) |
-/// | 1920×1088 | 1905.88 → **1905** | FAIL(**奇数**,H.264 编不出奇数宽度) |
+/// 两版都没能救活那张图:**裁成 `1920×1080` 之后照样 FAIL**,而且是**熬了 10 分钟**才失败
+/// (成功那次只用 10.4 秒)。同一时段拿另一个视频模型探,提交直接被
+/// `429 {"error":{"code":"1305","message":"该模型当前访问量过大，请您稍后再试"}}` 挡回来。
+/// 所以现在的结论是:**那几次 FAIL 是服务商侧的排队/过载**,和请求体无关。
 ///
-/// 也就是说:`size` 空着这条路对**某些比例就是必死**,而且死得没有任何提示。报一档清单里的
-/// 尺寸既绕开这个坑,又正好对上"屏幕多大就要多大"(见 `video_size_for`)。
+/// 那这两条改动为什么还留着:
+/// - 显式报一档 `size`,比留空让服务端自己推**可控**(至少出片尺寸是我们要的那一档);
+/// - "推出来是奇数就裁一刀"是**便宜的保险**:H.264 的宽高确实都得是偶数,而裁一刀只丢几行像素,
+///   比值本来就安全的图一分钱不花(原样发、不重编码)。
+/// 但**别再把它们当成病根** —— 病根在对面。
 const VIDEO_SIZES: [(u32, u32); 7] = [
     (1280, 720),
     (720, 1280),
@@ -2061,6 +2117,45 @@ pub fn video_size_for(screen: (u32, u32)) -> (u32, u32) {
 /// 清单里的一档 → 报给接口的那个字符串(`"1920x1080"`,小写 x,没有空格)。
 fn size_field(size: (u32, u32)) -> String {
     format!("{}x{}", size.0, size.1)
+}
+/// 服务商**自己**会推出来的尺寸:短边压到 1080,长边按图片比例走,而且**向下取整**。
+///
+/// 这个函数是 `VIDEO_SIZES` 上那段账的"计算器",也是 `video_image_fix` 的判据:
+/// 2026-10-16 连挂三次的 `1920×1088` 推出来就是 `(1905, 1080)` —— 长边奇数,编不出来。
+///
+/// 别把它当成"我们想要的尺寸":我们要的那一档在 `video_size_for` 里。
+pub fn derived_video_size(image: (u32, u32)) -> (u32, u32) {
+    let (width, height) = (image.0.max(1), image.1.max(1));
+    // 短边贴 1080、长边按比例;整数除法就是向下取整(和实测的 1718 / 1905 对得上)
+    let long = |short: u32, long: u32| -> u32 {
+        (1080u64 * long as u64 / short as u64).min(u32::MAX as u64) as u32
+    };
+    if width >= height {
+        (long(height, width), 1080)
+    } else {
+        (1080, long(width, height))
+    }
+}
+
+/// 提交前这张图**要不要先裁一刀**:要就返回"裁成哪一档的比例",不用就 `None`(原样发)。
+///
+/// 判据只有一条:**服务商自己推出来的长边必须是偶数** —— H.264 的宽高都得是偶数,奇数必然编不出来。
+/// (2026-10-17 的实测说明这并不是那几次 FAIL 的病根,见 `VIDEO_SIZES`;这里图的是"便宜且无害",
+/// 不是"救命"。)
+///
+/// 两条路的分工是有意的:
+/// - 比值本来就安全的图**原样发**。重编码一次就是画面更糊一次,而这是**条件图** ——
+///   糊了整段视频都跟着糊(同一笔账见 `image_data_url`);
+/// - 不安全才裁。裁的目标是"离这张图比例最近的那一档官方尺寸":它推出来的长边必然落在
+///   偶数上,而且**只丢边、不重采样**(`1920×1088` → `1920×1080`,上下各 4 行)。
+///
+/// 喂给 `video_size_for` 的是**图片自己的宽高**(不是屏幕):这里要保的是画面,不是屏。
+pub fn video_image_fix(image: (u32, u32)) -> Option<(u32, u32)> {
+    let derived = derived_video_size(image);
+    if derived.0.max(derived.1) % 2 == 0 {
+        return None;
+    }
+    Some(video_size_for(image))
 }
 
 /// 任务状态。**提交和轮询返回的是同一个形状**(实测:提交回 `PROCESSING`,轮询回 `SUCCESS` +
@@ -2671,6 +2766,50 @@ mod tests {
                 "{screen:?} 挑出了清单外的 {size:?}"
             );
             assert_eq!(size.0 % 2 + size.1 % 2, 0, "{size:?} 有奇数边");
+        }
+    }
+
+    /// 这个"计算器"必须和实测对得上 —— 整条修法都架在它上面。
+    #[test]
+    fn 服务商自己推出来的尺寸和实测一致() {
+        // 两张出过片的 `1808×1136`:成片元数据里就是 1718×1080
+        assert_eq!(derived_video_size((1808, 1136)), (1718, 1080));
+        // 三次 FAIL 的那张:`1080 × 1920/1088 = 1905.88` → 向下取整 → 1905(奇数)
+        assert_eq!(derived_video_size((1920, 1088)), (1905, 1080));
+        // 竖屏反过来:短边是宽
+        assert_eq!(derived_video_size((1088, 1920)), (1080, 1905));
+        // 已经落在官方档上的一点都不用动
+        assert_eq!(derived_video_size((1920, 1080)), (1920, 1080));
+    }
+
+    /// 判据只有一条:**推出来的长边是偶数**。奇数才裁,安全的一律原样发。
+    #[test]
+    fn 只有推出来是奇数才需要裁图() {
+        assert_eq!(video_image_fix((1808, 1136)), None);
+        assert_eq!(video_image_fix((1920, 1080)), None);
+        // 1920×1088 → 1905(奇数)→ 裁到最贴它的那一档(16:9)
+        assert_eq!(video_image_fix((1920, 1088)), Some((1920, 1080)));
+        // 竖屏同理,且必须是竖屏的档
+        assert_eq!(video_image_fix((1088, 1920)), Some((1080, 1920)));
+        // 奇数高度 / 正方形也要能落到清单里的某一档
+        for image in [(1000, 1000), (1001, 1000), (1000, 1001), (3000, 2000)] {
+            if let Some(size) = video_image_fix(image) {
+                assert!(VIDEO_SIZES.contains(&size), "{image:?} 挑出了 {size:?}");
+            }
+        }
+    }
+
+    /// **这条是整条修法的命根子**:裁成官方某一档的比例之后,服务商推出来的长边必须是偶数。
+    /// 否则"裁了还是死",而它死得一声不吭 —— 只有真跑一次才知道。
+    #[test]
+    fn 官方七档自己推出来都是偶数() {
+        for size in VIDEO_SIZES {
+            let derived = derived_video_size(size);
+            assert_eq!(
+                derived.0 % 2 + derived.1 % 2,
+                0,
+                "{size:?} 自己会推出 {derived:?},有奇数边"
+            );
         }
     }
 }

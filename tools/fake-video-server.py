@@ -20,7 +20,8 @@ r"""假的「图生视频」服务 —— 给会话里那颗「生成动图」�
 
 `--running N` 是"先说 N 次还在跑" —— 真链路里轮询间隔 8 秒(`VIDEO_POLL_INTERVAL`),
 所以 N=2 意味着"正在生成动图…"这个状态会**稳稳停住 16 秒**,够截图看清楚了。
-`--hold` 则是永远不出片,专门用来把那个状态钉住。
+`--hold` 则是永远不出片,专门用来把那个状态钉住。`--busy N` 先拿 N 次 429 挡住提交
+(服务商在忙时的真实形状:`code 1305 该模型当前访问量过大`),用来验证客户端会不会退避重提。
 `--video <mp4>` 指定出片时给哪一段(默认拿本机壁纸库里的第一段 mp4)——
 走完之后主线程要解封面、入库,那条路只有给一段**真 mp4** 才能验到底。
 
@@ -93,6 +94,15 @@ class Handler(BaseHTTPRequestHandler):
             self._say(404, {"error": "no such endpoint"})
             return
         size = parse_size(blob)
+        # `--busy N`:先拿 N 次 429(服务商在忙时就是这个形状)把客户端挡住,再放行。
+        # 客户端应该退避重提、而且**不重复计费**(429 = 这单压根没受理)。
+        with LOCK:
+            if ARGS.busy > 0:
+                ARGS.busy -= 1
+                self._log("submit -> 429 (busy, 客户端该退避重提)")
+                self._say(429, {"error": {"code": "1305",
+                                          "message": "该模型当前访问量过大,请您稍后再试"}})
+                return
         with LOCK:
             ARGS.seq += 1
             task = "fake-%d" % ARGS.seq
@@ -139,6 +149,8 @@ def main():
     parser.add_argument("--running", type=int, default=2,
                         help="先说几次「还在跑」,之后才出片")
     parser.add_argument("--hold", action="store_true", help="永远不出片(把状态钉住)")
+    parser.add_argument("--busy", type=int, default=0,
+                        help="先拿 N 次 429(服务商在忙)挡住提交,验证客户端的退避重提")
     parser.add_argument("--video", default=None, help="出片时给哪一段 mp4")
     parser.add_argument("--log", default="fake-video.log")
     ARGS = parser.parse_args()

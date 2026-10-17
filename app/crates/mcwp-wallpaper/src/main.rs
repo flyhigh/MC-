@@ -577,7 +577,6 @@ fn animate_photo(
     // 条件图用**库里那张原图的字节**,不重新编码(见 `mcwp_ai::image_data_url`)
     let image_bytes = std::fs::read(&entry.image)
         .with_context(|| format!("读不出这张图:{}", entry.image.display()))?;
-    let image_url = mcwp_ai::image_data_url(&image_bytes);
     // 1 · 元素级方案。库里已经存过一份就**直接用** —— 同一张图重做一遍时不必再看第二眼,
     //     两次分析给的元素也未必一样(见 `MotionPlan` 的说明)。
     let plan = match chat {
@@ -609,8 +608,33 @@ fn animate_photo(
     }
     // 3 · **首尾帧**(首帧=尾帧=这张图)逼模型把画面绕回起点,循环才接得上;时长要 10 秒
     //     (和 5 秒同价,素材翻倍 —— 头尾的抖动都能丢)。
-    // 尺寸**必须自己报**(见 `mcwp_ai::VIDEO_SIZES`):留空让服务端按原图比例推,某些比例会推出
-    // 一个奇数长边然后 FAIL,而且一个字都不解释。报屏幕那一档还顺手对上"屏幕多大就要多大"。
+    //
+    // 3.5 · 提交前把图收拾成"服务商自己推得动"的比例:它按"短边 1080 × 图片比例、向下取整"推
+    //       成片尺寸,推出奇数长边时 H.264 编不出来。**这不是 2026-10-16 那几次 FAIL 的病根**
+    //       (裁成 1920×1080 之后照样失败,见 `mcwp_ai::VIDEO_SIZES` 的更正),它只是一份便宜的
+    //       保险:比值本来就安全的图**原样发**(不重编码 —— 这是条件图,糊了整段都糊),不安全的才裁。
+    let submit_bytes = match mcwp_ai::video_image_fix((source.width, source.height)) {
+        None => image_bytes.clone(),
+        Some((target_width, target_height)) => {
+            let bitmap = mcwp_image::Bitmap::decode(&image_bytes)
+                .with_context(|| format!("裁图前解不开这张图:{}", entry.image.display()))?;
+            let cropped = bitmap.crop_to_ratio(target_width, target_height);
+            let derived = mcwp_ai::derived_video_size((bitmap.width, bitmap.height));
+            tracing::info!(
+                "条件图裁成 {}×{}(原 {}×{};不裁的话服务商会推 {}×{},长边奇数就 FAIL) · 目标比例 {}:{}",
+                cropped.width,
+                cropped.height,
+                bitmap.width,
+                bitmap.height,
+                derived.0,
+                derived.1,
+                target_width,
+                target_height
+            );
+            cropped.encode_jpeg(92)?
+        }
+    };
+    let image_url = mcwp_ai::image_data_url(&submit_bytes);
     let generated = videos.animate_looped(&image_url, &motion, screen)?;
     video_payload_from_bytes(&source, plan, generated.bytes, screen)
 }
